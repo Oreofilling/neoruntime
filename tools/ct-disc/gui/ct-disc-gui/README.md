@@ -1,17 +1,11 @@
 # CT-Disc GUI
 
-CT-Disc GUI 是设备扫描和资源数据记录的 Windows 图形界面。
+CT-Disc GUI is a Windows desktop application for scanning NE503/AIPC devices and recording their resource data.
 
-完整使用说明见：
+Full usage instructions:
 
 ```text
 ../../README.md
-```
-
-GUI exe 中文使用说明：
-
-```text
-GUI_EXE_USER_GUIDE_ZH.md
 ```
 
 GUI exe English user guide:
@@ -20,40 +14,40 @@ GUI exe English user guide:
 GUI_EXE_USER_GUIDE_EN.md
 ```
 
-## 功能
+## Features
 
-- 扫描 CT-Disc 组播可达网络范围内的设备
-- 手动添加跨网段设备 IP 或 URL
-- 自动补全手动设备的 SN、FW、MAC、Product、HW
-- 批量选择设备
-- 记录 CPU、内存、磁盘、NPU、温度和请求延迟
-- 支持 CSV / JSON Lines
-- 支持一台设备一个记录文件，文件名优先按 IP 生成
-- 记录过程中显示每台设备的趋势图
+- Scan devices reachable via CT-Disc multicast
+- Manually add cross-subnet devices by IP or URL
+- Auto-fill SN, FW, MAC, Product, HW for manually added devices
+- Batch device selection
+- Record CPU, memory, disk, NPU, temperature, and request latency
+- CSV / JSON Lines output
+- One recording file per device, named by IP
+- Per-device trend charts while recording
 
-## 运行开发模式
+## Run in dev mode
 
 ```bash
 cd tools/ct-disc/gui/ct-disc-gui
 wails dev
 ```
 
-## 构建 Windows GUI exe
+## Build Windows GUI exe
 
 ```bash
 cd tools/ct-disc/gui/ct-disc-gui
 wails build -platform windows/amd64 -clean
 ```
 
-构建产物：
+Build output:
 
 ```text
 build/bin/ct-disc-gui.exe
 ```
 
-## 手动设备补全
+## Manual device enrichment
 
-添加设备时可以配置协议、端口、username、token 和 HTTPS 证书校验选项。GUI 会尝试读取：
+When adding a device you can configure the protocol, port, username, token, and HTTPS certificate verification options. The GUI attempts to read:
 
 ```text
 /api/v1/device-info
@@ -61,4 +55,4 @@ build/bin/ct-disc-gui.exe
 /api/v1/monitor/summary
 ```
 
-如果接口可达且鉴权正确，设备列表会显示真实 SN/FW/MAC。读取失败时设备仍会保留为 `Manual`，不影响记录数据。
+If an endpoint is reachable and authenticated correctly, the device list shows the real SN/FW/MAC. If the reads fail, the device is kept as `Manual` and recording still works.
