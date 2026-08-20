@@ -424,6 +424,7 @@ _pack-stage:
 	@cp -f scripts/aipc-configure-platform-api-gateway.py "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" || true
 	@cp -f scripts/aipc-logrotate.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" || true
 	@cp -f scripts/aipc-os-layout-check.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" || true
+	@cp -f scripts/aipc-factory-reset.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" || true
 	@cp -f scripts/aipc-restore.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" || true
 	@cp -f scripts/aipc-firstboot-os.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" || true
 	@cp -f scripts/aipc-autostart.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" || true
