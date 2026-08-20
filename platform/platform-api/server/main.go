@@ -498,6 +498,9 @@ func (s *PlatformAPIServer) setupRoutes() {
 	s.engine.GET("/api/v1/system/ota/status", systemHandler.OTAGetStatus)
 
 	osUpgradeHandler := handlers.NewOSUpgradeHandlers(os.Getenv("AIPC_OS_UPGRADE_DIR"))
+	// App OTA installs refuse to start while an OS upgrade job is not terminal
+	// (and vice versa) so the two upgraders never share the data partition.
+	systemHandler.SetOSUpgradeStore(osUpgradeHandler.Store())
 	// On boot, advance any job stuck in rebooting/verifying to a terminal
 	// state in case aipc-os-verify.service did not fire after the reboot.
 	osUpgradeHandler.ReconcileOnBoot()
