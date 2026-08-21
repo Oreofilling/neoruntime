@@ -453,9 +453,17 @@ _pack-stage:
 	@[ -d web/dist ] && cp -r web/dist/* "$(STAGE_DIR)/opt/aipc/web/" && echo "  + web console" || true
 	@cp -f platform/platform-api/swagger-ui/* "$(STAGE_DIR)/opt/aipc/swagger-ui/" 2>/dev/null || true
 	@cp -f docs/api/swagger.yaml "$(STAGE_DIR)/opt/aipc/etc/swagger.yaml" 2>/dev/null || true
-	@for cat in detection classification segmentation keypoint clip depth ocr genai; do \
+	@staged_models=0; \
+	for cat in detection classification segmentation keypoint clip depth ocr genai; do \
 		mkdir -p "$(STAGE_DIR)/opt/aipc/models/$$cat"; \
-	done
+		for f in "models/$$cat"/*.hef "models/$$cat"/*.json; do \
+			[ -f "$$f" ] || continue; \
+			cp -f "$$f" "$(STAGE_DIR)/opt/aipc/models/$$cat/"; \
+			echo "  + models/$$cat/$$(basename "$$f")"; \
+			staged_models=1; \
+		done; \
+	done; \
+	[ "$$staged_models" -eq 1 ] || echo "  - models/ source tree absent; device must run download_models.sh"
 	@printf '%s\n' \
 		"version=$(VERSION)" \
 		"build_date=$$(date +%Y%m%d-%H%M%S)" \
@@ -502,7 +510,7 @@ _pack-internal: _pack-stage
 test: test-unit
 
 test-unit: proto
-	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit
+	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit ./tools/aipc-cli/...
 
 test-basic:
 	./scripts/run_basic_tests.sh

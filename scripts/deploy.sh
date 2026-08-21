@@ -1747,15 +1747,23 @@ if [[ -d "$SCRIPT_DIR/opt/aipc/models" ]]; then
         [[ -d "$catdir" ]] || continue
         cat_name=$(basename "$catdir")
         mkdir -p "$MODELS_DIR/$cat_name"
-        for hef in "$catdir"*.hef; do
-            [[ -f "$hef" ]] || continue
-            hef_name=$(basename "$hef")
-            target="$MODELS_DIR/$cat_name/$hef_name"
-            if [[ -f "$target" ]] && cmp -s "$hef" "$target"; then
-                log "  = models/$cat_name/$hef_name (unchanged)"
+        # Copy the full supported set: HEF binaries plus their vendor postproc
+        # JSON sidecars. camera-daemon's DPM yolov8n detector REQUIRES
+        # hailo_yolov8n_384_640.json next to the HEF (labels + label_offset);
+        # without it d.label stays empty and keep_labels never matches.
+        for src in "$catdir"*; do
+            [[ -f "$src" ]] || continue
+            case "$src" in
+                *.hef|*.json) ;;
+                *) continue ;;
+            esac
+            src_name=$(basename "$src")
+            target="$MODELS_DIR/$cat_name/$src_name"
+            if [[ -f "$target" ]] && cmp -s "$src" "$target"; then
+                log "  = models/$cat_name/$src_name (unchanged)"
             else
-                cp -f "$hef" "$target"
-                log "  + models/$cat_name/$hef_name -> $MODELS_DIR/$cat_name/"
+                cp -f "$src" "$target"
+                log "  + models/$cat_name/$src_name -> $MODELS_DIR/$cat_name/"
             fi
         done
     done
