@@ -37,6 +37,7 @@ extern "C" {
 #include "media/hal_media.h"
 #include "peripheral/devices/hal_sensor.h"
 #include "peripheral/hal_mcu.h"
+#include "peripheral/devices/hal_lens_fg2009.h"
 }
 
 #ifdef HAS_GRPC
@@ -201,6 +202,14 @@ struct DaemonConfig {
     int32_t     lens_zoom_max      = 760;
     int32_t     lens_focus_min     = -844;
     int32_t     lens_focus_max     = 592;
+
+    // Lens product model (factory-fixed, from /data/aipc/etc/product.yaml).
+    // "af0832" (legacy default when product.yaml is absent) | "fg2009".
+    std::string lens_model = "af0832";
+    // FG2009 open-loop bootstrap geometry (bench-calibrated, yaml-overridable)
+    HalLensFg2009Params lens_fg2009 = {};
+    // FG2009 focus-tracking curve CSV (zoom_step,focus_step; empty = default)
+    std::string lens_fg2009_focus_curve_path;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;
@@ -641,6 +650,13 @@ private:
                                  std::string* message);
     bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
     double current_zoom_ratio() const;
+
+    // FG2009: zoom-motion observer target — replays the IR zoom-follow LUT
+    // at the new ratio (the AF0832 path gets this for free from the AF
+    // zoom-follow job; the open-loop lens has no AF, so the LensHAL service
+    // notifies us instead). Runs on the caller's thread with the lens mutex
+    // held: must not call back into the lens controller.
+    void on_fg2009_zoom_moved(double zoom_ratio);
 
     // Day/night auto (light-sensor) policy
     void start_light_monitor();

@@ -2878,6 +2878,9 @@ void CameraDaemon::start_grpc_server() {
         lens_cfg.zoom_max        = config_.lens_zoom_max;
         lens_cfg.focus_min       = config_.lens_focus_min;
         lens_cfg.focus_max       = config_.lens_focus_max;
+        lens_cfg.lens_model      = config_.lens_model;
+        lens_cfg.fg2009          = config_.lens_fg2009;
+        lens_cfg.fg2009_focus_curve_path = config_.lens_fg2009_focus_curve_path;
         auto lens_bundle = CreateLensHalService(lens_cfg);
         lens_controller_ = lens_bundle.controller;
         lens_hal_service_ = std::move(lens_bundle.service);
@@ -2888,8 +2891,18 @@ void CameraDaemon::start_grpc_server() {
     }
 
     if (config_.infrared.enabled) {
+        // FG2009 zoom range tops out at ~2.24x: substitute the lens-specific
+        // IR follow LUT when the yaml still carries the AF0832 default path
+        // (an explicit non-default path is respected for bench tuning).
+        IlluminationConfig illumination_cfg = config_.infrared;
+        if (config_.lens_model == "fg2009" &&
+            illumination_cfg.lut_path == "/data/aipc/etc/ir_zoom_lut.csv") {
+            illumination_cfg.lut_path = "/data/aipc/etc/ir_zoom_lut_fg2009.csv";
+            HAL_LOG_INFO("CameraDaemon: FG2009 lens; IR zoom LUT -> %s",
+                         illumination_cfg.lut_path.c_str());
+        }
         illumination_controller_ = std::make_unique<IlluminationController>(
-            config_.infrared,
+            illumination_cfg,
             [this](uint32_t led_id, uint32_t duty) {
                 return set_led_duty_raw(led_id, duty);
             });
@@ -2909,6 +2922,14 @@ void CameraDaemon::start_grpc_server() {
             HAL_LOG_WARNING("CameraDaemon: failed to apply startup illumination mode: %s",
                             error.c_str());
         }
+        // FG2009 has no AF zoom-follow job to drive the IR LUT mid-move;
+        // subscribe to the lens service's zoom-motion notifications instead.
+        if (config_.lens_model == "fg2009" && lens_controller_) {
+            lens_controller_->set_zoom_motion_observer(
+                [this](float ratio) { on_fg2009_zoom_moved(ratio); });
+            HAL_LOG_INFO("CameraDaemon: FG2009 IR zoom-follow wired to lens "
+                         "motion observer");
+        }
     }
 
     /* Day/night auto (light-sensor) policy: take a runtime copy of the thresholds
@@ -2926,7 +2947,10 @@ void CameraDaemon::start_grpc_server() {
                              ? SelectedMode::Infrared : SelectedMode::Day;
     }
 
-    if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
+    // FG2009 is open-loop with no AF: the controller would only ever fail.
+    if (config_.autofocus.enabled && config_.lens_model == "fg2009") {
+        HAL_LOG_INFO("CameraDaemon: autofocus disabled for lens model fg2009");
+    } else if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
         autofocus_controller_ = std::make_unique<AutofocusController>(
             hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
@@ -3946,6 +3970,10 @@ bool CameraDaemon::set_ircut(uint32_t mode) {
 }
 
 bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error) {
+    if (config_.lens_model == "fg2009") {
+        if (error) *error = "autofocus not supported on lens fg2009";
+        return false;
+    }
 #ifdef HAS_GRPC
     if (autofocus_controller_) return autofocus_controller_->start_one_shot(job_id, error);
 #endif
@@ -3955,6 +3983,10 @@ bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error
 
 bool CameraDaemon::start_autofocus_zoom_follow(float ratio, uint64_t* job_id,
                                                 std::string* error) {
+    if (config_.lens_model == "fg2009") {
+        if (error) *error = "autofocus not supported on lens fg2009";
+        return false;
+    }
 #ifdef HAS_GRPC
     if (autofocus_controller_)
         return autofocus_controller_->start_zoom_follow(ratio, job_id, error);
@@ -4026,13 +4058,32 @@ bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
     return true;
 }
 
+void CameraDaemon::on_fg2009_zoom_moved(double zoom_ratio) {
+    if (!illumination_controller_) return;
+    // Mirror the AF0832 zoom-follow cycle in one shot: takeover (drops a
+    // stale manual override), apply the endpoint LUT row, release.
+    std::string error;
+    illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
+    illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
+    illumination_controller_->end_zoom_follow(zoom_ratio, &error);
+    if (!error.empty()) {
+        HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
+                        zoom_ratio, error.c_str());
+    }
+}
+
 double CameraDaemon::current_zoom_ratio() const {
 #ifdef HAS_GRPC
     if (lens_controller_) {
         LensControllerState state{};
         if (lens_controller_->state_get(&state) == HAL_OK) {
+            // FG2009: pos_to_ratio comes from the dead-reckoned model and
+            // tops out at the optical limit (~2.2416), not the AF0832 2.88.
+            const double max_ratio = config_.lens_model == "fg2009"
+                ? static_cast<double>(hal_lens_fg2009_max_ratio())
+                : 2.88;
             return std::clamp(static_cast<double>(lens_controller_->pos_to_ratio(state.zoom_pos)),
-                              1.0, 2.88);
+                              1.0, max_ratio);
         }
     }
 #endif
