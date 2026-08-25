@@ -18,14 +18,14 @@ const maxDescriptionSize = 2 << 20
 const SingleRecoveryMarker = "AIPC_LOCAL_RECOVERY_V1"
 
 type ValidationOptions struct {
-	ExpectedSHA256       string
-	ExpectedMachine      string
-	ExpectedProduct      string
-	ExpectedHW           string
-	ExpectedDevice       string
-	RequireBuildTime     bool
-	RequireAB            bool
-	RequireSignature     bool
+	ExpectedSHA256   string
+	ExpectedMachine  string
+	ExpectedProduct  string
+	ExpectedHW       string
+	ExpectedDevice   string
+	RequireBuildTime bool
+	RequireAB        bool
+	RequireSignature bool
 }
 
 type ValidationResult struct {

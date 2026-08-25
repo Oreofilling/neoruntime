@@ -26,9 +26,9 @@ func TestValidatePackage(t *testing.T) {
 	})
 
 	result, err := ValidatePackage(path, ValidationOptions{
-		ExpectedMachine:      "hailo15-ne503",
-		ExpectedProduct:      "ne503",
-		ExpectedHW:           "1.0",
+		ExpectedMachine:  "hailo15-ne503",
+		ExpectedProduct:  "ne503",
+		ExpectedHW:       "1.0",
 		ExpectedDevice:   "mmcblk1",
 		RequireAB:        true,
 		RequireSignature: true,

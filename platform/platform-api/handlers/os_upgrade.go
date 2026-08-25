@@ -241,14 +241,14 @@ func (h *OSUpgradeHandlers) Validate(c *gin.Context) {
 		expectedSHA = job.SHA256
 	}
 	result, err := osupgrade.ValidatePackage(job.PackagePath, osupgrade.ValidationOptions{
-		ExpectedSHA256:       expectedSHA,
-		ExpectedMachine:      h.expectedMachine,
-		ExpectedProduct:      h.expectedProduct,
-		ExpectedHW:           h.expectedHW,
-		ExpectedDevice:       h.filesystemDevice,
-		RequireBuildTime:     h.requireBuildTime,
-		RequireAB:            false,
-		RequireSignature:     h.requireSig,
+		ExpectedSHA256:   expectedSHA,
+		ExpectedMachine:  h.expectedMachine,
+		ExpectedProduct:  h.expectedProduct,
+		ExpectedHW:       h.expectedHW,
+		ExpectedDevice:   h.filesystemDevice,
+		RequireBuildTime: h.requireBuildTime,
+		RequireAB:        false,
+		RequireSignature: h.requireSig,
 	})
 	if err != nil {
 		h.failJob(job, err)

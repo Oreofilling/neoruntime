@@ -168,14 +168,14 @@ type PlatformAPIServer struct {
 	unixSocketPath string       // resolved socket path for cleanup on shutdown
 	tlsCertFile    string
 	tlsKeyFile     string
-	db            *gorm.DB
-	eventLogger   *events.Logger
-	persistCtx    context.Context
-	persistCancel context.CancelFunc
-	gyroSrc       gyro.Source
-	gyroCancel    context.CancelFunc
-	monitor       *handlers.MonitorHandler
-	grpcClients   struct {
+	db             *gorm.DB
+	eventLogger    *events.Logger
+	persistCtx     context.Context
+	persistCancel  context.CancelFunc
+	gyroSrc        gyro.Source
+	gyroCancel     context.CancelFunc
+	monitor        *handlers.MonitorHandler
+	grpcClients    struct {
 		aiRuntime     *grpc.ClientConn
 		eventBus      *grpc.ClientConn
 		deviceControl *grpc.ClientConn

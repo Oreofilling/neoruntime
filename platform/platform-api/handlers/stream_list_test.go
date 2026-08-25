@@ -129,7 +129,7 @@ func TestGetStreamNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
 	}
 	var body struct {
-		Code  int    `json:"code"`
+		Code  int `json:"code"`
 		Error struct {
 			Detail string `json:"detail"`
 		} `json:"error"`

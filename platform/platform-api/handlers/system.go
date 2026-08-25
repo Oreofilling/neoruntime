@@ -188,10 +188,10 @@ func attachOTALogTail(status *OTAStatus) {
 
 // SystemHandlers handles system level configurations
 type SystemHandlers struct {
-	configPath    string
-	eventLogger   *events.Logger
-	configMgr     *config.Manager
-	rsaPriv       *rsa.PrivateKey // decrypts frontend-encrypted old/new passwords; nil -> plaintext fallback
+	configPath     string
+	eventLogger    *events.Logger
+	configMgr      *config.Manager
+	rsaPriv        *rsa.PrivateKey  // decrypts frontend-encrypted old/new passwords; nil -> plaintext fallback
 	osUpgradeStore *osupgrade.Store // optional: enables the app/OS upgrade mutual-exclusion gate
 }
 
