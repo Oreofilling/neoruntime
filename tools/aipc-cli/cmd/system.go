@@ -41,7 +41,7 @@ var systemInfoCmd = &cobra.Command{
 
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err == nil {
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := apiHTTPClient.Do(req)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
 				var info map[string]interface{}
@@ -98,7 +98,7 @@ var systemStatsCmd = &cobra.Command{
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to get stats: %w", err)
 		}
@@ -214,7 +214,7 @@ var systemHealthCmd = &cobra.Command{
 		url := systemAPIBase + "/api/v1/system/health"
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiHTTPClient.Do(req)
 		cancel()
 		if err != nil || resp.StatusCode != http.StatusOK {
 			results["platform-api"] = "unreachable"
