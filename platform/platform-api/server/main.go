@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,6 +26,8 @@ import (
 	"aipc/platform/common/constants"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
+	"aipc/platform/common/socket"
+	"aipc/platform/common/utils"
 	eventpb "aipc/platform/event-bus/proto"
 	mediaadapter "aipc/platform/platform-api/adapters/media"
 	"aipc/platform/platform-api/auth"
@@ -45,6 +48,7 @@ type Config struct {
 	Service struct {
 		Name               string    `yaml:"name"`
 		HTTPAddr           string    `yaml:"http_addr"`
+		UnixSocket         string    `yaml:"unix_socket"`
 		ReadTimeoutSeconds int       `yaml:"read_timeout_seconds" default:"1800"`
 		LogLevel           string    `yaml:"log_level"`
 		LogFile            string    `yaml:"log_file"`
@@ -156,20 +160,22 @@ func (c *Config) Validate() error {
 }
 
 type PlatformAPIServer struct {
-	config        *Config
-	engine        *gin.Engine
-	httpServer    *http.Server
-	tlsServer     *http.Server // non-nil when Config.Service.TLS.Enabled
-	tlsCertFile   string
-	tlsKeyFile    string
-	db            *gorm.DB
-	eventLogger   *events.Logger
-	persistCtx    context.Context
-	persistCancel context.CancelFunc
-	gyroSrc       gyro.Source
-	gyroCancel    context.CancelFunc
-	monitor       *handlers.MonitorHandler
-	grpcClients   struct {
+	config         *Config
+	engine         *gin.Engine
+	httpServer     *http.Server
+	tlsServer      *http.Server // non-nil when Config.Service.TLS.Enabled
+	unixServer     *http.Server // non-nil when Config.Service.UnixSocket is set
+	unixSocketPath string       // resolved socket path for cleanup on shutdown
+	tlsCertFile    string
+	tlsKeyFile     string
+	db             *gorm.DB
+	eventLogger    *events.Logger
+	persistCtx     context.Context
+	persistCancel  context.CancelFunc
+	gyroSrc        gyro.Source
+	gyroCancel     context.CancelFunc
+	monitor        *handlers.MonitorHandler
+	grpcClients    struct {
 		aiRuntime     *grpc.ClientConn
 		eventBus      *grpc.ClientConn
 		deviceControl *grpc.ClientConn
@@ -255,7 +261,29 @@ func NewPlatformAPIServer(cfg *Config) (*PlatformAPIServer, error) {
 		logger.Info("HTTPS enabled on %s (cert=%s)", cfg.Service.TLS.HTTPSAddr, certPath)
 	}
 
+	// Setup the local unix socket face when configured. It serves the same
+	// engine as TCP but marks requests as locally trusted, matching the gRPC
+	// services' trust model (socket file permission = authentication).
+	if cfg.Service.UnixSocket != "" {
+		server.unixServer = &http.Server{
+			Handler:      localTrustHandler(server.engine),
+			ReadTimeout:  readTimeout,
+			WriteTimeout: 0, // streaming endpoints (WebSocket, SSE, H264) need long-lived connections
+			IdleTimeout:  60 * time.Second,
+		}
+	}
+
 	return server, nil
+}
+
+// localTrustHandler wraps the engine so every request served through it
+// carries the local-trust context mark that exempts it from bearer auth.
+// The mark is injected here server-side; TCP-facing requests can never
+// carry it, so the exemption cannot be reached over the network.
+func localTrustHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(auth.WithLocalTrust(r.Context())))
+	})
 }
 
 func sanitizedGinLogFormatter(param gin.LogFormatterParams) string {
@@ -498,6 +526,9 @@ func (s *PlatformAPIServer) setupRoutes() {
 	s.engine.GET("/api/v1/system/ota/status", systemHandler.OTAGetStatus)
 
 	osUpgradeHandler := handlers.NewOSUpgradeHandlers(os.Getenv("AIPC_OS_UPGRADE_DIR"))
+	// App OTA installs refuse to start while an OS upgrade job is not terminal
+	// (and vice versa) so the two upgraders never share the data partition.
+	systemHandler.SetOSUpgradeStore(osUpgradeHandler.Store())
 	// On boot, advance any job stuck in rebooting/verifying to a terminal
 	// state in case aipc-os-verify.service did not fire after the reboot.
 	osUpgradeHandler.ReconcileOnBoot()
@@ -888,6 +919,12 @@ func (s *PlatformAPIServer) setupRoutes() {
 	streamHandlers := handlers.NewStreamHandlers(streamConfigs, rtspBase, encodedPubDir)
 	mediaHandler.SetStreamReloader(streamHandlers)
 
+	// Read-only stream inventory (config view; runtime state is /media/status).
+	// GET must be registered after streamHandlers is built; same paths as the
+	// POST/DELETE routes above are fine — gin differentiates by method.
+	mediaGroup.GET("/streams", streamHandlers.ListStreams)
+	mediaGroup.GET("/streams/:name", streamHandlers.GetStream)
+
 	// Audio control endpoints
 	audioHandler := handlers.NewAudioHandlers(s.grpcClients.cameraControl, s.config.Stream.CameraConfig, apiHandlers.ConfigManager())
 	audioGroup := api.Group("/audio")
@@ -1080,6 +1117,14 @@ func (s *PlatformAPIServer) Start() error {
 				logger.Error("Error shutting down TLS server: %v", err)
 			}
 		}
+		if s.unixServer != nil {
+			if err := s.unixServer.Shutdown(ctx); err != nil {
+				logger.Error("Error shutting down unix socket server: %v", err)
+			}
+		}
+		if s.unixSocketPath != "" {
+			os.Remove(s.unixSocketPath)
+		}
 
 		// Close gRPC connections
 		if s.grpcClients.aiRuntime != nil {
@@ -1117,6 +1162,36 @@ func (s *PlatformAPIServer) Start() error {
 			}
 		}()
 		logger.Info("HTTPS listener started on %s", s.config.Service.TLS.HTTPSAddr)
+	}
+
+	// Local unix socket face: listen + serve in the background (same pattern
+	// as the TLS listener). Requests on it skip bearer auth; access is gated
+	// by the socket file permission instead, like the platform gRPC services.
+	if s.unixServer != nil {
+		sock, err := utils.ParseListenAddress(s.config.Service.UnixSocket)
+		if err != nil {
+			return fmt.Errorf("failed to parse unix socket address: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(sock), 0755); err != nil {
+			return fmt.Errorf("failed to create unix socket directory: %w", err)
+		}
+		// Remove a stale socket left over from an ungraceful exit.
+		os.Remove(sock)
+		lis, err := net.Listen("unix", sock)
+		if err != nil {
+			return fmt.Errorf("failed to listen on unix socket %s: %w", sock, err)
+		}
+		if err := socket.SetSocketGroupPermission(sock); err != nil {
+			logger.Warn("Failed to set socket permissions on %s: %v (group access unavailable)", sock, err)
+		}
+		s.unixSocketPath = sock
+
+		go func() {
+			if err := s.unixServer.Serve(lis); err != nil && err != http.ErrServerClosed {
+				logger.Error("Unix socket server stopped unexpectedly: %v", err)
+			}
+		}()
+		logger.Info("Unix socket listener started on %s (auth-exempt local face)", sock)
 	}
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

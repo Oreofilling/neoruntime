@@ -1324,23 +1324,43 @@ bool CameraDaemon::start_dpm_worker(const aipc::camera::PrivacyMaskConfig& confi
     // must never block on it). Only the pointer swap is locked.
     auto worker = std::make_shared<DpmWorker>();
     if (!worker->start(cfg)) {
-        // No detector loaded (all HEFs missing) or session-create failed —
-        // typically transient NPU contention (ai-runtime / model-showcase holding
-        // the same HEFs at this instant). Return false so the caller persists
-        // dpm_enabled_=false: the UI toggle then honestly reverts to OFF instead
-        // of showing ON with no mask.
-        HAL_LOG_ERROR("CameraDaemon: DPM worker start failed (no detector loaded / HEF contention) — "
+        // HAL context/session init failed — typically transient NPU contention
+        // (ai-runtime / model-showcase holding the same HEFs at this instant).
+        // Return false so the caller persists dpm_enabled_=false: the UI toggle
+        // then honestly reverts to OFF instead of showing ON with no mask.
+        HAL_LOG_ERROR("CameraDaemon: DPM worker start failed (HAL init / HEF contention) — "
                       "toggle will report OFF; re-toggle to retry once the NPU is free");
         return false;
+    }
+
+    // Requested-but-none-effective guard (2026-08 field incident: a visdrone
+    // 11-class pair overwrote hailo_yolov8n_384_640.{hef,json}; the detector
+    // "loaded" but its labels never matched keep_labels, so the mask stayed
+    // forever empty while the toggle showed ON). If the user selected labels
+    // (specs were built) but none survived init — model files missing, postproc
+    // JSON unusable, or labels mismatch — revert to OFF instead of arming a
+    // silent no-op. The empty-label case (requested_spec_count()==0) is NOT a
+    // failure and keeps the documented idle behavior (#7).
+    if (worker->requested_spec_count() > 0 && worker->effective_detector_count() == 0) {
+        std::string why;
+        for (const auto& r : worker->detector_skip_reasons()) {
+            if (!why.empty()) why += "; ";
+            why += r;
+        }
+        HAL_LOG_ERROR("CameraDaemon: DPM armed but no effective detectors "
+                      "(models missing / labels mismatch) — toggle will report OFF; "
+                      "reasons: %s",
+                      why.c_str());
+        return false;  // caller persists dpm_enabled_=false → honest OFF; re-toggle retries
     }
     std::string loaded;
     for (const auto& d : cfg.detectors) {
         if (!loaded.empty()) loaded += ",";
         loaded += d.name;
     }
-    HAL_LOG_INFO("CameraDaemon: DPM worker started (detectors=%s%s)",
-                 loaded.c_str(),
-                 cfg.detectors.empty() ? " [IDLE]" : "");
+    HAL_LOG_INFO("CameraDaemon: DPM worker started (detectors=%s, effective=%zu%s)",
+                 loaded.c_str(), worker->effective_detector_count(),
+                 worker->effective_detector_count() == 0 ? " [IDLE]" : "");
 
     std::shared_ptr<DpmWorker> old;
     {

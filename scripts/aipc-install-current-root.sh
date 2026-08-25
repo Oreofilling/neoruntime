@@ -152,11 +152,11 @@ json_string() {
 # Compatibility capabilities are OS-owned. The application may validate them
 # but must never rewrite them from its own requirements.
 grep -Eq '^MACHINE=.+$' "$OS_RELEASE_FILE" || fail "OS compatibility metadata has no MACHINE"
-grep -Eq '^AIPC_COMPAT_LEVEL=[1-9][0-9]*$' "$OS_RELEASE_FILE" || \
-    fail "OS compatibility metadata has invalid AIPC_COMPAT_LEVEL"
-grep -Eq '^DATA_SCHEMA=[1-9][0-9]*$' "$OS_RELEASE_FILE" || \
-    fail "OS compatibility metadata has invalid DATA_SCHEMA"
-[[ -n "$(json_string "$MANIFEST" machine)" && -n "$(json_number "$MANIFEST" required_compat_level)" && \
+grep -Eq '^OS_VERSION=[1-9]+\.[0-9]+\.[0-9]+$' "$OS_RELEASE_FILE" || \
+    fail "OS compatibility metadata has invalid OS_VERSION"
+[[ -n "$(json_string "$MANIFEST" machine)" && \
+   -n "$(json_string "$MANIFEST" min_os_version)" && \
+   -n "$(json_string "$MANIFEST" max_os_version)" && \
    -n "$(json_number "$MANIFEST" target_data_schema)" ]] || \
     fail "persistent app manifest has incomplete compatibility metadata"
 

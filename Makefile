@@ -21,7 +21,9 @@ DOCKER_RELEASE_SDK_PATH ?= /opt/hailo-sdk
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
-AIPC_COMPAT_LEVEL ?= 1
+AIPC_OS_VERSION ?= 1.12.0
+AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
+AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_DATA_SCHEMA ?= 1
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
@@ -422,6 +424,7 @@ _pack-stage:
 	@cp -f scripts/aipc-configure-platform-api-gateway.py "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" || true
 	@cp -f scripts/aipc-logrotate.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" || true
 	@cp -f scripts/aipc-os-layout-check.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" || true
+	@cp -f scripts/aipc-factory-reset.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" || true
 	@cp -f scripts/aipc-restore.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" || true
 	@cp -f scripts/aipc-firstboot-os.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" || true
 	@cp -f scripts/aipc-autostart.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" || true
@@ -450,9 +453,17 @@ _pack-stage:
 	@[ -d web/dist ] && cp -r web/dist/* "$(STAGE_DIR)/opt/aipc/web/" && echo "  + web console" || true
 	@cp -f platform/platform-api/swagger-ui/* "$(STAGE_DIR)/opt/aipc/swagger-ui/" 2>/dev/null || true
 	@cp -f docs/api/swagger.yaml "$(STAGE_DIR)/opt/aipc/etc/swagger.yaml" 2>/dev/null || true
-	@for cat in detection classification segmentation keypoint clip depth ocr genai; do \
+	@staged_models=0; \
+	for cat in detection classification segmentation keypoint clip depth ocr genai; do \
 		mkdir -p "$(STAGE_DIR)/opt/aipc/models/$$cat"; \
-	done
+		for f in "models/$$cat"/*.hef "models/$$cat"/*.json; do \
+			[ -f "$$f" ] || continue; \
+			cp -f "$$f" "$(STAGE_DIR)/opt/aipc/models/$$cat/"; \
+			echo "  + models/$$cat/$$(basename "$$f")"; \
+			staged_models=1; \
+		done; \
+	done; \
+	[ "$$staged_models" -eq 1 ] || echo "  - models/ source tree absent; device must run download_models.sh"
 	@printf '%s\n' \
 		"version=$(VERSION)" \
 		"build_date=$$(date +%Y%m%d-%H%M%S)" \
@@ -463,7 +474,8 @@ _pack-stage:
 		'  "app_version": "$(VERSION)",' \
 		'  "machine": "$(AIPC_MACHINE)",' \
 		'  "product": "$(AIPC_PRODUCT)",' \
-		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
+		'  "min_os_version": "$(AIPC_MIN_OS_VERSION)",' \
+		'  "max_os_version": "$(AIPC_MAX_OS_VERSION)",' \
 		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
 		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
 		'}' > "$(STAGE_DIR)/opt/aipc/app-manifest.json"
@@ -498,7 +510,7 @@ _pack-internal: _pack-stage
 test: test-unit
 
 test-unit: proto
-	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit
+	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit ./tools/aipc-cli/...
 
 test-basic:
 	./scripts/run_basic_tests.sh
