@@ -6247,6 +6247,32 @@ paths:
                     data:
                       $ref: '#/components/schemas/StreamStatusList'
   /media/streams:
+    get:
+      tags: [Media]
+      summary: List configured streams
+      description: Read-only stream inventory as parsed from camera-daemon.yaml
+        (kept in sync after config writes). For runtime encoder state use
+        GET /media/status instead. Each entry carries playback URLs
+        rtsp_url (RTSP mount) and h264_ws_path (H264-over-WebSocket route;
+        prefix with the API base and swap http to ws).
+      operationId: listStreams
+      responses:
+        '200':
+          description: Stream inventory
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        streams:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/StreamView'
     post:
       tags: [Media]
       summary: Add a stream
@@ -6289,6 +6315,36 @@ paths:
                     data:
                       type: object
   /media/streams/{name}:
+    get:
+      tags: [Media]
+      summary: Get a stream's configuration
+      description: Single stream from the config-view inventory, including its
+        playback URLs (rtsp_url, h264_ws_path).
+      operationId: getStream
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream configuration
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      $ref: '#/components/schemas/StreamView'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIResponse'
     delete:
       tags: [Media]
       summary: Remove a stream
@@ -6951,6 +7007,39 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/StreamStatus'
+    StreamView:
+      type: object
+      description: Config-view projection of a stream (GET /media/streams),
+        as opposed to the runtime state in StreamStatus (GET /media/status).
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        codec:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        fps:
+          type: integer
+        bitrate:
+          type: integer
+        gop:
+          type: integer
+        enabled:
+          type: boolean
+        status:
+          type: string
+          description: active when enabled in config, stopped otherwise
+        rtsp_url:
+          type: string
+          description: RTSP mount URL; empty when RTSP base is unconfigured
+        h264_ws_path:
+          type: string
+          description: H264-over-WebSocket route on this API; prefix with the
+            API base URL and swap http->ws
     InfraredStatus:
       type: object
       properties:

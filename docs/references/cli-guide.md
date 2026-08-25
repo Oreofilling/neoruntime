@@ -104,7 +104,7 @@ aipc-cli device gpio write 21 1      # GPIO 21 output high
 ```bash
 aipc-cli stream list                                 # List streams
 aipc-cli stream info <stream-id>                     # Stream details
-aipc-cli stream url <stream-id> [--format rtsp|hls]  # Get stream URL
+aipc-cli stream url <stream-id> [--format ws|rtsp]   # Get stream URL
 ```
 
 ---

@@ -209,8 +209,9 @@ var systemHealthCmd = &cobra.Command{
 			}
 		}
 
-		// Check platform-api (HTTP)
-		url := systemAPIBase + "/health"
+		// Check platform-api (HTTP). The server exposes its health endpoint at
+		// /api/v1/system/health (no auth); there is no bare /health route.
+		url := systemAPIBase + "/api/v1/system/health"
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		resp, err := http.DefaultClient.Do(req)
