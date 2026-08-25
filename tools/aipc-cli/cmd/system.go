@@ -265,13 +265,33 @@ func init() {
 
 // ============ service management ============
 
+// aipcServices mirrors SERVICES in scripts/aipc-autostart.sh (dependency
+// order; stop reverses it). system_test.go fails the build when the two
+// lists drift, so `system stop/disable` always covers the full boot set.
 var aipcServices = []string{
+	"aipc-healthmon",
 	"event-bus",
-	"app-manager",
-	"ai-runtime",
 	"camera-daemon",
+	"ai-runtime",
 	"device-control",
+	"device-discovery",
+	"onvif-device",
 	"platform-api",
+	"app-manager",
+	"aipc-nginx-gateway",
+}
+
+// aipc-autostart re-runs `systemctl enable` + `start` for aipcServices on
+// every boot, so `system disable` must disable it too or the next reboot
+// silently undoes the command. A redeploy (or the OS-upgrade verify boot)
+// re-enables it by design: that is the recovery path, not a bug.
+const aipcAutostartUnit = "aipc-autostart.service"
+
+// unitInstalled reports whether the unit exists at all (systemctl cat loads
+// it from any search path). The CLI skips absent units instead of failing so
+// it keeps working on installs that predate some of the services.
+func unitInstalled(svc string) bool {
+	return exec.Command("systemctl", "cat", svc+".service").Run() == nil
 }
 
 var serviceStartCmd = &cobra.Command{
@@ -337,6 +357,10 @@ func manageServices(action string) error {
 	}
 
 	for _, svc := range services {
+		if !unitInstalled(svc) {
+			printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus("not installed"))
+			continue
+		}
 		cmd := exec.Command("systemctl", action, svc+".service")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -352,7 +376,10 @@ func manageServices(action string) error {
 var serviceEnableCmd = &cobra.Command{
 	Use:   "enable",
 	Short: "Enable and start all AIPC services",
-	Long:  `Enable all AIPC services for auto-start on boot and start them immediately.`,
+	Long: `Enable all AIPC services for auto-start on boot and start them immediately.
+
+Also re-enables aipc-autostart.service, the boot unit that keeps the
+service set enabled across reboots.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		printer.Println("Enabling and starting AIPC services...")
 		printer.Println("────────────────────────────────────")
@@ -368,7 +395,11 @@ var serviceEnableCmd = &cobra.Command{
 var serviceDisableCmd = &cobra.Command{
 	Use:   "disable",
 	Short: "Stop and disable all AIPC services",
-	Long:  `Stop all running AIPC services and disable them from starting on boot.`,
+	Long: `Stop all running AIPC services and disable them from starting on boot.
+
+Also disables aipc-autostart.service, which would otherwise re-enable the
+whole service set at the next reboot. A redeploy or an OS-upgrade verify
+boot re-enables the platform by design (that is the recovery path).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		printer.Println("Stopping and disabling AIPC services...")
 		printer.Println("────────────────────────────────────")
@@ -383,6 +414,10 @@ var serviceDisableCmd = &cobra.Command{
 
 func enableDisableServices(action string) error {
 	for _, svc := range aipcServices {
+		if !unitInstalled(svc) {
+			printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus("not installed"))
+			continue
+		}
 		cmd := exec.Command("systemctl", action, svc+".service")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -394,6 +429,17 @@ func enableDisableServices(action string) error {
 			label = "disabled"
 		}
 		printer.Printf("  %-18s %s\n", svc+":", printer.FormatStatus(label))
+	}
+	// aipc-autostart re-enables the whole list on every boot; without this
+	// line `system disable` is undone at the next reboot.
+	if unitInstalled(strings.TrimSuffix(aipcAutostartUnit, ".service")) {
+		cmd := exec.Command("systemctl", action, aipcAutostartUnit)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			printer.Printf("  %-18s %s (%s)\n", aipcAutostartUnit+":", printer.FormatStatus("failed"), strings.TrimSpace(string(out)))
+			return fmt.Errorf("%s %s failed: %s", action, aipcAutostartUnit, strings.TrimSpace(string(out)))
+		}
+		printer.Printf("  %-18s %s\n", aipcAutostartUnit+":", printer.FormatStatus("(boot auto-start)"))
 	}
 	printer.Success("\nAll services %sd", action)
 	return nil

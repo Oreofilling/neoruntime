@@ -153,9 +153,13 @@ aipc-cli system status                               # Service status
 aipc-cli system start                                # Start all services
 aipc-cli system stop                                 # Stop all services
 aipc-cli system restart                              # Restart all services
-aipc-cli system enable                               # Enable auto-start on boot
-aipc-cli system disable                              # Disable auto-start
+aipc-cli system enable                               # Enable auto-start on boot (incl. aipc-autostart)
+aipc-cli system disable                              # Stop now + disable auto-start (incl. aipc-autostart)
 ```
+
+`disable` survives a reboot: it also disables `aipc-autostart.service`,
+which would otherwise re-enable the whole service set at boot. A redeploy or
+an OS-upgrade verify boot brings the platform back by design.
 
 ---
 
