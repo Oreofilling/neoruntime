@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -448,6 +449,17 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}, nil
 	}
 
+	// Verify spec.model dependencies before pulling the image (fail fast).
+	if err := s.validateModelDependencies(ctx, appManifest, nil); err != nil {
+		return &proto.InstallResponse{
+			Status: &proto.Status{
+				Success: false,
+				Message: fmt.Sprintf("Model dependency validation failed: %v", err),
+				Code:    400,
+			},
+		}, nil
+	}
+
 	// Check duplicate BEFORE pulling image
 	appID := appManifest.Metadata.ID
 	var isUpdate bool
@@ -728,6 +740,13 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		return
 	}
 	task.Update("validating", 5, "Validation complete")
+
+	// Verify spec.models dependencies before pulling the image: a missing
+	// required model fails here instead of after a multi-hundred-MB pull.
+	if err := s.validateModelDependencies(ctx, appManifest, task); err != nil {
+		task.Fail(err.Error())
+		return
+	}
 
 	// Check duplicate BEFORE pulling image
 	asyncAppID := appManifest.Metadata.ID
@@ -2286,6 +2305,88 @@ func (s *AppManagerServer) getModelMeta(modelID string) *ModelMeta {
 		return nil
 	}
 	return &meta
+}
+
+// validateModelDependencies checks spec.models against the models actually
+// loaded on the device, using a single ListModels call (no per-id N+1).
+// Missing required models fail the install with one combined error; missing
+// optional models surface as warnings (task progress message + log). When
+// ai-runtime is unreachable nothing can be verified: required models fail,
+// optional ones warn with the reason. task may be nil (sync InstallApp path).
+// Call before image pull so a missing model fails fast.
+func (s *AppManagerServer) validateModelDependencies(ctx context.Context, appManifest *manifest.AppManifest, task *InstallTask) error {
+	if appManifest == nil || len(appManifest.Spec.Models) == 0 {
+		return nil
+	}
+
+	// Sorted alias→id pairs keep error/warning order deterministic across
+	// Go's randomized map iteration.
+	type modelRef struct{ alias, id string }
+	refs := make([]modelRef, 0, len(appManifest.Spec.Models))
+	for alias, mapping := range appManifest.Spec.Models {
+		refs = append(refs, modelRef{alias: alias, id: mapping.ID})
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].alias < refs[j].alias })
+
+	unavailable := ""
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	if client == nil || !s.config.AIRuntime.Enabled {
+		unavailable = "ai-runtime is not available"
+	} else {
+		resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+		if err != nil {
+			unavailable = fmt.Sprintf("ai-runtime list models failed: %v", err)
+		} else {
+			loaded := make(map[string]bool, len(resp.Models))
+			for _, m := range resp.Models {
+				loaded[m.ModelId] = true
+			}
+			var requiredErrs, warnings []string
+			for _, ref := range refs {
+				if loaded[ref.id] {
+					continue
+				}
+				entry := fmt.Sprintf("%q (alias %q)", ref.id, ref.alias)
+				if appManifest.Spec.Models[ref.alias].Required {
+					requiredErrs = append(requiredErrs, fmt.Sprintf("required model %s is not loaded on the device", entry))
+				} else {
+					warnings = append(warnings, fmt.Sprintf("optional model %s is not loaded on the device", entry))
+				}
+			}
+			return reportModelValidation(requiredErrs, warnings, task)
+		}
+	}
+
+	// Unreachable ai-runtime: nothing could be verified.
+	var requiredErrs, warnings []string
+	for _, ref := range refs {
+		entry := fmt.Sprintf("%q (alias %q)", ref.id, ref.alias)
+		if appManifest.Spec.Models[ref.alias].Required {
+			requiredErrs = append(requiredErrs, fmt.Sprintf("required model %s cannot be verified (%s)", entry, unavailable))
+		} else {
+			warnings = append(warnings, fmt.Sprintf("optional model %s cannot be verified (%s)", entry, unavailable))
+		}
+	}
+	return reportModelValidation(requiredErrs, warnings, task)
+}
+
+// reportModelValidation turns collected per-model errors/warnings into the
+// install result: warnings always log and, when a task is attached, replace
+// its progress message; errors combine into a single returned error.
+func reportModelValidation(requiredErrs, warnings []string, task *InstallTask) error {
+	if len(warnings) > 0 {
+		msg := "Warning: " + strings.Join(warnings, "; ")
+		logger.Warn("%s", msg)
+		if task != nil {
+			task.Update("validating", 5, msg)
+		}
+	}
+	if len(requiredErrs) > 0 {
+		return fmt.Errorf("%s", strings.Join(requiredErrs, "; "))
+	}
+	return nil
 }
 
 // PreloadModels registers the models declared in the manifest with ai-runtime
