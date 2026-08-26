@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"gopkg.in/yaml.v3"
 
+	"aipc/platform/app-manager/manifest"
 	apppb "aipc/platform/app-manager/proto"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
@@ -61,6 +61,8 @@ type NetworkPermsSummary struct {
 }
 
 // readAppPermissions reads the manifest YAML and extracts permissions.
+// Uses the shared manifest.ParseManifest so spec.models ids merged into
+// permissions.inference.models show up here too (single source of truth).
 func readAppPermissions(manifestPath string) *AppPermissions {
 	if manifestPath == "" {
 		return nil
@@ -69,39 +71,13 @@ func readAppPermissions(manifestPath string) *AppPermissions {
 	if err != nil {
 		return nil
 	}
-	var raw struct {
-		Spec struct {
-			Permissions struct {
-				Video     []string `yaml:"video"`
-				Inference struct {
-					Models        []string `yaml:"models"`
-					MaxQPS        int      `yaml:"max_qps"`
-					MaxConcurrent int      `yaml:"max_concurrent"`
-					AllowRegister bool     `yaml:"allow_register_model"`
-				} `yaml:"inference"`
-				Events struct {
-					Publish   []string `yaml:"publish"`
-					Subscribe []string `yaml:"subscribe"`
-				} `yaml:"events"`
-				Device struct {
-					Light bool `yaml:"light"`
-					IrCut bool `yaml:"ir_cut"`
-					PTZ   bool `yaml:"ptz"`
-					Lens  bool `yaml:"lens"`
-				} `yaml:"device"`
-				Network struct {
-					Mode     string   `yaml:"mode"`
-					Outbound []string `yaml:"outbound"`
-					Inbound  []int    `yaml:"inbound"`
-				} `yaml:"network"`
-			} `yaml:"permissions"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	appManifest, err := manifest.ParseManifest(data)
+	if err != nil {
+		logger.Warn("Failed to parse manifest %s for permissions: %v", manifestPath, err)
 		return nil
 	}
 
-	p := raw.Spec.Permissions
+	p := appManifest.Spec.Permissions
 	result := &AppPermissions{}
 
 	if len(p.Video) > 0 {
@@ -806,26 +782,20 @@ func (h *APIHandlers) UploadManifest(c *gin.Context) {
 		return
 	}
 
-	// Parse YAML to extract metadata.id
-	var manifest struct {
-		Metadata struct {
-			ID          string `yaml:"id"`
-			Name        string `yaml:"name"`
-			Version     string `yaml:"version"`
-			Description string `yaml:"description"`
-		} `yaml:"metadata"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		Resp(c).FailMsg(CodeInvalidRequest, "Invalid YAML format: "+err.Error())
+	// Parse via the shared parser: full validation + spec.models merge.
+	appManifest, err := manifest.ParseManifest(data)
+	if err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid manifest: "+err.Error())
 		return
 	}
-	if manifest.Metadata.ID == "" {
+	if appManifest.Metadata.ID == "" {
 		Resp(c).FailMsg(CodeInvalidRequest, "manifest metadata.id is required")
 		return
 	}
 
-	// Save to manifests directory
-	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", manifest.Metadata.ID)
+	// Save the ORIGINAL bytes untouched (fidelity first: comments and
+	// unknown fields survive; canonicalization never happens on write).
+	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", appManifest.Metadata.ID)
 	if err := os.MkdirAll(manifestDir, 0755); err != nil {
 		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
 		return
@@ -837,16 +807,23 @@ func (h *APIHandlers) UploadManifest(c *gin.Context) {
 		return
 	}
 
-	logger.Info("Manifest uploaded: %s (app_id=%s)", manifestPath, manifest.Metadata.ID)
+	logger.Info("Manifest uploaded: %s (app_id=%s)", manifestPath, appManifest.Metadata.ID)
 
 	Resp(c).OK(gin.H{
 		"path": manifestPath,
 		"metadata": gin.H{
-			"id":          manifest.Metadata.ID,
-			"name":        manifest.Metadata.Name,
-			"version":     manifest.Metadata.Version,
-			"description": manifest.Metadata.Description,
+			"id":          appManifest.Metadata.ID,
+			"name":        appManifest.Metadata.Name,
+			"version":     appManifest.Metadata.Version,
+			"description": appManifest.Metadata.Description,
 		},
+		// Full parsed manifest (json-tagged struct): the wizard hydrates from
+		// this without any client-side YAML parsing. Spec.Models ids are
+		// already merged into permissions.inference.models.
+		"manifest": appManifest,
+		// The wizard cannot express spec.containers; the web layer needs to
+		// know before offering editable install for this file.
+		"multi_container": appManifest.IsMultiContainer(),
 	})
 }
 
