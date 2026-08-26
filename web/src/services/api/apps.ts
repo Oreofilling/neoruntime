@@ -72,4 +72,10 @@ export const appsApi = {
 
   // 从已上传的清单+镜像安装应用（异步，返回 task_id）
   installPackage: (data: { manifest_path: string; image_path?: string }) => request.post('/api/v1/apps/install-package', data),
+
+  // 字段级修改已上传的清单（保注释/未知字段，白名单路径 → JSON 值）
+  patchManifest: (data: {
+    manifest_path: string;
+    fields: Record<string, unknown>;
+  }) => request.patch('/api/v1/apps/manifest', data),
 };

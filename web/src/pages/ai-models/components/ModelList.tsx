@@ -44,6 +44,8 @@ interface ModelData {
   used_by_apps?: string[];
   input_width?: number;
   input_height?: number;
+  /** non-empty when the model was registered by an app (R4 owner chain) */
+  owner_app_id?: string;
 }
 
 interface ModelListProps {
@@ -195,6 +197,25 @@ export default function ModelList({
                             {model.variant}
                           </Badge>
                         )}
+                        <Badge
+                          variant="outline"
+                          className={`text-xs max-w-[150px] truncate ${
+                            model.owner_app_id
+                              ? 'border-violet-500/40 text-violet-600 dark:text-violet-400'
+                              : 'text-muted-foreground'
+                          }`}
+                          title={
+                            model.owner_app_id
+                              ? `app-owned · ${model.owner_app_id}`
+                              : 'system'
+                          }
+                        >
+                          {model.owner_app_id
+                            ? t('sys.ai_models.provenance.app_owned', {
+                                id: model.owner_app_id,
+                              })
+                            : t('sys.ai_models.provenance.system')}
+                        </Badge>
                       </div>
                     </td>
                     <td className="px-6 py-4">

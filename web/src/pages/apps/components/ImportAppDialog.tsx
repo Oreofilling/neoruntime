@@ -53,6 +53,11 @@ import {
   translateInstallProgress,
   translateInstallPhase,
 } from '../lib/installProgressMessage';
+import {
+  manifestToWizardConfig,
+  changedPatchFields,
+  isDirty,
+} from '../lib/manifestHydrate';
 
 export interface ImportAppDialogProps {
   open: boolean;
@@ -188,9 +193,15 @@ export default function ImportAppDialog({
   const [packageImagePath, setPackageImagePath] = useState('');
   const [packageImageName, setPackageImageName] = useState('');
   const [isUploadingManifest, setIsUploadingManifest] = useState(false);
+  // mode-3: the uploaded manifest is multi-container (spec.containers) — the
+  // wizard cannot express it, so edits are never written back.
+  const [isMultiContainer, setIsMultiContainer] = useState(false);
 
   const cancelRequestedRef = useRef(false);
   const uploadedImageRef = useRef({ path: '', name: '', size: 0 });
+  // mode-3: snapshot of the config hydrated from the uploaded manifest; dirty
+  // checks and the PATCH body diff against it.
+  const hydratedConfigRef = useRef<WizardConfig | null>(null);
 
   const isStep0SourceReady =    sourceType === 'registry'
       ? !!config.image.trim() && isValidContainerImageRef(config.image)
@@ -230,6 +241,14 @@ export default function ImportAppDialog({
   const installMutation = useWizardInstall();
   const { data: progress } = useInstallProgress(taskId);
 
+  // mode-3 dirty tracking: how many whitelisted fields diverge from the
+  // uploaded file. 0 → install the original bytes untouched.
+  const editedFieldCount = sourceType === 'package'
+    ? Object.keys(changedPatchFields(config, hydratedConfigRef.current)).length
+    : 0;
+  const manifestDirty = sourceType === 'package'
+    && isDirty(config, hydratedConfigRef.current);
+
   const cleanupPaths = useMemo(() => {
     const paths = [manifestPath, packageImagePath, config.image_path].filter(
       Boolean
@@ -251,6 +270,8 @@ export default function ImportAppDialog({
     setPackageImagePath('');
     setPackageImageName('');
     setIsUploadingManifest(false);
+    setIsMultiContainer(false);
+    hydratedConfigRef.current = null;
 
     installMutation.reset();
   };
@@ -334,6 +355,8 @@ export default function ImportAppDialog({
     setPackageImagePath('');
     setPackageImageName('');
     setIsUploadingManifest(false);
+    setIsMultiContainer(false);
+    hydratedConfigRef.current = null;
     installMutation.reset();
   }, [open]);
 
@@ -353,25 +376,52 @@ export default function ImportAppDialog({
 
   const handleInstall = () => {
     if (sourceType === 'package') {
-      // Package mode: use install-package endpoint
+      // Package mode: patch the uploaded manifest with the wizard's edits
+      // (when possible), then install from it.
+      const startPackageInstall = () => {
+        appsApi
+          .installPackage({
+            manifest_path: manifestPath,
+            image_path: packageImagePath || undefined,
+          })
+          .then((res: any) => {
+            const tid = res?.data?.task_id;
+            if (tid) {
+              setTaskId(tid);
+              setStep(steps.length);
+            } else {
+              toast.success(t('sys.apps.toast.installSuccess', 'App installed'));
+              queryClient.invalidateQueries({ queryKey: ['apps'] });
+              onOpenChange(false);
+            }
+          })
+          .catch((error: unknown) => {
+            toast.error(resolveInstallApiError(error, t));
+          });
+      };
+
+      // Untouched walkthrough → install the uploaded bytes as-is (byte-faithful).
+      if (!manifestDirty) {
+        startPackageInstall();
+        return;
+      }
+      // Multi-container manifests are not wizard-expressible; the server
+      // rejects patching them, so install the original file unchanged.
+      if (isMultiContainer) {
+        toast.info(t('sys.apps.import.multi_container_hint'));
+        startPackageInstall();
+        return;
+      }
+
+      const fields = changedPatchFields(config, hydratedConfigRef.current);
       appsApi
-        .installPackage({
-          manifest_path: manifestPath,
-          image_path: packageImagePath || undefined,
-        })
-        .then((res: any) => {
-          const tid = res?.data?.task_id;
-          if (tid) {
-            setTaskId(tid);
-            setStep(steps.length);
-          } else {
-            toast.success(t('sys.apps.toast.installSuccess', 'App installed'));
-            queryClient.invalidateQueries({ queryKey: ['apps'] });
-            onOpenChange(false);
-          }
-        })
+        .patchManifest({ manifest_path: manifestPath, fields })
+        .then(startPackageInstall)
         .catch((error: unknown) => {
-          toast.error(resolveInstallApiError(error, t));
+          toast.error(
+            resolveInstallApiError(error, t)
+              || t('sys.apps.import.patch_failed', 'Failed to apply manifest edits')
+          );
         });
       return;
     }
@@ -474,12 +524,6 @@ export default function ImportAppDialog({
           image: name || prev.image,
         }));
       }
-    }
-
-    // Package mode: install directly from step 0
-    if (sourceType === 'package' && step === 0) {
-      handleInstall();
-      return;
     }
 
     if (step === steps.length - 1) {
@@ -736,6 +780,22 @@ export default function ImportAppDialog({
                           if (data?.path) {
                             setManifestPath(data.path);
                             setManifestMeta(data.metadata || null);
+                            // Hydrate the wizard from the parsed manifest so
+                            // mode-3 walks the same steps as other sources.
+                            // Fields the file omits stay undefined so an
+                            // untouched walkthrough installs byte-identical.
+                            if (data.manifest) {
+                              // Two independent mappings: config and the
+                              // dirty-check snapshot must not share references.
+                              setConfig(manifestToWizardConfig(data.manifest));
+                              hydratedConfigRef.current = manifestToWizardConfig(
+                                data.manifest
+                              );
+                              setIsMultiContainer(!!data.multi_container);
+                            } else {
+                              hydratedConfigRef.current = null;
+                              setIsMultiContainer(false);
+                            }
                           }
                         } catch (err: unknown) {
                           toast.error(
@@ -824,8 +884,14 @@ export default function ImportAppDialog({
                     ...config,
                     metadata: { ...config.metadata, id: e.target.value },
                   })}
+                disabled={sourceType === 'package'}
                 className={`mt-2 ${existingAppIds.has(config.metadata.id.trim()) ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
               />
+              {sourceType === 'package' && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('sys.apps.import.readonly_id_hint')}
+                </p>
+              )}
               {existingAppIds.has(config.metadata.id.trim()) && (
                 <p className="mt-1 text-sm text-red-500">
                   {t(
@@ -1584,6 +1650,26 @@ export default function ImportAppDialog({
               {t('sys.apps.import.review_title')}
             </h2>
 
+            {sourceType === 'package' && (
+              <div
+                className={`mb-4 rounded-lg border p-3 text-sm ${
+                  manifestDirty
+                    ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                    : 'border-border bg-muted/40 text-muted-foreground'
+                }`}
+              >
+                {manifestDirty
+                  ? isMultiContainer
+                    ? t('sys.apps.import.multi_container_edited', {
+                        n: editedFieldCount,
+                      })
+                    : t('sys.apps.import.manifest_edited', {
+                        n: editedFieldCount,
+                      })
+                  : t('sys.apps.import.manifest_untouched')}
+              </div>
+            )}
+
             <div className="space-y-4 pr-0 sm:pr-4">
               {/* Basic Info */}
               <div className="border-b border-border pb-3">
@@ -1926,8 +2012,7 @@ export default function ImportAppDialog({
                   || (step === 0 && !isStep0SourceReady)
                 }
               >
-                {(sourceType === 'package' && step === 0)
-                || step === steps.length - 1
+                {step === steps.length - 1
                   ? installMutation.isPending
                     ? t('sys.apps.import.installing')
                     : t('common.install', 'Install')

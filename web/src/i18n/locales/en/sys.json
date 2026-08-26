@@ -1326,6 +1326,12 @@
         "manifest_file": "App Manifest",
         "click_upload_manifest": "Click to upload app.yaml",
         "manifest_upload_failed": "Manifest upload failed",
+        "readonly_id_hint": "Determined by the uploaded app.yaml — the manifest directory is bound to this ID",
+        "manifest_untouched": "No changes — the original app.yaml will be installed as-is",
+        "manifest_edited": "Modified {{n}} field(s) — edits will be written back to the manifest before install",
+        "multi_container_edited": "Modified {{n}} field(s), but multi-container manifests cannot be wizard-edited — the original app.yaml will be installed as-is",
+        "multi_container_hint": "Multi-container manifest: wizard edits cannot be applied, installing the original file",
+        "patch_failed": "Failed to apply manifest edits",
         "package_image": "Container Image",
         "package_image_hint": "Optional if app.yaml uses registry image",
         "image_address": "Image Address",
@@ -1660,6 +1666,10 @@
         "default": "General AI Inference Model"
       },
       "apps": "Apps",
+      "provenance": {
+        "system": "system",
+        "app_owned": "app-owned · {{id}}"
+      },
       "time": {
         "just_now": "Just now",
         "minutes_ago": "minutes ago",

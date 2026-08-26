@@ -1250,6 +1250,12 @@
         "manifest_file": "应用配置文件",
         "click_upload_manifest": "点击上传 app.yaml",
         "manifest_upload_failed": "配置文件上传失败",
+        "readonly_id_hint": "由上传的 app.yaml 决定 — 清单目录与此 ID 绑定，不可修改",
+        "manifest_untouched": "未修改，将按原文件内容原样安装",
+        "manifest_edited": "已修改 {{n}} 处，安装前将写回清单",
+        "multi_container_edited": "已修改 {{n}} 处，但多容器清单不支持向导修改，仍将按原文件原样安装",
+        "multi_container_hint": "多容器清单：向导修改无法写回，将按原文件安装",
+        "patch_failed": "清单修改写回失败",
         "package_image": "容器镜像",
         "package_image_hint": "如 app.yaml 使用远程镜像则可选",
         "image_address": "镜像地址",
@@ -1584,6 +1590,10 @@
         "default": "通用AI推理模型"
       },
       "apps": "应用",
+      "provenance": {
+        "system": "系统",
+        "app_owned": "应用自有 · {{id}}"
+      },
       "time": {
         "just_now": "刚刚",
         "minutes_ago": "分钟前",

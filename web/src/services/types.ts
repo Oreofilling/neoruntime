@@ -272,4 +272,67 @@ export interface WizardConfig {
   volumes?: Array<{ host: string; container: string; readonly?: boolean }>;
   autostart?: boolean;
   restart_policy?: string;
+  security?: {
+    no_new_privileges?: boolean;
+    readonly_rootfs?: boolean;
+  };
+}
+
+/**
+ * Full app manifest as returned by upload-manifest / PATCH /apps/manifest
+ * (the `manifest` field). Mirrors the Go manifest structs' json tags for the
+ * wizard-expressible subset; unknown future fields are ignored by design.
+ */
+export interface AppManifestDTO {
+  apiVersion?: string;
+  kind?: string;
+  metadata: {
+    id: string;
+    name: string;
+    version: string;
+    description?: string;
+    author?: string;
+    email?: string;
+  };
+  spec: {
+    image?: string;
+    permissions?: {
+      video?: string[];
+      inference?: {
+        models?: string[];
+        max_qps?: number;
+        max_concurrent?: number;
+        allow_register_model?: boolean;
+      };
+      events?: {
+        publish?: string[];
+        subscribe?: string[];
+      };
+      device?: {
+        light?: boolean;
+        ir_cut?: boolean;
+        ptz?: boolean;
+        lens?: boolean;
+      };
+      network?: {
+        mode?: string;
+        inbound?: number[];
+      };
+    };
+    resources?: {
+      cpu?: string;
+      memory?: string;
+    };
+    env?: Array<{ name: string; value: string }>;
+    volumes?: Array<{ host: string; container: string; readonly?: boolean }>;
+    autostart?: boolean;
+    restart_policy?: string;
+    security?: {
+      no_new_privileges?: boolean | null;
+      readonly_rootfs?: boolean | null;
+    };
+    /** present on the DTO but wizard-unpatchable (read-only display) */
+    models?: Record<string, { id: string; path?: string; required?: boolean }>;
+    containers?: unknown;
+  };
 }
