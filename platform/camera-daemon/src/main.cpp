@@ -589,6 +589,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.fine_step = static_cast<int>(parse_u32_config(val, "autofocus.fine_step"));
             else if (trimmed.find("fine_span:") != std::string::npos)
                 cfg.autofocus.fine_span = static_cast<int>(parse_u32_config(val, "autofocus.fine_span"));
+            else if (trimmed.find("trace_scan:") != std::string::npos)
+                cfg.autofocus.trace_scan = (val == "true" || val == "1");
             else if (trimmed.find("max_moves:") != std::string::npos)
                 cfg.autofocus.max_moves = static_cast<int>(parse_u32_config(val, "autofocus.max_moves"));
             else if (trimmed.find("balanced_retry:") != std::string::npos)
@@ -660,6 +662,26 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009.zoom_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.zoom_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("focus_pps:") != std::string::npos)
                     cfg.lens_fg2009.focus_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.focus_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("af_coarse_step:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_step = (int)parse_u32_config(val, "lens.fg2009.af_coarse_step");
+                else if (trimmed.find("af_coarse_span:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_span = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span");
+                else if (trimmed.find("af_coarse_span_low_zoom:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_span_low_zoom = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span_low_zoom");
+                else if (trimmed.find("af_coarse_span_zoom_threshold:") != std::string::npos)
+                    cfg.lens_fg2009_af_coarse_span_zoom_threshold = parse_float_config(val, "lens.fg2009.af_coarse_span_zoom_threshold");
+                else if (trimmed.find("af_fine_span:") != std::string::npos)
+                    cfg.lens_fg2009_af_fine_span = (int)parse_u32_config(val, "lens.fg2009.af_fine_span");
+                else if (trimmed.find("af_confidence_accept:") != std::string::npos)
+                    cfg.lens_fg2009_af_confidence_accept = parse_float_config(val, "lens.fg2009.af_confidence_accept");
+                else if (trimmed.find("af_balanced_retry:") != std::string::npos)
+                    cfg.lens_fg2009_af_balanced_retry = (int)parse_u32_config(val, "lens.fg2009.af_balanced_retry");
+                else if (trimmed.find("af_boot_oneshot:") != std::string::npos)
+                    cfg.lens_fg2009_af_boot_oneshot = (int)parse_u32_config(val, "lens.fg2009.af_boot_oneshot");
+                else if (trimmed.find("af_pps:") != std::string::npos)
+                    cfg.lens_fg2009_af_pps = (int)parse_u32_config(val, "lens.fg2009.af_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("af_move_timeout_ms:") != std::string::npos)
+                    cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
                 else if (trimmed.find("focus_curve_path:") != std::string::npos)
                     cfg.lens_fg2009_focus_curve_path = val;
             }

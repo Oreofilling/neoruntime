@@ -2880,6 +2880,35 @@ bool CameraDaemon::load_profile_config(std::string* profile_name) {
     return false;
 }
 
+/* FG2009 one-shot autofocus injection: geometry is a lens property — the
+ * focus range is the vendor curve range (curve coordinates, the same space
+ * the daemon uses everywhere for fg2009) and startup AF stays off because
+ * power-on parking already lands on the curve.  Tunables take fg2009-specific
+ * defaults (yaml lens.fg2009.af_* can override them) so the shared
+ * autofocus: section keeps its af0832 values untouched. */
+static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
+                                             AutofocusConfig* af) {
+    af->min_focus_pos = 0;
+    af->max_focus_pos = 2453;
+    af->startup_af = false;
+    af->coarse_step = cfg.lens_fg2009_af_coarse_step;
+    af->coarse_span = cfg.lens_fg2009_af_coarse_span;
+    af->coarse_span_low_zoom = cfg.lens_fg2009_af_coarse_span_low_zoom;
+    af->coarse_span_zoom_threshold = cfg.lens_fg2009_af_coarse_span_zoom_threshold;
+    af->fine_span = cfg.lens_fg2009_af_fine_span;
+    af->confidence_accept = cfg.lens_fg2009_af_confidence_accept;
+    af->balanced_retry = cfg.lens_fg2009_af_balanced_retry;
+    af->pps = cfg.lens_fg2009_af_pps;
+    af->move_timeout_ms = cfg.lens_fg2009_af_move_timeout_ms;
+    // The boot one-shot job blocks in wait_lens_ready() until the FG2009
+    // bootstrap parks.  After some restarts the first MCU lens_init stalls for
+    // ~2 minutes before failing and the retry succeeds (observed: init fail at
+    // +117s, bootstrapped at +128s) — just past the shared 120s deadline, which
+    // surfaced as "lens did not become ready" in the UI.  The boot AF is not
+    // latency-critical, so wait up to 5 minutes instead.
+    af->startup_ready_timeout_ms = 300000;
+}
+
 #ifdef HAS_GRPC
 void CameraDaemon::start_grpc_server() {
     std::string server_address("unix:///run/aipc/camera-control.sock");
@@ -2967,15 +2996,16 @@ void CameraDaemon::start_grpc_server() {
                              ? SelectedMode::Infrared : SelectedMode::Day;
     }
 
-    // FG2009 is open-loop with no AF: the controller would only ever fail.
-    if (config_.autofocus.enabled && config_.lens_model == "fg2009") {
-        HAL_LOG_INFO("CameraDaemon: autofocus disabled for lens model fg2009");
-    } else if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
+    AutofocusConfig af_cfg = config_.autofocus;
+    if (config_.lens_model == "fg2009") {
+        apply_fg2009_autofocus_overrides(config_, &af_cfg);
+    }
+    if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
         autofocus_controller_ = std::make_unique<AutofocusController>(
             hal_loader_->isp(), hal_loader_->video(), video_source_->video_ctx(),
             frame_router_.get(), lens_controller_, illumination_controller_.get(),
-            config_.autofocus,
+            af_cfg,
             0, 0,
             [this]() { return refresh_autofocus_video_context(); });
     } else if (config_.autofocus.enabled) {
@@ -2993,7 +3023,25 @@ void CameraDaemon::start_grpc_server() {
     chmod(sock_path, 0660);
     chown(sock_path, -1, 1001);
 
-    if (autofocus_controller_) autofocus_controller_->start();
+    if (autofocus_controller_) {
+        autofocus_controller_->start();
+        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot) {
+            // Boot focus: the FG2009 park lands on the INF curve; refine once
+            // right after the lens parks.  The queued job blocks in
+            // wait_lens_ready until the bootstrap finishes and the motors
+            // stop, so the scan always starts from the parked position (and
+            // the stat warm-up covers the still-warming video pipeline).
+            uint64_t boot_job = 0;
+            std::string af_error;
+            if (autofocus_controller_->start_one_shot(&boot_job, &af_error)) {
+                HAL_LOG_INFO("CameraDaemon: fg2009 boot autofocus job %llu queued",
+                             (unsigned long long)boot_job);
+            } else {
+                HAL_LOG_WARNING("CameraDaemon: fg2009 boot autofocus rejected: %s",
+                                af_error.c_str());
+            }
+        }
+    }
 }
 
 void CameraDaemon::stop_grpc_server() {
@@ -3990,10 +4038,8 @@ bool CameraDaemon::set_ircut(uint32_t mode) {
 }
 
 bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error) {
-    if (config_.lens_model == "fg2009") {
-        if (error) *error = "autofocus not supported on lens fg2009";
-        return false;
-    }
+    // FG2009 runs one-shot AF too: the scan rides the current focus position
+    // (the curve landing) with a +-300-step window, no zoom-follow involved.
 #ifdef HAS_GRPC
     if (autofocus_controller_) return autofocus_controller_->start_one_shot(job_id, error);
 #endif
@@ -4004,7 +4050,9 @@ bool CameraDaemon::start_autofocus_one_shot(uint64_t* job_id, std::string* error
 bool CameraDaemon::start_autofocus_zoom_follow(float ratio, uint64_t* job_id,
                                                 std::string* error) {
     if (config_.lens_model == "fg2009") {
-        if (error) *error = "autofocus not supported on lens fg2009";
+        // "Follow" on fg2009 is the DUAL_REL curve landing inside
+        // ZoomGotoRatio; the af0832 follow engine has no role here.
+        if (error) *error = "zoom follow not supported on lens fg2009";
         return false;
     }
 #ifdef HAS_GRPC
@@ -4079,16 +4127,35 @@ bool CameraDaemon::set_led_duty_raw(uint32_t led_id, uint32_t duty_percent) {
 }
 
 void CameraDaemon::on_fg2009_zoom_moved(double zoom_ratio) {
-    if (!illumination_controller_) return;
     // Mirror the AF0832 zoom-follow cycle in one shot: takeover (drops a
     // stale manual override), apply the endpoint LUT row, release.
-    std::string error;
-    illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
-    illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
-    illumination_controller_->end_zoom_follow(zoom_ratio, &error);
-    if (!error.empty()) {
-        HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
-                        zoom_ratio, error.c_str());
+    if (illumination_controller_) {
+        std::string error;
+        illumination_controller_->begin_zoom_follow(zoom_ratio, &error);
+        illumination_controller_->apply_endpoint_ratio(zoom_ratio, &error);
+        illumination_controller_->end_zoom_follow(zoom_ratio, &error);
+        if (!error.empty()) {
+            HAL_LOG_WARNING("CameraDaemon: IR zoom-follow reapply at %.3fx: %s",
+                            zoom_ratio, error.c_str());
+        }
+    }
+    // Post-zoom one-shot AF: the DUAL_REL landing rode the INF tracking
+    // curve, so the current focus position is the search center and the
+    // injected coarse span (300) is the bench-validated search window.  This
+    // observer runs with the lens service mutex held, so only the pure
+    // enqueue is safe here; the worker's wait_lens_ready rides out the zoom
+    // travel before scanning, and the scan only moves focus, so this never
+    // re-enters the observer.
+    if (autofocus_controller_) {
+        uint64_t job_id = 0;
+        std::string af_error;
+        if (autofocus_controller_->start_one_shot(&job_id, &af_error)) {
+            HAL_LOG_INFO("CameraDaemon: post-zoom autofocus job %llu started at "
+                         "%.3fx", (unsigned long long)job_id, zoom_ratio);
+        } else {
+            HAL_LOG_INFO("CameraDaemon: post-zoom autofocus skipped at %.3fx: %s",
+                         zoom_ratio, af_error.c_str());
+        }
     }
 }
 
