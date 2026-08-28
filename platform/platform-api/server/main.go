@@ -432,6 +432,11 @@ func (s *PlatformAPIServer) setupRoutes() {
 		AppManager:    s.grpcClients.appManager,
 	}, modelStoragePath, modelStore, s.db, s.config.Auth.Username, s.config.Auth.Password, authValidator, rsaPriv, rsaPubPEM, s.eventLogger)
 
+	// Disk-seeded model rows carry no file hash (only web imports compute one).
+	// Backfill in the background — hashing every model can take seconds per
+	// multi-GB file and must not delay startup.
+	go apiHandlers.BackfillMissingHashes()
+
 	// Phase 2: reconcile the desired-state store with live config at startup.
 	// Currently scopes the media domain (camera-daemon.yaml): confirms the live
 	// file matches the desired row (in-sync no-op), re-projects the desired
@@ -570,6 +575,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	ai.POST("/models/scan", apiHandlers.ScanModels)
 	ai.POST("/models", apiHandlers.RegisterModel)
 	ai.GET("/models/:model_id", apiHandlers.GetModelInfo)
+	ai.PUT("/models/:model_id", apiHandlers.UpdateModel)
 	ai.DELETE("/models/:model_id", apiHandlers.UnregisterModel)
 	ai.GET("/models/:model_id/apps", apiHandlers.GetModelApps)
 	ai.POST("/models/:model_id/load", apiHandlers.LoadModel)

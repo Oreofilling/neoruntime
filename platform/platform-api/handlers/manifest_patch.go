@@ -22,9 +22,11 @@ import (
 //     lookups
 //   - spec.image must keep matching the uploaded tar's RepoTag; changing it
 //     would break the import reconciliation
-//   - spec.models is a dependency declaration the wizard cannot express —
-//     the wizard edits the merged authorization list
-//     permissions.inference.models instead
+//   - spec.models is patchable only as a whole map — the wizard's model
+//     dependency editor replaces the full alias→mapping set in one op.
+//     Per-alias subpaths (spec.models.<alias>.id and friends) stay rejected:
+//     partial edits could silently drop path/type/required subfields the
+//     form cannot express
 var patchableFields = map[string]bool{
 	"metadata.name":        true,
 	"metadata.version":     true,
@@ -34,6 +36,8 @@ var patchableFields = map[string]bool{
 	"spec.resources.memory": true,
 	"spec.autostart":        true,
 	"spec.restart_policy":   true,
+
+	"spec.models": true,
 
 	"spec.permissions.video":                          true,
 	"spec.permissions.inference.models":               true,

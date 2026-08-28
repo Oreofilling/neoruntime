@@ -128,6 +128,50 @@ func TestGenerateAppYAMLFullRequestRoundTrip(t *testing.T) {
 	}
 }
 
+// The top-level models map lands in spec.models verbatim — path/type/required
+// subfields survive the round-trip — and an empty map leaves no stray key.
+func TestGenerateAppYAMLModelsMapRoundTrip(t *testing.T) {
+	req := &WizardRequest{
+		Metadata: WizardMetadata{ID: "model-app", Name: "Model App", Version: "1.0.0"},
+		Image:    "docker.io/library/alpine:latest",
+		Models: map[string]manifest.ModelMapping{
+			"detector": {ID: "yolov8s-640", Path: "/opt/models/yolov8s.hef", Type: "detection", Required: true},
+			"clip":     {ID: "clip_vit_b_32"},
+		},
+	}
+	data, err := yaml.Marshal(wizardRequestToManifest(req))
+	if err != nil {
+		t.Fatalf("yaml.Marshal() error: %v", err)
+	}
+	parsed, err := manifest.ParseManifest(data)
+	if err != nil {
+		t.Fatalf("ParseManifest(round-trip) error: %v\nYAML:\n%s", err, data)
+	}
+	if len(parsed.Spec.Models) != 2 {
+		t.Fatalf("models = %+v, want 2 entries\nYAML:\n%s", parsed.Spec.Models, data)
+	}
+	det := parsed.Spec.Models["detector"]
+	if det.ID != "yolov8s-640" || det.Path != "/opt/models/yolov8s.hef" || det.Type != "detection" || !det.Required {
+		t.Errorf("models[detector] = %+v\nYAML:\n%s", det, data)
+	}
+	if clip := parsed.Spec.Models["clip"]; clip.ID != "clip_vit_b_32" || clip.Required {
+		t.Errorf("models[clip] = %+v", clip)
+	}
+
+	// No dependencies → no models key at all.
+	bare := &WizardRequest{
+		Metadata: WizardMetadata{ID: "bare-app", Name: "Bare", Version: "1.0.0"},
+		Image:    "docker.io/library/alpine:latest",
+	}
+	bareData, err := yaml.Marshal(wizardRequestToManifest(bare))
+	if err != nil {
+		t.Fatalf("yaml.Marshal(bare) error: %v", err)
+	}
+	if strings.Contains(string(bareData), "models") {
+		t.Errorf("empty models map should produce no models key:\n%s", bareData)
+	}
+}
+
 func TestGenerateAppYAMLMinimalRequestNoEmptyBlocks(t *testing.T) {
 	req := &WizardRequest{
 		Metadata: WizardMetadata{ID: "minimal-app", Name: "Minimal App", Version: "1.0.0"},

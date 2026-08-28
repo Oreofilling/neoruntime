@@ -42,6 +42,15 @@ func (r *AIModelRepo) Update(m *model.AIModel) error {
 	return r.db.Save(m).Error
 }
 
+// UpdateFileHash sets only the file hash, leaving concurrent row changes
+// (status, config) untouched — used by the background hash backfill, which
+// may hold a row for seconds while hashing a multi-GB file.
+func (r *AIModelRepo) UpdateFileHash(modelID string, hash string) error {
+	return r.db.Model(&model.AIModel{}).
+		Where("model_id = ?", modelID).
+		Update("file_hash", hash).Error
+}
+
 // GetByFilePath retrieves a model by its file path.
 func (r *AIModelRepo) GetByFilePath(filePath string) (*model.AIModel, error) {
 	var m model.AIModel

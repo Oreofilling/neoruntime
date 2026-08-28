@@ -114,6 +114,12 @@ type WizardRequest struct {
 	RestartPolicy string            `json:"restart_policy,omitempty"`
 	Security      WizardSecurity    `json:"security,omitempty"`
 	Force         bool              `json:"force,omitempty"`
+
+	// Models is the declarative model dependency map (spec.models): alias →
+	// model id (+ optional in-image path/type, required flag). The web wizard's
+	// 模型依赖 editor sends this; permissions.inference.models stays as the
+	// legacy authorization list and is no longer sent by the wizard.
+	Models map[string]manifest.ModelMapping `json:"models,omitempty"`
 }
 
 type WizardMetadata struct {
@@ -137,6 +143,9 @@ type WizardPermissions struct {
 }
 
 type WizardInference struct {
+	// Models is the legacy authorization list. The web wizard now sends the
+	// declarative top-level `models` map instead; this field stays accepted so
+	// older API clients keep installing.
 	Models        []string `json:"models,omitempty"`
 	MaxQPS        int      `json:"max_qps,omitempty"`
 	MaxConcurrent int      `json:"max_concurrent,omitempty"`
@@ -202,6 +211,12 @@ func wizardRequestToManifest(req *WizardRequest) *manifest.AppManifest {
 			CPU:    req.Resources.CPU,
 			Memory: req.Resources.Memory,
 		}
+	}
+
+	// Model dependencies land in spec.models verbatim — including path/type/
+	// required subfields the form itself may not edit but must not drop.
+	if len(req.Models) > 0 {
+		m.Spec.Models = req.Models
 	}
 
 	if p := req.Permissions; p.Video != nil || p.Inference != nil || p.Events != nil || p.Device != nil || p.Network != nil {

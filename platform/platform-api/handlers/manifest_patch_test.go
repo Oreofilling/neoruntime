@@ -157,7 +157,7 @@ func TestPatchManifestWhitelist(t *testing.T) {
 	}{
 		{"metadata_id", "metadata.id"},
 		{"spec_image", "spec.image"},
-		{"spec_models", "spec.models"},
+		{"spec_models_subpath", "spec.models.detector.id"},
 		{"random", "metadata.evolved"},
 	}
 	for _, tc := range tests {
@@ -177,6 +177,80 @@ func TestPatchManifestWhitelist(t *testing.T) {
 				t.Fatalf("disk file changed on rejected patch")
 			}
 		})
+	}
+}
+
+// spec.models is patchable as a whole map: set → clear-with-null round trip,
+// with the response echoing the dependency map and the disk file losing the
+// models subtree entirely on clear.
+func TestPatchManifestSpecModelsMap(t *testing.T) {
+	dir, restore := newPatchTestEnv(t, patchTestManifest)
+	defer restore()
+	h := &APIHandlers{}
+	path := filepath.Join(dir, "app.yaml")
+
+	w := callPatch(t, h, `{
+		"manifest_path": `+quoteJSON(path)+`,
+		"fields": {
+			"spec.models": {
+				"detector": {"id": "yolov8s-640", "path": "/opt/models/yolov8s.hef", "type": "detection", "required": true}
+			}
+		}
+	}`)
+	if code := patchCode(t, w); code != CodeSuccess {
+		t.Fatalf("set code = %d, want %d; body: %s", code, CodeSuccess, w.Body.String())
+	}
+
+	var resp struct {
+		Data struct {
+			Manifest struct {
+				Spec struct {
+					Models map[string]struct {
+						ID       string `json:"id"`
+						Path     string `json:"path"`
+						Type     string `json:"type"`
+						Required bool   `json:"required"`
+					} `json:"models"`
+				} `json:"spec"`
+			} `json:"manifest"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode success body: %v", err)
+	}
+	if got := resp.Data.Manifest.Spec.Models["detector"]; got.ID != "yolov8s-640" || got.Path != "/opt/models/yolov8s.hef" || got.Type != "detection" || !got.Required {
+		t.Errorf("response models[detector] = %+v", got)
+	}
+
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// jsonToNode deliberately keeps JSON scalar quoting (type fidelity), so
+	// patch-written map keys/values land double-quoted — valid YAML that
+	// round-trips identically.
+	for _, want := range []string{"models:", `"detector":`, `"id": "yolov8s-640"`, `"path": "/opt/models/yolov8s.hef"`, `"type": "detection"`, `"required": true`} {
+		if !strings.Contains(string(onDisk), want) {
+			t.Errorf("disk missing %q:\n%s", want, onDisk)
+		}
+	}
+
+	w = callPatch(t, h, `{
+		"manifest_path": `+quoteJSON(path)+`,
+		"fields": {"spec.models": null}
+	}`)
+	if code := patchCode(t, w); code != CodeSuccess {
+		t.Fatalf("clear code = %d, want %d; body: %s", code, CodeSuccess, w.Body.String())
+	}
+	onDisk, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after clear: %v", err)
+	}
+	if strings.Contains(string(onDisk), "models") {
+		t.Errorf("clear should remove the models subtree:\n%s", onDisk)
+	}
+	if !strings.Contains(string(onDisk), "keep-me") {
+		t.Errorf("unknown sibling lost on clear:\n%s", onDisk)
 	}
 }
 
