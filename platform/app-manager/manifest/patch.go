@@ -9,10 +9,11 @@ import (
 )
 
 // FieldPatch is one field-level edit: a dotted path into the document plus
-// the JSON-encoded replacement value.
+// the JSON-encoded replacement value. A JSON null value deletes the target
+// key (clearing a map like spec.models leaves no empty node behind).
 type FieldPatch struct {
 	Path  string // e.g. "spec.permissions.inference.models"
-	Value []byte // JSON bytes
+	Value []byte // JSON bytes; null = delete
 }
 
 // PatchDocument applies ops to src and returns the re-marshaled document.
@@ -109,10 +110,12 @@ func clearFlowStyle(n *yaml.Node) {
 }
 
 // setPath walks (creating as needed) the mapping chain along segs and
-// replaces or appends the value at the last segment. Existing key nodes are
-// preserved — only the value node is swapped — and comments attached to the
-// replaced value carry over to the replacement when it brings none of its
-// own.
+// replaces or appends the value at the last segment. A null value deletes
+// the target key instead (no-op when absent) — that is how a patch clears a
+// map like spec.models without leaving `models:` empty nodes behind.
+// Existing key nodes are preserved — only the value node is swapped — and
+// comments attached to the replaced value carry over to the replacement
+// when it brings none of its own.
 func setPath(root *yaml.Node, segs []string, value *yaml.Node) error {
 	cur := root
 	for _, seg := range segs[:len(segs)-1] {
@@ -130,6 +133,10 @@ func setPath(root *yaml.Node, segs []string, value *yaml.Node) error {
 	last := segs[len(segs)-1]
 	for i := 0; i+1 < len(cur.Content); i += 2 {
 		if cur.Content[i].Value == last {
+			if isNullNode(value) {
+				cur.Content = append(cur.Content[:i], cur.Content[i+2:]...)
+				return nil
+			}
 			old := cur.Content[i+1]
 			if value.HeadComment == "" {
 				value.HeadComment = old.HeadComment
@@ -144,9 +151,17 @@ func setPath(root *yaml.Node, segs []string, value *yaml.Node) error {
 			return nil
 		}
 	}
+	if isNullNode(value) {
+		return nil // deleting a key that is not there is a no-op
+	}
 	key := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: last}
 	cur.Content = append(cur.Content, key, value)
 	return nil
+}
+
+// isNullNode reports whether n is the null scalar JSON null parses to.
+func isNullNode(n *yaml.Node) bool {
+	return n.Kind == yaml.ScalarNode && n.Tag == "!!null"
 }
 
 // childMapping returns the mapping stored under key, or nil when the key is

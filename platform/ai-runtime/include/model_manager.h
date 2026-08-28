@@ -24,6 +24,14 @@ struct ModelEntry {
     std::string  name;                  // Display name for the model
     std::string  path;
 
+    // App-bundled model (extracted from an app image by app-manager).
+    // Transient models are hidden from the model page: platform-api's
+    // syncRuntimeModelsToDB skips them, so they never reach platform.db.
+    // Set at first registration; co-ownership re-registrations keep the
+    // stored value (a model already loaded under a visibility contract
+    // keeps it).
+    bool         transient = false;
+
     HalInferenceSession* infer_session = nullptr;  // HAL v2 inference session
     PostprocessSession   post_session;              // HAL v2 postprocess session
 
@@ -54,9 +62,11 @@ public:
 
     /// Register (load) a model. If owner_id is non-empty, it tracks ownership.
     /// If the model is already loaded by another owner, this just adds co-ownership.
+    /// transient marks an app-bundled model (hidden from the model page).
     /// Returns 0 on success, <0 on error.
     int register_model(const std::string& model_id, const std::string& model_path,
-                       const std::string& owner_id = "");
+                       const std::string& owner_id = "",
+                       bool transient = false);
 
     /// Unregister (unload) a model. If owner_id is given, only removes that owner.
     /// The model is physically unloaded only when no owners remain AND ref_count == 0.

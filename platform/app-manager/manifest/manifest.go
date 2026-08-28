@@ -3,6 +3,7 @@ package manifest
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -66,8 +67,18 @@ type SecuritySpec struct {
 
 // ModelMapping resolves an app-side alias to a concrete model.
 type ModelMapping struct {
-	ID       string `yaml:"id" json:"id"`                                 // platform model id (required)
-	Path     string `yaml:"path,omitempty" json:"path,omitempty"`         // in-image model file (Phase B; rejected this round with a clear error)
+	ID string `yaml:"id" json:"id"` // model id (required: runtime identity and AIPC_MODEL_<alias> value)
+	// Path is an in-image model file used when the id is not found on the
+	// platform: the file is extracted from the app image and registered as a
+	// transient (app-bundled) model, hidden from the model page. Absolute
+	// container path, no ".." segments. Requires Type.
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+	// Type is the postprocess type for a path-declared (bundled) model —
+	// detection, segmentation, keypoint, ... It mirrors platform.db's
+	// model_type, which bundled models have no access to. Required with Path
+	// (ai-runtime rejects bundled models without it: raw-tensor-only output
+	// would silently break apps expecting structured results).
+	Type     string `yaml:"type,omitempty" json:"type,omitempty"`
 	Required bool   `yaml:"required,omitempty" json:"required,omitempty"` // default false: warn when missing; true: block install
 }
 
@@ -249,6 +260,11 @@ type AutoRestart struct {
 // it must be a valid environment variable name fragment.
 var modelAliasPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// modelTypePattern guards the format of spec.models.<alias>.type. The
+// semantic authority for accepted postprocess types is ai-runtime's
+// init_post_process; this only catches authoring mistakes at parse time.
+var modelTypePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
 // reservedModelAliases names that would shadow or be confused with
 // platform-injected container env names (AIPC_HOST_PREFIX, APP_ID, APP_ROLE,
 // CONTAINER_NAME). Refusing them keeps the container environment unambiguous.
@@ -374,6 +390,9 @@ func (m *AppManifest) Validate() error {
 // ValidateModels validates spec.models declarations.
 // Alias keys become env var suffixes (AIPC_MODEL_<alias>), so they must be
 // valid identifiers and must not shadow platform-injected env names.
+// A declared path turns the entry into a bundled-model fallback (extracted
+// from the app image when the id is not found on the platform); it must be
+// an absolute, clean container path and carry a postprocess type.
 func (m *AppManifest) ValidateModels() error {
 	for alias, mapping := range m.Spec.Models {
 		if !modelAliasPattern.MatchString(alias) {
@@ -385,10 +404,29 @@ func (m *AppManifest) ValidateModels() error {
 		if mapping.ID == "" {
 			return fmt.Errorf("spec.models.%s.id is required", alias)
 		}
-		if mapping.Path != "" {
-			// Phase B (in-image models) is not implemented yet; fail loudly
-			// instead of silently pretending to support it.
-			return fmt.Errorf("spec.models.%s.path is not supported yet (planned Phase B); use a platform-hosted model id instead", alias)
+		if mapping.Path == "" {
+			if mapping.Type != "" {
+				// No semantics for a type without a bundled file — platform
+				// models take their postprocess type from platform.db. Reject
+				// instead of silently ignoring a field the author wrote.
+				return fmt.Errorf("spec.models.%s.type is only valid together with path", alias)
+			}
+			continue
+		}
+		// Bundled-model fallback declared: validate the in-image path.
+		if !filepath.IsAbs(mapping.Path) || filepath.Clean(mapping.Path) != mapping.Path || mapping.Path == "/" {
+			return fmt.Errorf("spec.models.%s.path must be an absolute container path without '.', '..' or redundant separators (got %q)",
+				alias, mapping.Path)
+		}
+		if mapping.Type == "" {
+			// Mirror of the ai-runtime guard so the failure surfaces at
+			// manifest-parse time: bundled models have no platform.db entry
+			// to supply a postprocess type, and registering without one would
+			// silently yield raw-tensor-only output.
+			return fmt.Errorf("spec.models.%s.type is required when path is declared (e.g. detection, segmentation)", alias)
+		}
+		if !modelTypePattern.MatchString(mapping.Type) {
+			return fmt.Errorf("spec.models.%s.type must match %s", alias, modelTypePattern.String())
 		}
 	}
 	return nil
@@ -679,6 +717,43 @@ func (m *AppManifest) GetMainContainer() (string, *ContainerSpec) {
 		}
 	}
 	return "", nil
+}
+
+// ImageReferences returns the normalized image references the app needs at
+// start time: spec.image for single-container manifests, one entry per
+// container for multi-container manifests (main first, the rest in sorted
+// key order). Empty and duplicate references are skipped.
+func (m *AppManifest) ImageReferences() []string {
+	var refs []string
+	add := func(image string) {
+		if image == "" {
+			return
+		}
+		ref := NormalizeImageName(image)
+		for _, existing := range refs {
+			if existing == ref {
+				return
+			}
+		}
+		refs = append(refs, ref)
+	}
+
+	if m.IsMultiContainer() {
+		if _, main := m.GetMainContainer(); main != nil {
+			add(main.Image)
+		}
+		names := make([]string, 0, len(m.Spec.Containers))
+		for name := range m.Spec.Containers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			add(m.Spec.Containers[name].Image)
+		}
+		return refs
+	}
+	add(m.Spec.Image)
+	return refs
 }
 
 // GetSubContainers returns all sub containers

@@ -295,3 +295,39 @@ spec:
 		t.Errorf("name = %q, want New\n%s", parsed.Metadata.Name, out)
 	}
 }
+
+// A null value deletes the target key instead of writing a null scalar:
+// clearing spec.models removes the subtree, clearing an absent key is a
+// no-op, and siblings survive both.
+func TestPatchDocumentNullDeletesKey(t *testing.T) {
+	set := mustPatch(t, patchSrc,
+		FieldPatch{Path: "spec.models", Value: []byte(`{"detector":{"id":"yolov8s-640","path":"/opt/models/yolov8s.hef","type":"detection","required":true}}`)})
+	parsed, err := ParseManifest(set)
+	if err != nil {
+		t.Fatalf("ParseManifest(set) error: %v\n%s", err, set)
+	}
+	if m := parsed.Spec.Models["detector"]; m.ID != "yolov8s-640" || m.Path != "/opt/models/yolov8s.hef" || m.Type != "detection" || !m.Required {
+		t.Fatalf("models round-trip lost subfields: %+v\n%s", m, set)
+	}
+
+	cleared := mustPatch(t, string(set), FieldPatch{Path: "spec.models", Value: []byte(`null`)})
+	if strings.Contains(string(cleared), "models") {
+		t.Errorf("null patch should delete spec.models:\n%s", cleared)
+	}
+	if !strings.Contains(string(cleared), "unknown_spec:") {
+		t.Errorf("sibling subtree lost on delete:\n%s", cleared)
+	}
+	parsed, err = ParseManifest(cleared)
+	if err != nil {
+		t.Fatalf("ParseManifest(cleared) error: %v\n%s", err, cleared)
+	}
+	if len(parsed.Spec.Models) != 0 {
+		t.Errorf("models = %+v after clear\n%s", parsed.Spec.Models, cleared)
+	}
+
+	// null on a key that never existed: no-op, nothing appended.
+	noop := mustPatch(t, patchSrc, FieldPatch{Path: "spec.models", Value: []byte(`null`)})
+	if strings.Contains(string(noop), "models") {
+		t.Errorf("null patch on absent key created a node:\n%s", noop)
+	}
+}

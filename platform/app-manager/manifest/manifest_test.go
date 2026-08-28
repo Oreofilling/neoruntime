@@ -173,10 +173,52 @@ func TestValidateModels(t *testing.T) {
 			wantErr: "spec.models.clip.id is required",
 		},
 		{
-			name:    "path_rejected_phase_b",
+			name:    "path_without_type",
 			alias:   "clip",
 			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef"},
-			wantErr: "not supported",
+			wantErr: "spec.models.clip.type is required when path is declared",
+		},
+		{
+			name:    "type_without_path",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Type: "detection"},
+			wantErr: "spec.models.clip.type is only valid together with path",
+		},
+		{
+			name:    "path_relative",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "models/clip.hef", Type: "clip"},
+			wantErr: "absolute container path",
+		},
+		{
+			name:    "path_parent_escape",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/../etc/clip.hef", Type: "clip"},
+			wantErr: "absolute container path",
+		},
+		{
+			name:    "path_redundant_separator",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app//models/clip.hef", Type: "clip"},
+			wantErr: "absolute container path",
+		},
+		{
+			name:    "path_directory_root",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/", Type: "clip"},
+			wantErr: "absolute container path",
+		},
+		{
+			name:    "type_bad_token",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef", Type: "Object Detection"},
+			wantErr: "spec.models.clip.type must match",
+		},
+		{
+			name:    "bundled_model_accepted",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef", Type: "clip", Required: true},
+			wantErr: "",
 		},
 	}
 
@@ -217,11 +259,12 @@ spec:
   models:
     detector:
       id: yolo_v5
-      path: /app/models/yolo.hef
+      path: /app/models/../models/yolo.hef
+      type: detection
 `)
 	_, err := ParseManifest(data)
 	if err == nil {
-		t.Fatal("ParseManifest() expected error for models path, got nil")
+		t.Fatal("ParseManifest() expected error for unclean models path, got nil")
 	}
 	if !strings.Contains(err.Error(), "models validation failed") {
 		t.Errorf("ParseManifest() error = %q, want 'models validation failed' in chain", err.Error())
@@ -571,6 +614,62 @@ func TestMarshalOmitEmpty(t *testing.T) {
 		}
 		if !strings.Contains(string(out), `"models":{"clip":{"id":"clip_vit_b_32"}}`) {
 			t.Errorf("json output missing models mapping:\n%s", out)
+		}
+	})
+}
+
+func TestImageReferences(t *testing.T) {
+	t.Run("single_container_returns_normalized_spec_image", func(t *testing.T) {
+		m := &AppManifest{
+			Metadata: Metadata{ID: "app", Name: "App", Version: "1.0.0"},
+			Spec:     Spec{Image: "busybox:latest"},
+		}
+		got := m.ImageReferences()
+		want := []string{"docker.io/library/busybox:latest"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ImageReferences() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("multi_container_main_first_then_sorted_deduped", func(t *testing.T) {
+		m := &AppManifest{
+			Metadata: Metadata{ID: "app", Name: "App", Version: "1.0.0"},
+			Spec: Spec{
+				Containers: map[string]ContainerSpec{
+					"worker": {Image: "docker.io/library/alpine:3.19", Role: "sub"},
+					"main":   {Image: "busybox:latest", Role: "main"},
+					"zleep":  {Image: "docker.io/library/busybox:latest", Role: "sub"},
+					"noimg":  {Image: "", Role: "sub"},
+				},
+			},
+		}
+		got := m.ImageReferences()
+		// main first, then remaining containers in sorted key order, empty
+		// images skipped, duplicates collapsed after normalization.
+		want := []string{
+			"docker.io/library/busybox:latest",
+			"docker.io/library/alpine:3.19",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ImageReferences() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("no_image_and_no_containers_returns_empty", func(t *testing.T) {
+		m := &AppManifest{
+			Metadata: Metadata{ID: "app", Name: "App", Version: "1.0.0"},
+		}
+		if got := m.ImageReferences(); len(got) != 0 {
+			t.Fatalf("ImageReferences() = %v, want empty", got)
+		}
+	})
+
+	t.Run("single_container_with_empty_image_returns_empty", func(t *testing.T) {
+		m := &AppManifest{
+			Metadata: Metadata{ID: "app", Name: "App", Version: "1.0.0"},
+		}
+		if got := m.ImageReferences(); len(got) != 0 {
+			t.Fatalf("ImageReferences() = %v, want empty", got)
 		}
 	})
 }
