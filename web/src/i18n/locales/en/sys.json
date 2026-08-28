@@ -1312,6 +1312,7 @@
         "source": "Source",
         "basic_info": "Basic Info",
         "resources": "Resources",
+        "models_section": "Models",
         "permissions": "Permissions",
         "advanced": "Advanced",
         "review": "Review",
@@ -1319,6 +1320,17 @@
         "source_desc": "Provide the container image for your application",
         "registry_title": "Registry Image",
         "registry_desc": "Pull from Docker Hub or private registry",
+        "local_title": "Local Upload",
+        "local_desc": "Upload app.yaml and/or an image tar file",
+        "local_manifest_optional": "Optional",
+        "local_mode_manifest_hint": "app.yaml uploaded: the manifest is the source of truth; fine-tune below",
+        "local_mode_image_hint": "No app.yaml: the form below generates the manifest",
+        "local_source_required": "Upload app.yaml or an image tar file first",
+        "invalid_model_alias": "Invalid model alias: it must start with a letter or underscore and contain only letters, digits, and underscores",
+        "model_id_required": "A model dependency has no model selected — complete or remove that row",
+        "duplicate_id_warning": "This app ID already exists; installing will overwrite the existing app",
+        "back_to_source": "Back to source",
+        "nav_sections_aria": "Configuration sections",
         "upload_title": "Upload Archive",
         "upload_desc": "Upload a .tar, .tar.gz or .tgz image file",
         "package_title": "Upload Package",
@@ -1329,9 +1341,28 @@
         "readonly_id_hint": "Determined by the uploaded app.yaml — the manifest directory is bound to this ID",
         "manifest_untouched": "No changes — the original app.yaml will be installed as-is",
         "manifest_edited": "Modified {{n}} field(s) — edits will be written back to the manifest before install",
-        "multi_container_edited": "Modified {{n}} field(s), but multi-container manifests cannot be wizard-edited — the original app.yaml will be installed as-is",
+        "multi_container_edited": "Modified {{n}} field(s) — written back to the manifest before install; edit containers in the YAML view",
         "multi_container_hint": "Multi-container manifest: wizard edits cannot be applied, installing the original file",
         "patch_failed": "Failed to apply manifest edits",
+        "form_view_tab": "Form",
+        "yaml_view_tab": "YAML",
+        "yaml_dirty_dot_aria": "Unapplied YAML changes",
+        "yaml_dirty_chip": "Unapplied changes",
+        "yaml_clean_chip": "In sync with file",
+        "yaml_live_sync_chip": "Live-synced with form",
+        "yaml_apply": "Apply",
+        "yaml_flushing": "Applying…",
+        "yaml_applied": "YAML changes applied",
+        "yaml_flush_failed": "Failed to apply YAML changes",
+        "yaml_parse_error": "YAML parse failed",
+        "yaml_diff_toggle": "Diff original",
+        "yaml_copy": "Copy",
+        "yaml_copied": "Copied to clipboard",
+        "yaml_copy_failed": "Copy failed",
+        "yaml_preview_hint": "Read-only preview · generated from the form — copy and use as app.yaml",
+        "yaml_edited_review": "app.yaml: modified in the YAML editor (installed as edited)",
+        "yaml_review_unchanged": "app.yaml: unmodified",
+        "yaml_loading": "Loading editor…",
         "package_image": "Container Image",
         "package_image_hint": "Optional if app.yaml uses registry image",
         "image_address": "Image Address",
@@ -1353,7 +1384,12 @@
         "restart_always": "Always Restart",
         "readonly_short": "RO",
         "autostart": "Auto-start on boot",
-        "ai_models": "AI Models Access",
+        "ai_models": "Model Dependencies",
+        "model_dep_hint": "Declare the models the app depends on. Each alias is injected as an AIPC_MODEL_<alias> environment variable at runtime.",
+        "model_dep_add": "Add Dependency",
+        "model_alias": "Alias",
+        "model_select": "Select model",
+        "no_model_deps": "No model dependencies declared",
         "no_models": "No models available",
         "max_qps": "Max Inference QPS",
         "max_concurrent": "Max Concurrent Inference",
@@ -1477,7 +1513,19 @@
           "invalid_manifest_type": "Only .yaml or .yml manifest files are supported.",
           "invalid_yaml": "Invalid manifest YAML. Please check the syntax. {{detail}}",
           "manifest_id_required": "app.yaml must include metadata.id."
-        }
+        },
+        "model_custom_add": "Custom model…",
+        "model_id_label": "Model ID",
+        "model_badge_system": "System model",
+        "model_badge_bundled": "Bundled model",
+        "model_badge_missing_required": "Missing · required",
+        "model_badge_missing_optional": "Unregistered · optional",
+        "model_path": "Model path",
+        "model_type": "Model type",
+        "model_required_row": "Required (install fails if missing)",
+        "model_custom_hint": "Declare a model bundled in the image and not registered with the system: when the id is not in the system list, the in-image model file path is required to pass install validation.",
+        "model_unavailable_required": "A required model dependency is unregistered and declares no path — install would be blocked. Provide the model path or pick a system model.",
+        "image_uploading": "Image upload is still in progress, please wait"
       },
       "logs": {
         "title": "Logs",
@@ -1533,7 +1581,8 @@
         "scan": "Scan Models",
         "scanning": "Scanning...",
         "scan_success": "Scan complete: {{added}} new, {{skipped}} existing, {{scanned}} total",
-        "scan_no_new": "No new models found ({{scanned}} scanned)"
+        "scan_no_new": "No new models found ({{scanned}} scanned)",
+        "update": "Update"
       },
       "form": {
         "model_file": "Model File",
@@ -1552,7 +1601,8 @@
         "nms_threshold_range": "NMS threshold must be between 0 and 1",
         "number_min": "Value must be ≥ {{min}}",
         "number_max": "Value must be ≤ {{max}}",
-        "model_id_exists": "This Model ID already exists. Please use a different one."
+        "model_id_exists": "This Model ID already exists. Please use a different one.",
+        "model_id_readonly": "Model ID cannot be changed on update"
       },
       "empty": {
         "templates": "No AI models available",
@@ -1612,6 +1662,7 @@
         "threshold": "Threshold",
         "max_detections": "Max Detections",
         "file_size": "File Size",
+        "file_hash": "File Hash",
         "network_name": "Network Name",
         "used_by_apps": "Used By Apps",
         "no_apps": "No associated apps",
@@ -1641,7 +1692,9 @@
         "preview_file": "File",
         "preview_input": "Input",
         "suggested_type": "Suggested",
-        "confirm_register": "Register"
+        "confirm_register": "Register",
+        "confirm_update": "Update",
+        "update_file_optional": "Optional: upload a new model file to replace the current one; skip to update configuration only."
       },
       "type": {
         "landmark": "Keypoint Detection",
@@ -1667,8 +1720,8 @@
       },
       "apps": "Apps",
       "provenance": {
-        "system": "system",
-        "app_owned": "app-owned · {{id}}"
+        "system": "Preset",
+        "manual": "Imported"
       },
       "time": {
         "just_now": "Just now",
@@ -1689,16 +1742,22 @@
         "upload_success": "Model uploaded. Click 'Load' to deploy to NPU.",
         "npu_busy": "NPU resources insufficient, please unload other models first",
         "delete_success": "Model deleted",
-        "delete_failed": "Failed to delete model"
+        "delete_failed": "Failed to delete model",
+        "update_success": "Model updated successfully"
       },
       "confirm": {
         "delete_title": "Confirm Delete",
         "delete": "Are you sure you want to delete model \"{{name}}\"? This action cannot be undone.",
         "unload_title": "Confirm Unload",
-        "unload": "Unload model \"{{name}}\" from NPU?"
+        "unload": "Unload model \"{{name}}\" from NPU?",
+        "update_title": "Confirm Update",
+        "update_in_use": "Model \"{{name}}\" is used by {{count}} app(s); updating it may affect them. Continue?"
       },
       "pagination": "Showing {{start}} - {{end}} of {{total}} models",
-      "no_models": "No models"
+      "no_models": "No models",
+      "dialog": {
+        "update_title": "Update Model"
+      }
     },
     "devices": {
       "no_devices": "No devices connected"

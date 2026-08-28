@@ -232,6 +232,23 @@ export interface StorageDevice {
 }
 
 // Wizard Configuration Types
+
+/**
+ * One model dependency (spec.models entry): the model id plus optional
+ * in-image bundling info. Mirrors the Go manifest.ModelMapping json tags.
+ * Declared as a type alias (not interface) so Record values stay assignable
+ * to the YAML emitter's index-signature value type.
+ */
+export type WizardModelMapping = {
+  id: string;
+  /** absolute in-image path of a bundled model file */
+  path?: string;
+  /** postprocess type, only valid together with path */
+  type?: string;
+  /** install fails when the model is missing on device */
+  required?: boolean;
+};
+
 export interface WizardConfig {
   metadata: {
     id: string;
@@ -241,6 +258,8 @@ export interface WizardConfig {
   };
   image: string;
   image_path?: string;
+  /** model dependencies (spec.models): alias → mapping */
+  models?: Record<string, WizardModelMapping>;
   resources?: {
     cpu?: string;
     memory?: string;
@@ -331,8 +350,8 @@ export interface AppManifestDTO {
       no_new_privileges?: boolean | null;
       readonly_rootfs?: boolean | null;
     };
-    /** present on the DTO but wizard-unpatchable (read-only display) */
-    models?: Record<string, { id: string; path?: string; required?: boolean }>;
+    /** model dependencies (spec.models), shared with the wizard config */
+    models?: Record<string, WizardModelMapping>;
     containers?: unknown;
   };
 }

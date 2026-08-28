@@ -21,6 +21,7 @@ import {
   Power,
   PowerOff,
   Loader2,
+  RefreshCw,
 } from 'lucide-react';
 
 import { Empty } from '@/components/ui/empty';
@@ -44,8 +45,8 @@ interface ModelData {
   used_by_apps?: string[];
   input_width?: number;
   input_height?: number;
-  /** non-empty when the model was registered by an app (R4 owner chain) */
-  owner_app_id?: string;
+  /** provenance: "disk" = system preset, anything else = manually imported */
+  source?: string;
 }
 
 interface ModelListProps {
@@ -53,6 +54,7 @@ interface ModelListProps {
   onDelete: (modelId: string, modelName: string) => void;
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
+  onUpdate?: (model: ModelData) => void;
   loadingAction?: string | null;
 }
 
@@ -73,6 +75,7 @@ export default function ModelList({
   onDelete,
   onLoad,
   onUnload,
+  onUpdate,
   loadingAction,
 }: ModelListProps) {
   const { t } = useTranslation();
@@ -88,6 +91,7 @@ export default function ModelList({
     id: string;
     name: string;
   } | null>(null);
+  const [updateConfirm, setUpdateConfirm] = useState<ModelData | null>(null);
 
   const totalPages = Math.max(1, Math.ceil(models.length / PAGE_SIZE));
   const safePage = Math.min(currentPage, totalPages);
@@ -199,22 +203,16 @@ export default function ModelList({
                         )}
                         <Badge
                           variant="outline"
-                          className={`text-xs max-w-[150px] truncate ${
-                            model.owner_app_id
-                              ? 'border-violet-500/40 text-violet-600 dark:text-violet-400'
-                              : 'text-muted-foreground'
-                          }`}
+                          className="text-xs max-w-[150px] truncate text-muted-foreground"
                           title={
-                            model.owner_app_id
-                              ? `app-owned · ${model.owner_app_id}`
-                              : 'system'
+                            model.source === 'disk'
+                              ? 'system preset'
+                              : 'manually imported'
                           }
                         >
-                          {model.owner_app_id
-                            ? t('sys.ai_models.provenance.app_owned', {
-                                id: model.owner_app_id,
-                              })
-                            : t('sys.ai_models.provenance.system')}
+                          {model.source === 'disk'
+                            ? t('sys.ai_models.provenance.system')
+                            : t('sys.ai_models.provenance.manual')}
                         </Badge>
                       </div>
                     </td>
@@ -298,6 +296,23 @@ export default function ModelList({
                         >
                           <Eye className="w-4 h-4" />
                         </Button>
+                        {onUpdate && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 hover:text-primary"
+                            onClick={() => {
+                              if (appsCount > 0) {
+                                setUpdateConfirm(model);
+                              } else {
+                                onUpdate(model);
+                              }
+                            }}
+                            title={t('sys.ai_models.action.update', '更新')}
+                          >
+                            <RefreshCw className="w-4 h-4" />
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon"
@@ -442,6 +457,43 @@ export default function ModelList({
               }}
             >
               {t('sys.ai_models.action.unload', '卸载')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Update Confirmation (model in use by apps) */}
+      <AlertDialog
+        open={!!updateConfirm}
+        onOpenChange={open => !open && setUpdateConfirm(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('sys.ai_models.confirm.update_title', '确认更新')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'sys.ai_models.confirm.update_in_use',
+                '模型 "{{name}}" 正被 {{count}} 个应用使用，更新后相关应用可能受影响。确定继续？',
+                {
+                  name: updateConfirm?.name || updateConfirm?.model_id,
+                  count: updateConfirm?.used_by_apps?.length ?? 0,
+                }
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.cancel', '取消')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (updateConfirm) {
+                  onUpdate?.(updateConfirm);
+                  setUpdateConfirm(null);
+                }
+              }}
+            >
+              {t('sys.ai_models.action.update', '更新')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

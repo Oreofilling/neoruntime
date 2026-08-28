@@ -15,6 +15,7 @@ import {
   Tag,
   FolderOpen,
   ExternalLink,
+  Hash,
   Settings2,
   AppWindow,
 } from 'lucide-react';
@@ -38,6 +39,7 @@ interface ModelData {
   threshold?: number;
   max_detections?: number;
   file_size?: number;
+  file_hash?: string;
   used_by_apps?: string[];
   // Input dimensions from HEF
   input_width?: number;
@@ -307,6 +309,21 @@ export default function ModelDetailDialog({
               <div className="min-w-0 overflow-hidden bg-muted/50 rounded-lg px-3 py-2">
                 <code className="block w-full text-xs font-mono break-all whitespace-pre-wrap">
                   {mergedModel.model_path}
+                </code>
+              </div>
+            </div>
+          )}
+
+          {/* File Hash */}
+          {hasNonEmptyString(mergedModel.file_hash) && (
+            <div className="min-w-0 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Hash className="w-3.5 h-3.5 shrink-0" />
+                {t('sys.ai_models.detail.file_hash', '文件哈希')}
+              </div>
+              <div className="min-w-0 overflow-hidden bg-muted/50 rounded-lg px-3 py-2">
+                <code className="block w-full text-xs font-mono break-all whitespace-pre-wrap">
+                  {mergedModel.file_hash}
                 </code>
               </div>
             </div>

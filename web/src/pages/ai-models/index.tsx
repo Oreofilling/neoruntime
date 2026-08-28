@@ -21,6 +21,8 @@ export default function AIModels() {
   const [viewMode, setViewMode] = useState<'card' | 'list'>('card');
   const [search, setSearch] = useState('');
   const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [updateTarget, setUpdateTarget] = useState<any | null>(null);
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
 
@@ -128,6 +130,11 @@ export default function AIModels() {
     }
   };
 
+  const handleOpenUpdateDialog = (model: any) => {
+    setUpdateTarget(model);
+    setUpdateDialogOpen(true);
+  };
+
   if (isLoading) {
     return <AIModelsPageSkeleton viewMode={viewMode} />;
   }
@@ -219,6 +226,7 @@ export default function AIModels() {
             onLoad={handleLoadModel}
             onUnload={handleUnloadModel}
             onImportClick={() => setImportDialogOpen(true)}
+            onUpdate={handleOpenUpdateDialog}
             loadingAction={loadingAction}
           />
         ) : (
@@ -227,6 +235,7 @@ export default function AIModels() {
             onDelete={handleDeleteModel}
             onLoad={handleLoadModel}
             onUnload={handleUnloadModel}
+            onUpdate={handleOpenUpdateDialog}
             loadingAction={loadingAction}
           />
         )}
@@ -236,6 +245,14 @@ export default function AIModels() {
         open={importDialogOpen}
         onOpenChange={setImportDialogOpen}
         onSuccess={refetch}
+      />
+
+      <ImportModelDialog
+        open={updateDialogOpen}
+        onOpenChange={setUpdateDialogOpen}
+        onSuccess={refetch}
+        mode="update"
+        model={updateTarget}
       />
     </div>
   );

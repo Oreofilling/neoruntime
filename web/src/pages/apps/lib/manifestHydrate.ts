@@ -41,6 +41,10 @@ export function isDirty(
  * Map a parsed manifest onto the wizard form. Fields the manifest omits stay
  * undefined (not defaulted) so an untouched walk-through of the wizard is
  * byte-identical to the uploaded file — defaults would fake edits.
+ *
+ * The Go backend marshals nil slices/maps/pointers as JSON `null`, so absent
+ * fields arrive as null rather than undefined; the guards below treat the
+ * two the same.
  */
 export function manifestToWizardConfig(m: AppManifestDTO): WizardConfig {
   const spec = m.spec ?? ({} as AppManifestDTO['spec']);
@@ -59,50 +63,66 @@ export function manifestToWizardConfig(m: AppManifestDTO): WizardConfig {
       description: meta?.description ?? '',
     },
     image: spec.image ?? '',
+    ...(spec.models != null
+      && typeof spec.models === 'object' && {
+        models: Object.fromEntries(
+          Object.entries(spec.models).map(([alias, mapping]) => [
+            alias,
+            { ...mapping },
+          ])
+        ),
+      }),
     resources: {
-      ...(spec.resources?.cpu !== undefined && { cpu: spec.resources.cpu }),
-      ...(spec.resources?.memory !== undefined && {
+      ...(spec.resources?.cpu != null && { cpu: spec.resources.cpu }),
+      ...(spec.resources?.memory != null && {
         memory: spec.resources.memory,
       }),
     },
     permissions: {
-      ...(perms.video !== undefined && { video: [...perms.video] }),
+      ...(Array.isArray(perms.video) && { video: [...perms.video] }),
       inference: {
-        ...(inf.models !== undefined && { models: [...inf.models] }),
-        ...(inf.max_qps !== undefined && { max_qps: inf.max_qps }),
-        ...(inf.max_concurrent !== undefined && {
+        // models deliberately NOT hydrated here: the wizard's model editor is
+        // rebound to spec.models (declarative dependencies). The legacy
+        // permissions.inference.models authorization list is no longer form
+        // state — PATCH never writes it, so it survives untouched on disk.
+        ...(inf.max_qps != null && { max_qps: inf.max_qps }),
+        ...(inf.max_concurrent != null && {
           max_concurrent: inf.max_concurrent,
         }),
-        ...(inf.allow_register_model !== undefined && {
+        ...(inf.allow_register_model != null && {
           allow_register_model: inf.allow_register_model,
         }),
       },
       events: {
-        ...(events.publish !== undefined && { publish: [...events.publish] }),
-        ...(events.subscribe !== undefined && {
+        ...(Array.isArray(events.publish) && {
+          publish: [...events.publish],
+        }),
+        ...(Array.isArray(events.subscribe) && {
           subscribe: [...events.subscribe],
         }),
       },
       device: {
-        ...(device.light !== undefined && { light: device.light }),
-        ...(device.ir_cut !== undefined && { ir_cut: device.ir_cut }),
-        ...(device.ptz !== undefined && { ptz: device.ptz }),
-        ...(device.lens !== undefined && { lens: device.lens }),
+        ...(device.light != null && { light: device.light }),
+        ...(device.ir_cut != null && { ir_cut: device.ir_cut }),
+        ...(device.ptz != null && { ptz: device.ptz }),
+        ...(device.lens != null && { lens: device.lens }),
       },
       network: {
-        ...(network.mode !== undefined && { mode: network.mode }),
-        ...(network.inbound !== undefined && { inbound: [...network.inbound] }),
+        ...(network.mode != null && { mode: network.mode }),
+        ...(Array.isArray(network.inbound) && {
+          inbound: [...network.inbound],
+        }),
       },
     },
-    ...(spec.env !== undefined && { env: spec.env.map(e => ({ ...e })) }),
-    ...(spec.volumes !== undefined && {
+    ...(Array.isArray(spec.env) && { env: spec.env.map(e => ({ ...e })) }),
+    ...(Array.isArray(spec.volumes) && {
       volumes: spec.volumes.map(v => ({ ...v })),
     }),
-    ...(spec.autostart !== undefined && { autostart: spec.autostart }),
-    ...(spec.restart_policy !== undefined && {
+    ...(spec.autostart != null && { autostart: spec.autostart }),
+    ...(spec.restart_policy != null && {
       restart_policy: spec.restart_policy,
     }),
-    ...(spec.security !== undefined && {
+    ...(spec.security != null && {
       security: {
         ...(typeof spec.security.no_new_privileges === 'boolean' && {
           no_new_privileges: spec.security.no_new_privileges,
@@ -143,11 +163,15 @@ export function wizardConfigToPatchFields(
   set('spec.autostart', config.autostart);
   set('spec.restart_policy', config.restart_policy);
 
+  // Model dependencies replace the whole spec.models map in one op. Always
+  // emitted — null (not undefined) clears it, which is the only way a
+  // dependency removal is detectable by changedPatchFields (set() skips
+  // undefined, and an absent key cannot be diffed against a present one).
+  fields['spec.models'] =    config.models && Object.keys(config.models).length > 0
+      ? config.models
+      : null;
+
   set('spec.permissions.video', config.permissions?.video);
-  set(
-    'spec.permissions.inference.models',
-    config.permissions?.inference?.models
-  );
   set(
     'spec.permissions.inference.max_qps',
     config.permissions?.inference?.max_qps
@@ -200,4 +224,58 @@ export function changedPatchFields(
     }
   }
   return changed;
+}
+
+/**
+ * Overlay of PATCH-style field edits onto a wizard config — the flush-merge
+ * half of `changedPatchFields`. When the YAML editor applies a new manifest
+ * version the form is re-hydrated from it, but unflushed form edits (captured
+ * as changed fields relative to the previous snapshot) must survive as
+ * overrides on top. Paths use the PATCH vocabulary (`spec.`-prefixed manifest
+ * paths); the `spec.` segment maps onto the config root, `metadata.*` maps
+ * onto config.metadata unchanged. Returns a new config; base is not mutated.
+ */
+export function applyPatchFields(
+  base: WizardConfig,
+  fields: Record<string, unknown>
+): WizardConfig {
+  const merged = clonePlain(base) as unknown as Record<string, unknown>;
+  for (const [path, value] of Object.entries(fields)) {
+    const segments = path.split('.');
+    if (segments[0] === 'spec') segments.shift();
+    if (segments.length === 0) continue;
+
+    let node = merged;
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      const key = segments[i];
+      const child = node[key];
+      node[key] = child !== null && typeof child === 'object' ? child : {};
+      node = node[key] as Record<string, unknown>;
+    }
+    const last = segments[segments.length - 1];
+    if (value === null) {
+      // null is the wire format for "clear this field" — the config treats
+      // absence as canonical (matches the backend's null-deletes-key patch
+      // semantics).
+      delete node[last];
+    } else {
+      node[last] = value;
+    }
+  }
+  return merged as unknown as WizardConfig;
+}
+
+/** Recursive clone for the JSON-safe shapes the wizard config uses. */
+function clonePlain<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(item => clonePlain(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) out[k] = clonePlain(v);
+    }
+    return out as unknown as T;
+  }
+  return value;
 }

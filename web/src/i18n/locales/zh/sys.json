@@ -1277,7 +1277,7 @@
         "restart_always": "总是重启",
         "readonly_short": "只读",
         "autostart": "开机自启动",
-        "ai_models": "AI 模型访问",
+        "ai_models": "模型依赖",
         "no_models": "无可用模型",
         "max_qps": "最大推理 QPS",
         "max_concurrent": "最大并发推理数",
@@ -1401,7 +1401,48 @@
           "invalid_manifest_type": "仅支持 .yaml 或 .yml 格式的配置文件。",
           "invalid_yaml": "配置文件格式无效，请检查 YAML 语法。{{detail}}",
           "manifest_id_required": "app.yaml 中必须包含 metadata.id 字段。"
-        }
+        },
+        "back_to_source": "返回上传来源",
+        "duplicate_id_warning": "该应用 ID 已存在；安装将覆盖现有应用",
+        "form_view_tab": "表单",
+        "image_uploading": "镜像上传中，请稍候",
+        "local_desc": "上传 app.yaml 和/或镜像 tar 文件",
+        "local_manifest_optional": "可选",
+        "local_mode_image_hint": "未上传 app.yaml：下方表单将生成清单",
+        "local_mode_manifest_hint": "已上传 app.yaml：以清单为准，可在下方微调",
+        "local_source_required": "请先上传 app.yaml 或镜像 tar 文件",
+        "local_title": "本地上传",
+        "model_alias": "别名",
+        "model_badge_bundled": "自带模型",
+        "model_badge_missing_optional": "未注册 · 可选",
+        "model_badge_missing_required": "缺失 · 必需",
+        "model_badge_system": "系统模型",
+        "model_custom_add": "自定义模型…",
+        "model_custom_hint": "声明镜像内自带、未注册到系统的模型：id 不在系统列表时，需提供镜像内模型文件路径才能通过安装校验。",
+        "model_dep_add": "添加依赖",
+        "model_dep_hint": "声明应用依赖的模型。每个别名会在运行时以 AIPC_MODEL_<别名> 环境变量注入。",
+        "model_id_label": "模型 ID",
+        "model_path": "模型路径 (path)",
+        "model_required_row": "必需（缺失时安装失败）",
+        "model_select": "选择模型",
+        "model_type": "模型类型 (type)",
+        "models_section": "模型",
+        "nav_sections_aria": "配置分区导航",
+        "no_model_deps": "未声明模型依赖",
+        "yaml_apply": "应用",
+        "yaml_clean_chip": "与文件一致",
+        "yaml_copied": "已复制到剪贴板",
+        "yaml_copy": "复制",
+        "yaml_copy_failed": "复制失败",
+        "yaml_diff_toggle": "对比原文件",
+        "yaml_dirty_chip": "有未应用的修改",
+        "yaml_dirty_dot_aria": "有未应用的 YAML 修改",
+        "yaml_flushing": "应用中…",
+        "yaml_live_sync_chip": "与表单实时同步",
+        "yaml_loading": "编辑器加载中…",
+        "yaml_parse_error": "YAML 解析失败",
+        "yaml_preview_hint": "只读预览 · 由表单生成 — 可复制用作 app.yaml",
+        "yaml_view_tab": "YAML"
       },
       "logs": {
         "title": "日志",
@@ -1457,7 +1498,8 @@
         "scan": "扫描模型",
         "scanning": "扫描中...",
         "scan_success": "扫描完成：新增 {{added}} 个，已存在 {{skipped}} 个，共扫描 {{scanned}} 个",
-        "scan_no_new": "未发现新模型（已扫描 {{scanned}} 个）"
+        "scan_no_new": "未发现新模型（已扫描 {{scanned}} 个）",
+        "update": "更新"
       },
       "form": {
         "model_file": "模型文件",
@@ -1476,7 +1518,8 @@
         "nms_threshold_range": "NMS 阈值范围应为 0-1",
         "number_min": "数值应 ≥ {{min}}",
         "number_max": "数值应 ≤ {{max}}",
-        "model_id_exists": "模型 ID 已存在，请更换"
+        "model_id_exists": "模型 ID 已存在，请更换",
+        "model_id_readonly": "更新时不可修改"
       },
       "empty": {
         "templates": "暂无可用的 AI 模型",
@@ -1537,6 +1580,7 @@
         "threshold": "置信阈值",
         "max_detections": "最大检测数",
         "file_size": "文件大小",
+        "file_hash": "文件哈希",
         "network_name": "网络名称",
         "used_by_apps": "关联应用",
         "no_apps": "暂无关联应用",
@@ -1565,7 +1609,9 @@
         "preview_file": "文件",
         "preview_input": "输入",
         "suggested_type": "推荐",
-        "confirm_register": "注册"
+        "confirm_register": "注册",
+        "confirm_update": "更新",
+        "update_file_optional": "可选：上传新的模型文件以替换现有文件；不上传则仅更新配置。"
       },
       "type": {
         "landmark": "关键点检测",
@@ -1591,8 +1637,8 @@
       },
       "apps": "应用",
       "provenance": {
-        "system": "系统",
-        "app_owned": "应用自有 · {{id}}"
+        "system": "系统预置",
+        "manual": "手动导入"
       },
       "time": {
         "just_now": "刚刚",
@@ -1613,16 +1659,22 @@
         "upload_success": "模型上传成功，点击「加载」部署到 NPU",
         "npu_busy": "NPU 资源不足，请先卸载其他模型",
         "delete_success": "模型已删除",
-        "delete_failed": "删除失败"
+        "delete_failed": "删除失败",
+        "update_success": "模型更新成功"
       },
       "confirm": {
         "delete_title": "确认删除",
         "delete": "确认删除模型 \"{{name}}\" 吗？此操作无法撤销。",
         "unload_title": "确认卸载",
-        "unload": "确认将模型 \"{{name}}\" 从 NPU 卸载？"
+        "unload": "确认将模型 \"{{name}}\" 从 NPU 卸载？",
+        "update_title": "确认更新",
+        "update_in_use": "模型 \"{{name}}\" 正被 {{count}} 个应用使用，更新后相关应用可能受影响。确定继续？"
       },
       "pagination": "显示 {{start}} - {{end}} 共 {{total}} 个模型",
-      "no_models": "暂无模型"
+      "no_models": "暂无模型",
+      "dialog": {
+        "update_title": "更新模型"
+      }
     },
     "devices": {
       "no_devices": "No devices connected"

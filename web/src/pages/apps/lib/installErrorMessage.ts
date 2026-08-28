@@ -202,12 +202,8 @@ export function translateInstallError(
     });
   }
 
-  for (const matcher of ERROR_MATCHERS) {
-    const match = raw.match(matcher.pattern);
-    if (match) {
-      return matcher.translate(match, t);
-    }
-  }
+  const matched = matchInstallError(raw, t);
+  if (matched) return matched;
 
   return t('sys.apps.import.errors.unknown', {
     detail: raw,
@@ -215,6 +211,37 @@ export function translateInstallError(
   });
 }
 
+/** First matching translation for a raw backend message, or undefined when
+ * nothing matches (no payload / unknown text). */
+function matchInstallError(
+  raw: string | undefined,
+  t: TFunction
+): string | undefined {
+  if (!raw?.trim()) return undefined;
+  for (const matcher of ERROR_MATCHERS) {
+    const match = raw.match(matcher.pattern);
+    if (match) {
+      return matcher.translate(match, t);
+    }
+  }
+  return undefined;
+}
+
 export function resolveInstallApiError(error: unknown, t: TFunction): string {
   return translateInstallError(readApiErrorPayload(error), t);
+}
+
+/**
+ * Matched-only variant for non-install error contexts (e.g. applying YAML
+ * editor changes): a specifically recognized backend error keeps its own
+ * translated copy, while anything unmatched falls back to the caller's
+ * context message instead of the install-flavored generic — "installation
+ * failed" wording is wrong when no installation was attempted.
+ */
+export function resolveKnownApiError(
+  error: unknown,
+  t: TFunction,
+  fallback: string
+): string {
+  return matchInstallError(readApiErrorPayload(error), t) ?? fallback;
 }
