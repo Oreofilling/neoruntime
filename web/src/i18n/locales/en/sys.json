@@ -306,8 +306,12 @@
       "bundled_recovery": "Bundled in AIPC",
       "recovery_version": "Recovery Version",
       "current_app_version": "Current App Version",
-      "compat_level": "Compatibility Level",
-      "data_schema": "Data Schema",
+      "ota_incompatible_title": "App package is incompatible with the current OS",
+      "ota_incompatible_range": "Current OS {{os}}; app supports {{min}}–{{max}}",
+      "ota_blocked_os_in_progress": "An OS upgrade is in progress; the app firmware install was rejected. Retry after the OS upgrade finishes or is cancelled",
+      "os_upgrade_blocked_app_ota": "An app firmware upgrade is in progress; the OS install was rejected. Retry after it finishes or fails",
+      "os_upgrade_app_incompatible_title": "Current app is incompatible with this OS package",
+      "os_upgrade_app_incompatible_desc": "OS upgrades are not blocked by app compatibility. After the upgrade, install an app package that supports this OS range; app services stay stopped until then, and the platform-api rescue channel remains available",
       "rollback_support": "Auto Rollback",
       "target_machine": "Target Hardware",
       "install_log": "Install Log",
@@ -1733,7 +1737,8 @@
         "set_failed": "Failed to update setting"
       },
       "lens": {
-        "title": "Lens Control"
+        "title": "Lens Control",
+        "model_badge": "Factory-fitted lens model"
       },
       "peripheral": {
         "title": "Peripheral Control",

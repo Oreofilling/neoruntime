@@ -10,6 +10,7 @@ add_compile_options(-g)
 # Sanitizer options (enable with -DENABLE_ASAN=ON or -DENABLE_TSAN=ON)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(CAMERA_DAEMON_BUILD_TESTS "Build camera-daemon native unit tests" OFF)
 if(ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
@@ -23,6 +24,7 @@ endif()
 set(HAL_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_V2_INC ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/include)
 set(HAL_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/common)
+set(HAL_THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/third_party)
 set(AUTO_AF_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../hal_v2/examples/AF_demo/core)
 set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_common.c
@@ -31,6 +33,7 @@ set(HAL_COMMON_SOURCES
     ${HAL_COMMON_DIR}/hal_postprocess_common.c
     ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
     ${HAL_COMMON_DIR}/hal_draw_ops_cpu.cpp
+    ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
 )
 # v2 headers are in subdirectories: media/, common/, model/, peripheral/
 # Each header uses relative includes (e.g. "../common/hal_common.h")
@@ -193,11 +196,14 @@ set(SOURCES
     src/audio_service.cpp
     src/dpm_worker.cpp
     src/autofocus_controller.cpp
+    src/illumination_controller.cpp
+    src/daynight_policy.cpp
     src/camera_control_service.cpp
     src/lens_hal_service.cpp
     src/camera_daemon.cpp
     ${AUTO_AF_CORE_DIR}/af_calibration.cpp
     ${AUTO_AF_CORE_DIR}/af_follow.cpp
+    ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
     ${AUTO_AF_CORE_DIR}/af_metric.cpp
     ${AUTO_AF_CORE_DIR}/af_scan.cpp
 )
@@ -219,6 +225,7 @@ target_include_directories(camera-daemon PRIVATE
     ${HAL_V2_INCLUDE_DIRS}
     ${PROTO_GEN_DIR}
     ${CAMERA_PROTO_GEN_ARM_DIR}
+    ${HAL_THIRD_PARTY_DIR}
     ${AUTO_AF_CORE_DIR}
 )
 
@@ -251,3 +258,40 @@ endif()
 
 # Install
 install(TARGETS camera-daemon DESTINATION /opt/aipc/bin)
+
+if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_executable(illumination-controller-test
+        tests/illumination_controller_test.cpp
+        src/illumination_controller.cpp
+        ${AUTO_AF_CORE_DIR}/af_ir_follow.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(illumination-controller-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${AUTO_AF_CORE_DIR}
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+    )
+    target_link_libraries(illumination-controller-test PRIVATE pthread)
+    add_test(NAME illumination-controller-test COMMAND illumination-controller-test)
+
+    add_executable(daynight-policy-test
+        tests/daynight_policy_test.cpp
+        src/daynight_policy.cpp
+    )
+    target_include_directories(daynight-policy-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(daynight-policy-test PRIVATE pthread)
+    add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
+
+    add_executable(fg2009-position-test
+        tests/fg2009_position_test.cpp
+        ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c
+    )
+    target_include_directories(fg2009-position-test PRIVATE
+        ${HAL_V2_INC}
+    )
+    add_test(NAME fg2009-position-test COMMAND fg2009-position-test)
+endif()

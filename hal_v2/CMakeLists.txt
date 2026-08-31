@@ -212,7 +212,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         # ---- SDK's webserver config for the Basic profiles; references rewritten to a scratch
         # ---- dir so no on-device config path is needed at runtime.
         set(HAL_V2_EMBED_DEFAULT_MEDIALIB ON CACHE BOOL "Embed a self-contained default medialib config in the HAL")
-        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic" CACHE STRING "Profiles embedded in the default medialib config")
+        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic" CACHE STRING "Profiles embedded in the default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT "/var/tmp/hal_medialib_default" CACHE STRING "Runtime scratch dir for the embedded default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_WS_CFG "etc/imaging/cfg/medialib_configs/webserver_medialib_config.json" CACHE STRING "Webserver medialib config path (relative to SDK sysroot)")
         get_filename_component(_HAL_SDK_SYSROOT "${HAILO_MEDIALIB_INC_DIR}/../../.." ABSOLUTE)
@@ -220,18 +220,24 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         set(_GEN_BUNDLE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/hailo15_media")
         set(_GEN_BUNDLE "${_GEN_BUNDLE_DIR}/hailo15_default_medialib_bundle.cpp")
         if(HAL_V2_EMBED_DEFAULT_MEDIALIB)
+            # Track every overlay file (not just the container json) so retuned
+            # iq_settings/calib files regenerate the bundle on incremental builds.
+            file(GLOB_RECURSE _HAL_OVERLAY_FILES CONFIGURE_DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/*")
             add_custom_command(
                 OUTPUT ${_GEN_BUNDLE}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${_GEN_BUNDLE_DIR}
                 COMMAND ${HAL_PYTHON3}
                         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
                         --sysroot ${_HAL_SDK_SYSROOT}
+                        --overlay ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay
                         --webserver-config ${HAL_V2_DEFAULT_MEDIALIB_WS_CFG}
                         --scratch-root ${HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT}
                         --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                         --out ${_GEN_BUNDLE}
                 DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
-                COMMENT "Generating self-contained default medialib bundle (5 Basic profiles)"
+                        ${_HAL_OVERLAY_FILES}
+                COMMENT "Generating self-contained default medialib bundle (5 Basic + Infrared profiles)"
                 VERBATIM
             )
             set(_DEFAULT_MEDIALIB_SOURCES

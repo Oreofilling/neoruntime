@@ -306,8 +306,12 @@
       "bundled_recovery": "AIPC 内置",
       "recovery_version": "Recovery 版本",
       "current_app_version": "当前 App 版本",
-      "compat_level": "兼容级别",
-      "data_schema": "数据版本",
+      "ota_incompatible_title": "应用包与当前系统不兼容",
+      "ota_incompatible_range": "当前 OS {{os}}，应用支持范围 {{min}}–{{max}}",
+      "ota_blocked_os_in_progress": "OS 升级正在进行中，应用固件安装被拒绝；请等待 OS 升级结束或取消后重试",
+      "os_upgrade_blocked_app_ota": "应用固件升级正在进行中，OS 安装被拒绝；请等待应用升级完成或失败后再试",
+      "os_upgrade_app_incompatible_title": "当前应用与此 OS 包不兼容",
+      "os_upgrade_app_incompatible_desc": "OS 升级不受应用兼容性限制；升级完成后请安装支持该 OS 范围的应用包，期间应用服务将保持停止，platform-api 救援通道仍可用",
       "rollback_support": "自动回滚",
       "target_machine": "目标硬件",
       "install_log": "安装日志",
@@ -1738,7 +1742,8 @@
         "set_failed": "设置更新失败"
       },
       "lens": {
-        "title": "镜头控制"
+        "title": "镜头控制",
+        "model_badge": "出厂镜头型号"
       },
       "peripheral": {
         "title": "外设控制",

@@ -3,7 +3,7 @@
 .PHONY: all build-go build-native build-web build-ci clean distclean test test-unit test-basic test-smoke test-verify verify test-integration proto \
   proto-inference proto-device proto-event proto-camera proto-app proto-lens proto-discovery \
   hal-v2 platform ai-runtime device-control event-bus app-manager platform-api \
-  device-discovery os-updater camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
+  device-discovery os-updater onvif-device camera-daemon web aipc-cli tools mcu-firmware pack pack-release \
   ensure-mcu-toolchain docker-pack-release _pack-stage _pack-internal fmt lint help
 
 -include Makefile.local
@@ -21,10 +21,15 @@ DOCKER_RELEASE_SDK_PATH ?= /opt/hailo-sdk
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
-AIPC_COMPAT_LEVEL ?= 1
+AIPC_OS_VERSION ?= 1.12.0
+AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
+AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_DATA_SCHEMA ?= 1
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
+# Factory-fitted lens baked into product.yaml at pack time: af0832 | fg2009.
+# camera-daemon fail-fasts on any other value, so validate here too.
+LENS_PRODUCT ?= af0832
 SKIP_STAGE_TARBALL ?= 0
 AIPC_NGINX_DIR ?= deploy/nginx
 AIPC_NGINX_RUNTIME_ENABLED ?= $(if $(filter hailo15,$(HAL_PLATFORM)),1,0)
@@ -44,6 +49,7 @@ PROTOC ?= protoc
 
 PROTO_GO_PLUGIN := --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative
 PROTOC_OPT := --experimental_allow_proto3_optional
+PROTOC_GO := $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN)
 CMAKE_TARGET_ARGS := -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE)
 SYSROOT_ENV :=
 HAL_V2_BUILD_DIR := hal_v2/build-$(HAL_PLATFORM)
@@ -91,33 +97,33 @@ ifeq ($(HAL_PLATFORM),hailo15)
 endif
 
 proto-inference:
-	cd platform/ai-runtime/proto && $(PROTOC) $(PROTO_GO_PLUGIN) inference.proto
+	cd platform/ai-runtime/proto && $(PROTOC_GO) inference.proto
 
 proto-device:
-	cd platform/device-control/proto && $(PROTOC) $(PROTO_GO_PLUGIN) device.proto
+	cd platform/device-control/proto && $(PROTOC_GO) device.proto
 
 proto-event:
-	cd platform/event-bus/proto && $(PROTOC) $(PROTO_GO_PLUGIN) event.proto
+	cd platform/event-bus/proto && $(PROTOC_GO) event.proto
 
 proto-camera:
 	@if [ -f platform/camera-daemon/proto/camera.proto ]; then \
-		cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) $(PROTO_GO_PLUGIN) camera.proto; \
+		cd platform/camera-daemon/proto && $(PROTOC_GO) camera.proto; \
 	fi
 
 proto-app:
 	@if [ -f platform/app-manager/proto/app.proto ]; then \
-		cd platform/app-manager/proto && $(PROTOC) $(PROTO_GO_PLUGIN) app.proto; \
+		cd platform/app-manager/proto && $(PROTOC_GO) app.proto; \
 	fi
 
 proto-lens:
 	@mkdir -p platform/device-control/lens/lenspb
-	$(PROTOC) --proto_path=platform/camera-daemon/proto $(PROTOC_OPT) \
-		--go_out=platform/device-control/lens/lenspb --go_opt=paths=source_relative \
-		--go-grpc_out=platform/device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
-		platform/camera-daemon/proto/lens_hal.proto
+	cd platform/camera-daemon/proto && $(PROTOC) $(PROTOC_OPT) \
+		--go_out=../../device-control/lens/lenspb --go_opt=paths=source_relative \
+		--go-grpc_out=../../device-control/lens/lenspb --go-grpc_opt=paths=source_relative \
+		lens_hal.proto
 
 proto-discovery:
-	cd platform/device-discovery/proto && $(PROTOC) $(PROTO_GO_PLUGIN) discovery.proto
+	cd platform/device-discovery/proto && $(PROTOC_GO) discovery.proto
 
 hal-v2:
 	@echo "==> Building HAL v2 [platform=$(HAL_PLATFORM)]"
@@ -142,7 +148,7 @@ hal-v2:
 	@mkdir -p $(BUILD_DIR)/hal/$(HAL_PLATFORM)
 	@cp -P $(HAL_V2_BUILD_DIR)/libaipc_hal*.so* $(HAL_V2_BUILD_DIR)/libhal-*.so* $(BUILD_DIR)/hal/$(HAL_PLATFORM)/ 2>/dev/null || true
 
-platform: device-control event-bus app-manager platform-api device-discovery os-updater
+platform: device-control event-bus app-manager platform-api device-discovery os-updater onvif-device
 
 ai-runtime: proto
 	@echo "==> Building ai-runtime"
@@ -178,6 +184,10 @@ platform-api: proto
 device-discovery: proto
 	@mkdir -p $(BUILD_DIR)
 	cd platform/device-discovery/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/device-discovery .
+
+onvif-device:
+	@mkdir -p $(BUILD_DIR)
+	cd platform/onvif-device/server && $(AIPC_GO_ENV) $(GO) build $(GO_BUILD_FLAGS) -o $(CURDIR)/$(BUILD_DIR)/onvif-device .
 
 os-updater:
 	@mkdir -p $(BUILD_DIR)
@@ -264,7 +274,7 @@ docker-pack-release:
 			corepack enable; \
 			corepack prepare "pnpm@$$DOCKER_RELEASE_PNPM_VERSION" --activate; \
 			pnpm -v; \
-			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW"'
+			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)"'
 
 ensure-mcu-toolchain:
 	@if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then \
@@ -295,6 +305,11 @@ mcu-firmware: ensure-mcu-toolchain
 		exit 1; \
 	fi; \
 	echo "==> MCU firmware staged in $(MCU_FW_DIR)"
+	@mkdir -p mcu_board_prj/firmware
+	@rm -f mcu_board_prj/firmware/ne503_ota_package_*.bin mcu_board_prj/firmware/ne503_Main_v*.hex
+	@cp -f "$(MCU_FW_BUILD_DIR)"/ne503_ota_package_*.bin mcu_board_prj/firmware/
+	@cp -f "$(MCU_FW_BUILD_DIR)"/ne503_Main_v*.hex mcu_board_prj/firmware/
+	@echo "==> Latest OTA + HEX copied to mcu_board_prj/firmware"
 
 pack: all
 	$(MAKE) _pack-stage HAL_PLATFORM="$(HAL_PLATFORM)" VERSION="$(VERSION)"
@@ -313,7 +328,7 @@ endif
 _pack-stage:
 	@echo "==> Packaging release [$(VERSION), platform=$(HAL_PLATFORM)]"
 	@missing=""; \
-	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery aipc-os-updater; do \
+	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device aipc-os-updater; do \
 		[ -x "$(BUILD_DIR)/$$b" ] || missing="$$missing $$b"; \
 	done; \
 	[ -e "$(BUILD_DIR)/hal/$(HAL_PLATFORM)/libaipc_hal.so" ] || missing="$$missing libaipc_hal.so"; \
@@ -328,6 +343,10 @@ _pack-stage:
 			exit 1; \
 		fi; \
 	done
+	@if [ "$(LENS_PRODUCT)" != "af0832" ] && [ "$(LENS_PRODUCT)" != "fg2009" ]; then \
+		echo "ERROR: LENS_PRODUCT must be af0832 or fg2009 (got '$(LENS_PRODUCT)')"; \
+		exit 1; \
+	fi
 	@rm -rf "$(STAGE_DIR)" "$(TARBALL)"
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/bin" \
 		"$(STAGE_DIR)/opt/aipc/libexec" \
@@ -340,7 +359,7 @@ _pack-stage:
 		"$(STAGE_DIR)/opt/aipc/swagger-ui" \
 		"$(STAGE_DIR)/opt/aipc/models" \
 		"$(STAGE_DIR)/systemd"
-	@for f in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery; do \
+	@for f in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device; do \
 		cp "$(BUILD_DIR)/$$f" "$(STAGE_DIR)/opt/aipc/bin/"; \
 		echo "  + $$f"; \
 	done
@@ -357,6 +376,11 @@ _pack-stage:
 	@cp -f configs/platform/device-control.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform-api.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@cp -f configs/platform/discovery.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@cp -f configs/platform/onvif.yaml "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
+	@printf '%s\n' \
+		'lens:' \
+		'  model: $(LENS_PRODUCT)' > "$(STAGE_DIR)/opt/aipc/etc/product.yaml" \
+		&& echo "  + product.yaml (lens=$(LENS_PRODUCT))"
 	@cp -f configs/security/seccomp-default.json "$(STAGE_DIR)/opt/aipc/etc/security/" 2>/dev/null || true
 	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/systemd/system.conf.d" \
 		"$(STAGE_DIR)/opt/aipc/etc/systemd/journald.conf.d" \
@@ -400,6 +424,7 @@ _pack-stage:
 	@cp -f scripts/aipc-configure-platform-api-gateway.py "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" || true
 	@cp -f scripts/aipc-logrotate.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" || true
 	@cp -f scripts/aipc-os-layout-check.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-os-layout-check.sh" || true
+	@cp -f scripts/aipc-factory-reset.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-factory-reset.sh" || true
 	@cp -f scripts/aipc-restore.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-restore" || true
 	@cp -f scripts/aipc-firstboot-os.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-firstboot" || true
 	@cp -f scripts/aipc-autostart.sh "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/libexec/aipc-autostart" || true
@@ -428,9 +453,17 @@ _pack-stage:
 	@[ -d web/dist ] && cp -r web/dist/* "$(STAGE_DIR)/opt/aipc/web/" && echo "  + web console" || true
 	@cp -f platform/platform-api/swagger-ui/* "$(STAGE_DIR)/opt/aipc/swagger-ui/" 2>/dev/null || true
 	@cp -f docs/api/swagger.yaml "$(STAGE_DIR)/opt/aipc/etc/swagger.yaml" 2>/dev/null || true
-	@for cat in detection classification segmentation keypoint clip depth ocr genai; do \
+	@staged_models=0; \
+	for cat in detection classification segmentation keypoint clip depth ocr genai; do \
 		mkdir -p "$(STAGE_DIR)/opt/aipc/models/$$cat"; \
-	done
+		for f in "models/$$cat"/*.hef "models/$$cat"/*.json; do \
+			[ -f "$$f" ] || continue; \
+			cp -f "$$f" "$(STAGE_DIR)/opt/aipc/models/$$cat/"; \
+			echo "  + models/$$cat/$$(basename "$$f")"; \
+			staged_models=1; \
+		done; \
+	done; \
+	[ "$$staged_models" -eq 1 ] || echo "  - models/ source tree absent; device must run download_models.sh"
 	@printf '%s\n' \
 		"version=$(VERSION)" \
 		"build_date=$$(date +%Y%m%d-%H%M%S)" \
@@ -441,7 +474,8 @@ _pack-stage:
 		'  "app_version": "$(VERSION)",' \
 		'  "machine": "$(AIPC_MACHINE)",' \
 		'  "product": "$(AIPC_PRODUCT)",' \
-		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
+		'  "min_os_version": "$(AIPC_MIN_OS_VERSION)",' \
+		'  "max_os_version": "$(AIPC_MAX_OS_VERSION)",' \
 		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
 		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
 		'}' > "$(STAGE_DIR)/opt/aipc/app-manifest.json"
@@ -463,6 +497,10 @@ _pack-internal: _pack-stage
 	else \
 		echo "  - imaging configs not found at $$IMAGING_BASE"; \
 	fi
+	@mkdir -p "$(STAGE_DIR)/opt/aipc/etc/imaging" \
+		"$(STAGE_DIR)/opt/aipc/etc"
+	@cp -a configs/imaging/. "$(STAGE_DIR)/opt/aipc/etc/imaging/" 2>/dev/null || true
+	@cp -f configs/platform/ir_zoom_lut.csv configs/platform/ir_zoom_lut_fg2009.csv configs/platform/focus_curve_fg2009.csv "$(STAGE_DIR)/opt/aipc/etc/" 2>/dev/null || true
 	@mkdir -p "$(RELEASE_DIR)"
 	tar czf "$(TARBALL)" -C "$(RELEASE_DIR)" "$(PKG_NAME)"
 	@echo "=== Release Package Ready ==="
@@ -472,7 +510,7 @@ _pack-internal: _pack-stage
 test: test-unit
 
 test-unit: proto
-	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit
+	$(GO) test $(GO_TEST_FLAGS) ./platform/... ./tests/unit ./tools/aipc-cli/...
 
 test-basic:
 	./scripts/run_basic_tests.sh

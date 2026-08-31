@@ -18,7 +18,9 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/glebarez/sqlite"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"gorm.io/gorm"
 
@@ -687,7 +689,7 @@ func (s *AppManagerServer) AsyncInstallApp(ctx context.Context, req *proto.Async
 func (s *AppManagerServer) GetInstallProgress(ctx context.Context, req *proto.InstallProgressRequest) (*proto.InstallProgressResponse, error) {
 	task, ok := s.taskStore.Get(req.TaskId)
 	if !ok {
-		return nil, fmt.Errorf("task not found: %s", req.TaskId)
+		return nil, status.Errorf(codes.NotFound, "task not found: %s", req.TaskId)
 	}
 
 	phase, percent, message, appID, errMsg := task.Snapshot()
