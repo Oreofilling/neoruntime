@@ -8,18 +8,12 @@ import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
+import { LightingControlSkeleton } from './DeviceControlSkeletons';
 import {
-  useInfraredStatus,
-  useSetInfraredSettings,
-  useIrPresets,
-  useSaveIrPreset,
-  useDeleteIrPreset,
-  useLensGoto,
-  useLensGotoZoomRatio,
-  useLensStatus,
-  useOneshotAutofocus,
+  useDeviceStatus,
+  useSetLight,
+  useSetIrLed,
 } from '@/hooks/useDeviceControl';
-import type { IrPreset } from '@/services/api/device';
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 const DEFAULT_LEVEL = 50;
@@ -86,54 +80,51 @@ function IrBrightnessSlider({
 
 export default function LightingControl() {
   const { t } = useTranslation();
-  const { data: infrared, isLoading } = useInfraredStatus();
-  const setInfrared = useSetInfraredSettings();
-  const { data: presetData } = useIrPresets();
-  const savePreset = useSaveIrPreset();
-  const deletePreset = useDeleteIrPreset();
-  const lensGoto = useLensGoto();
-  const lensGotoRatio = useLensGotoZoomRatio();
-  const { data: lensStatus } = useLensStatus();
-  const oneshotAf = useOneshotAutofocus();
-  // Open-loop lens: no autofocus stack, and the ratio-only goto endpoint is
-  // the one it supports (the AF0832 ratio+distance goto is rejected on it).
-  const isFg2009 = lensStatus?.lens_model === 'fg2009';
-  const presets = presetData?.presets ?? [];
+  const { data: status, isLoading } = useDeviceStatus();
+  const setLight = useSetLight();
+  const setIrLed = useSetIrLed();
 
-  const [nearLevel, setNearLevel] = useState(DEFAULT_LEVEL);
+  const [nearLevel, setNearLevel] = useState(
+    status?.white_light_level ?? DEFAULT_LEVEL
+  );
   const [farLevel, setFarLevel] = useState(DEFAULT_LEVEL);
 
   useEffect(() => {
-    if (infrared) {
-      setNearLevel(infrared.requested_near_pwm);
-      setFarLevel(infrared.requested_far_pwm);
+    if (status?.white_light_level != null && status.white_light_level > 0) {
+      setNearLevel(status.white_light_level);
     }
-  }, [infrared]);
+  }, [status?.white_light_level]);
+
+  useEffect(() => {
+    if (status?.ir_led_level != null) {
+      setFarLevel(status.ir_led_level > 0 ? status.ir_led_level : 0);
+    }
+  }, [status?.ir_led_level]);
 
   const handleNearLevelCommit = useCallback(
     async (level: number) => {
       try {
-        await setInfrared.mutateAsync({ near_pwm: level, far_pwm: farLevel });
+        await setLight.mutateAsync(level);
       } catch {
         toast.error(
           t('sys.device.lighting.set_failed', 'Failed to update setting')
         );
       }
     },
-    [farLevel, setInfrared, t]
+    [setLight, t]
   );
 
   const handleFarLevelCommit = useCallback(
     async (level: number) => {
       try {
-        await setInfrared.mutateAsync({ near_pwm: nearLevel, far_pwm: level });
+        await setIrLed.mutateAsync(level);
       } catch {
         toast.error(
           t('sys.device.lighting.set_failed', 'Failed to update setting')
         );
       }
     },
-    [nearLevel, setInfrared, t]
+    [setIrLed, t]
   );
 
   const handleNearStep = async (direction: -1 | 1) => {
@@ -156,7 +147,7 @@ export default function LightingControl() {
       setNearLevel(level);
     }
     try {
-      await setInfrared.mutateAsync({ near_pwm: level, far_pwm: farLevel });
+      await setLight.mutateAsync(level);
     } catch {
       toast.error(
         t('sys.device.lighting.set_failed', 'Failed to update setting')
@@ -174,7 +165,7 @@ export default function LightingControl() {
       setFarLevel(0);
     }
     try {
-      await setInfrared.mutateAsync({ near_pwm: nearLevel, far_pwm: level });
+      await setIrLed.mutateAsync(level);
     } catch {
       toast.error(
         t('sys.device.lighting.set_failed', 'Failed to update setting')
@@ -182,57 +173,12 @@ export default function LightingControl() {
     }
   };
 
-  const zoomRatio = infrared?.zoom_ratio ?? 1;
+  if (isLoading) {
+    return <LightingControlSkeleton />;
+  }
 
-  const handleSavePreset = async () => {
-    const name = window.prompt(t('sys.device.lighting.preset_name_prompt', 'Preset name'));
-    if (!name?.trim()) return;
-    try {
-      await savePreset.mutateAsync({
-        name: name.trim(),
-        zoom_ratio: zoomRatio,
-        near_pwm: nearLevel,
-        far_pwm: farLevel,
-      });
-      toast.success(t('sys.device.lighting.preset_saved', 'Preset saved'));
-    } catch {
-      toast.error(t('sys.device.lighting.set_failed', 'Failed to save preset'));
-    }
-  };
-
-  const handleLoadPreset = async (p: IrPreset) => {
-    try {
-      if (isFg2009) {
-        // Ratio-only goto lands focus on the INF tracking curve and the
-        // daemon's post-zoom observer runs a one-shot AF automatically;
-        // an explicit oneshot here would only double-run it.
-        await lensGotoRatio.mutateAsync(p.zoom_ratio);
-      } else {
-        await lensGoto.mutateAsync({ zoomRatio: p.zoom_ratio });
-        await oneshotAf.mutateAsync(); // re-focus after the zoom move so the image is sharp
-      }
-      await setInfrared.mutateAsync({ near_pwm: p.near_pwm, far_pwm: p.far_pwm });
-      setNearLevel(p.near_pwm);
-      setFarLevel(p.far_pwm);
-      toast.success(t('sys.device.lighting.preset_loaded', 'Preset loaded'));
-    } catch {
-      toast.error(t('sys.device.lighting.set_failed', 'Failed to load preset'));
-    }
-  };
-
-  const handleDeletePreset = async (name: string) => {
-    try {
-      await deletePreset.mutateAsync(name);
-    } catch {
-      toast.error(t('sys.device.lighting.set_failed', 'Failed to delete preset'));
-    }
-  };
-
-  const nearIrOn = nearLevel > 0;
-  const farIrOn = farLevel > 0;
-  const infraredActive = infrared?.mode === 'infrared';
-  const busy = isLoading || setInfrared.isPending;
-  const manualEnabled = infraredActive && !infrared?.follow_active && !busy;
+  const nearIrOn = (status?.white_light_level ?? 0) > 0;
+  const farIrOn = (status?.ir_led_level ?? 0) > 0;
 
   return (
     <Card className="shadow-sm bg-background">
@@ -250,7 +196,7 @@ export default function LightingControl() {
             <Switch
               checked={nearIrOn}
               onCheckedChange={handleNearIrToggle}
-              disabled={!manualEnabled}
+              disabled={setLight.isPending}
             />
           </div>
           <div className="space-y-2">
@@ -267,7 +213,7 @@ export default function LightingControl() {
             </div>
             <IrBrightnessSlider
               level={nearLevel}
-              disabled={!manualEnabled || !nearIrOn}
+              disabled={!nearIrOn || setLight.isPending}
               onLevelChange={setNearLevel}
               onLevelCommit={handleNearLevelCommit}
               onStep={handleNearStep}
@@ -283,7 +229,7 @@ export default function LightingControl() {
             <Switch
               checked={farIrOn}
               onCheckedChange={handleFarIrToggle}
-              disabled={!manualEnabled}
+              disabled={setIrLed.isPending}
             />
           </div>
           <div className="space-y-2">
@@ -300,62 +246,12 @@ export default function LightingControl() {
             </div>
             <IrBrightnessSlider
               level={farLevel}
-              disabled={!manualEnabled || !farIrOn}
+              disabled={!farIrOn || setIrLed.isPending}
               onLevelChange={setFarLevel}
               onLevelCommit={handleFarLevelCommit}
               onStep={handleFarStep}
             />
           </div>
-        </div>
-
-        {/* IR presets: save current (zoom + near/far) and one-click recall */}
-        <div className="space-y-3 border-t pt-4">
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-muted-foreground">
-              {t('sys.device.lighting.presets', 'Presets')}
-            </span>
-            <Button variant="outline" size="sm" onClick={handleSavePreset} disabled={!infraredActive}>
-              {t('sys.device.lighting.save_preset', 'Save current')}
-            </Button>
-          </div>
-          {presets.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              {t('sys.device.lighting.no_presets', 'No presets saved')}
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {presets.map(p => (
-                <div
-                  key={p.name}
-                  className="flex items-center justify-between gap-2 rounded-md border px-3 py-2"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium">{p.name}</div>
-                    <div className="text-xs text-muted-foreground tabular-nums">
-                      {p.zoom_ratio.toFixed(1)}× · near {p.near_pwm}% · far {p.far_pwm}%
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 gap-1">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleLoadPreset(p)}
-                      disabled={!infraredActive}
-                    >
-                      {t('sys.device.lighting.load', 'Load')}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleDeletePreset(p.name)}
-                    >
-                      ✕
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       </CardContent>
     </Card>

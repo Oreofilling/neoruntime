@@ -43,7 +43,7 @@ func doAPIGet(url string) (*apiResponse, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := apiHTTPClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}

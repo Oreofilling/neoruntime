@@ -199,98 +199,6 @@ static std::string derive_install_prefix(const std::string& config_path) {
     return "/opt/aipc";
 }
 
-static bool media_config_contains_profile(const std::string& path,
-                                          const std::string& profile_name) {
-    if (path.empty() || profile_name.empty()) return false;
-
-    std::ifstream file(path);
-    if (!file.is_open()) return false;
-
-    std::ostringstream contents;
-    contents << file.rdbuf();
-    const std::string json = contents.str();
-    const std::string quoted_name = "\"" + profile_name + "\"";
-    return json.find("\"name\"") != std::string::npos &&
-           json.find(quoted_name) != std::string::npos;
-}
-
-static void select_product_media_config_for_infrared(DaemonConfig& config) {
-    static constexpr const char* kProductMediaConfig =
-        "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
-        "medialib_configs/webserver_medialib_config.json";
-
-    if (!config.infrared.enabled ||
-        media_config_contains_profile(config.media_config_path,
-                                      config.infrared.infrared_profile)) {
-        return;
-    }
-    if (!media_config_contains_profile(kProductMediaConfig,
-                                       config.infrared.infrared_profile)) {
-        return;
-    }
-
-    HAL_LOG_WARNING("Configured media file '%s' does not provide profile '%s'; "
-                    "using product media file '%s'",
-                    config.media_config_path.c_str(),
-                    config.infrared.infrared_profile.c_str(),
-                    kProductMediaConfig);
-    config.media_config_path = kProductMediaConfig;
-}
-
-/* Lens product model is baked at pack time into product.yaml; the only
- * key consumed here is lens.model. Returns "" when the file is absent or
- * carries no lens model. */
-static std::string parse_product_lens_model(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return "";
-
-    std::string line;
-    bool in_lens_section = false;
-    while (std::getline(file, line)) {
-        line = strip_inline_comment(line);
-        const std::string trimmed = trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-
-        const bool indented = (line[0] == ' ' || line[0] == '\t');
-        if (trimmed.find("lens:") == 0 && !indented) {
-            in_lens_section = true;
-            continue;
-        }
-        if (!indented) {
-            in_lens_section = false;  // any other top-level key ends the section
-            continue;
-        }
-        if (in_lens_section && config_key_is(trimmed, "model"))
-            return get_value(trimmed);
-    }
-    return "";
-}
-
-/* Applies the factory lens model from <prefix>/etc/product.yaml.
- * Missing file keeps the af0832 default (legacy images); an unknown model
- * fails fast so a mis-built image cannot drive the wrong lens geometry. */
-static bool apply_product_lens_model(DaemonConfig& config,
-                                     const std::string& config_path) {
-    const std::string product_path =
-        derive_install_prefix(config_path) + "/etc/product.yaml";
-    const std::string model = parse_product_lens_model(product_path);
-
-    if (model.empty()) {
-        HAL_LOG_WARNING("No lens model in '%s'; defaulting to af0832",
-                        product_path.c_str());
-        return true;
-    }
-    if (model != "af0832" && model != "fg2009") {
-        HAL_LOG_ERROR("Unknown lens model '%s' in %s (expected af0832|fg2009)",
-                      model.c_str(), product_path.c_str());
-        return false;
-    }
-    config.lens_model = model;
-    HAL_LOG_INFO("Lens product model: %s (from %s)",
-                 model.c_str(), product_path.c_str());
-    return true;
-}
-
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -317,9 +225,6 @@ static DaemonConfig load_config(const std::string& path) {
     cfg.watchdog_timeout_ms = 5000;
     cfg.watchdog_warn_ms = 3000;
     cfg.log_level = "info";
-
-    // FG2009 open-loop geometry: bench-calibrated bootstrap offsets
-    hal_lens_fg2009_params_init_defaults(&cfg.lens_fg2009);
 
     // Streams derived from encoders after YAML parse (see below)
     cfg.streams = {};
@@ -357,7 +262,6 @@ static DaemonConfig load_config(const std::string& path) {
 
     std::string line;
     std::string section;
-    std::string lens_subsection;
 
     while (std::getline(file, line)) {
         line = strip_inline_comment(line);
@@ -373,10 +277,7 @@ static DaemonConfig load_config(const std::string& path) {
         if (trimmed.find("ai_overlay:") == 0) { section = "ai_overlay"; continue; }
         if (trimmed.find("audio:") == 0) { section = "audio"; continue; }
         if (trimmed.find("autofocus:") == 0) { section = "autofocus"; continue; }
-        if (trimmed.find("infrared:") == 0) { section = "infrared"; continue; }
-        if (trimmed.find("light_sensor:") == 0) { section = "light_sensor"; continue; }
         if (trimmed.find("service:") == 0) { section = "service"; continue; }
-        if (trimmed.find("lens:") == 0) { section = "lens"; lens_subsection.clear(); continue; }
         if (trimmed.find("streams:") == 0) { section = "streams"; cfg.streams.clear(); continue; }
         if (trimmed.find("encoders:") == 0) { section = "encoders"; cfg.encoders.clear(); continue; }
 
@@ -589,8 +490,6 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.fine_step = static_cast<int>(parse_u32_config(val, "autofocus.fine_step"));
             else if (trimmed.find("fine_span:") != std::string::npos)
                 cfg.autofocus.fine_span = static_cast<int>(parse_u32_config(val, "autofocus.fine_span"));
-            else if (trimmed.find("trace_scan:") != std::string::npos)
-                cfg.autofocus.trace_scan = (val == "true" || val == "1");
             else if (trimmed.find("max_moves:") != std::string::npos)
                 cfg.autofocus.max_moves = static_cast<int>(parse_u32_config(val, "autofocus.max_moves"));
             else if (trimmed.find("balanced_retry:") != std::string::npos)
@@ -603,88 +502,11 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.sensor_native_width = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_width"));
             else if (trimmed.find("sensor_native_height:") != std::string::npos)
                 cfg.autofocus.sensor_native_height = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_height"));
-        } else if (section == "infrared") {
-            if (trimmed.find("enabled:") != std::string::npos)
-                cfg.infrared.enabled = (val == "true" || val == "1");
-            else if (trimmed.find("profile_name:") != std::string::npos)
-                cfg.infrared.infrared_profile = val;
-            else if (trimmed.find("default_mode:") != std::string::npos)
-                cfg.infrared.default_mode = val;
-            else if (trimmed.find("near_led_id:") != std::string::npos)
-                cfg.infrared.near_led_id = parse_u32_config(val, "infrared.near_led_id", 255);
-            else if (trimmed.find("far_led_id:") != std::string::npos)
-                cfg.infrared.far_led_id = parse_u32_config(val, "infrared.far_led_id", 255);
-            else if (trimmed.find("auto_follow:") != std::string::npos)
-                cfg.infrared.auto_follow = (val == "true" || val == "1");
-            else if (trimmed.find("lut_path:") != std::string::npos)
-                cfg.infrared.lut_path = val;
-            else if (trimmed.find("deadband_percent:") != std::string::npos)
-                cfg.infrared.deadband_percent = static_cast<int>(parse_u32_config(val, "infrared.deadband_percent", 100));
-            else if (trimmed.find("endpoint_settle_frames:") != std::string::npos)
-                cfg.infrared.endpoint_settle_frames = static_cast<int>(parse_u32_config(val, "infrared.endpoint_settle_frames"));
-            else if (trimmed.find("mode_settle_frames:") != std::string::npos)
-                cfg.infrared.mode_settle_frames = static_cast<int>(parse_u32_config(val, "infrared.mode_settle_frames"));
-            else if (trimmed.find("log_updates:") != std::string::npos)
-                cfg.infrared.log_updates = (val == "true" || val == "1");
-        } else if (section == "light_sensor") {
-            if (trimmed.find("enabled:") != std::string::npos)
-                cfg.light_sensor.enabled = (val == "true" || val == "1");
-            else if (trimmed.find("auto_on_boot:") != std::string::npos)
-                cfg.light_sensor.auto_on_boot = (val == "true" || val == "1");
-            else if (trimmed.find("night_enter:") != std::string::npos)
-                cfg.light_sensor.night_enter = static_cast<int>(parse_u32_config(val, "light_sensor.night_enter", 100));
-            else if (trimmed.find("day_enter:") != std::string::npos)
-                cfg.light_sensor.day_enter = static_cast<int>(parse_u32_config(val, "light_sensor.day_enter", 100));
-            else if (trimmed.find("sample_interval_ms:") != std::string::npos)
-                cfg.light_sensor.sample_interval_ms = static_cast<int>(parse_u32_config(val, "light_sensor.sample_interval_ms", 60000));
-            else if (trimmed.find("stable_samples:") != std::string::npos)
-                cfg.light_sensor.stable_samples = static_cast<int>(parse_u32_config(val, "light_sensor.stable_samples", 100));
-            else if (trimmed.find("dark_mv:") != std::string::npos)
-                cfg.light_sensor.dark_mv = static_cast<int>(parse_u32_config(val, "light_sensor.dark_mv", 3300));
-            else if (trimmed.find("bright_mv:") != std::string::npos)
-                cfg.light_sensor.bright_mv = static_cast<int>(parse_u32_config(val, "light_sensor.bright_mv", 3300));
         } else if (section == "service") {
             if (trimmed.find("log_level:") != std::string::npos)
                 cfg.log_level = val;
             else if (trimmed.find("log_file:") != std::string::npos)
                 cfg.log_file = val;
-        } else if (section == "lens") {
-            if (trimmed.find("fg2009:") == 0) {
-                lens_subsection = "fg2009";
-            } else if (lens_subsection == "fg2009") {
-                if (trimmed.find("ram_steps:") != std::string::npos)
-                    cfg.lens_fg2009.ram_steps = (int32_t)parse_u32_config(val, "lens.fg2009.ram_steps");
-                else if (trimmed.find("park_zoom_steps:") != std::string::npos)
-                    cfg.lens_fg2009.park_zoom_steps = (int32_t)parse_u32_config(val, "lens.fg2009.park_zoom_steps");
-                else if (trimmed.find("park_focus_steps:") != std::string::npos)
-                    cfg.lens_fg2009.park_focus_steps = (int32_t)parse_u32_config(val, "lens.fg2009.park_focus_steps");
-                else if (trimmed.find("zoom_pps:") != std::string::npos)
-                    cfg.lens_fg2009.zoom_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.zoom_pps", HAL_LENS_FG2009_MAX_PPS);
-                else if (trimmed.find("focus_pps:") != std::string::npos)
-                    cfg.lens_fg2009.focus_pps = (uint16_t)parse_u32_config(val, "lens.fg2009.focus_pps", HAL_LENS_FG2009_MAX_PPS);
-                else if (trimmed.find("af_coarse_step:") != std::string::npos)
-                    cfg.lens_fg2009_af_coarse_step = (int)parse_u32_config(val, "lens.fg2009.af_coarse_step");
-                else if (trimmed.find("af_coarse_span:") != std::string::npos)
-                    cfg.lens_fg2009_af_coarse_span = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span");
-                else if (trimmed.find("af_coarse_span_low_zoom:") != std::string::npos)
-                    cfg.lens_fg2009_af_coarse_span_low_zoom = (int)parse_u32_config(val, "lens.fg2009.af_coarse_span_low_zoom");
-                else if (trimmed.find("af_coarse_span_zoom_threshold:") != std::string::npos)
-                    cfg.lens_fg2009_af_coarse_span_zoom_threshold = parse_float_config(val, "lens.fg2009.af_coarse_span_zoom_threshold");
-                else if (trimmed.find("af_fine_span:") != std::string::npos)
-                    cfg.lens_fg2009_af_fine_span = (int)parse_u32_config(val, "lens.fg2009.af_fine_span");
-                else if (trimmed.find("af_confidence_accept:") != std::string::npos)
-                    cfg.lens_fg2009_af_confidence_accept = parse_float_config(val, "lens.fg2009.af_confidence_accept");
-                else if (trimmed.find("af_balanced_retry:") != std::string::npos)
-                    cfg.lens_fg2009_af_balanced_retry = (int)parse_u32_config(val, "lens.fg2009.af_balanced_retry");
-                else if (trimmed.find("af_boot_oneshot:") != std::string::npos)
-                    cfg.lens_fg2009_af_boot_oneshot = (int)parse_u32_config(val, "lens.fg2009.af_boot_oneshot");
-                else if (trimmed.find("af_pps:") != std::string::npos)
-                    cfg.lens_fg2009_af_pps = (int)parse_u32_config(val, "lens.fg2009.af_pps", HAL_LENS_FG2009_MAX_PPS);
-                else if (trimmed.find("af_move_timeout_ms:") != std::string::npos)
-                    cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
-                else if (trimmed.find("focus_curve_path:") != std::string::npos)
-                    cfg.lens_fg2009_focus_curve_path = val;
-            }
         }
     }
 
@@ -780,10 +602,6 @@ int main(int argc, char** argv) {
     // Load configuration
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
-    select_product_media_config_for_infrared(config);
-    if (!apply_product_lens_model(config, config_path)) {
-        return 1;
-    }
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");
