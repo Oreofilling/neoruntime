@@ -2420,6 +2420,26 @@ func (h *MediaHandlers) RemoveStream(c *gin.Context) {
 		return
 	}
 
+	// Verify the stream exists in the YAML config before touching the
+	// pipeline: removing an unknown stream would push a bogus HAL request
+	// and surface as a 500 camera error instead of a clean 404.
+	encoders, err := h.readAllEncoderParams()
+	if err != nil {
+		Resp(c).FailMsg(CodeCameraError, "Failed to read stream config: "+err.Error())
+		return
+	}
+	found := false
+	for i := range encoders {
+		if encoders[i].StreamName == streamName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		Resp(c).FailMsg(CodeNotFound, "Stream not found in config: "+streamName)
+		return
+	}
+
 	client := camerapb.NewCameraControlClient(h.cameraClient)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

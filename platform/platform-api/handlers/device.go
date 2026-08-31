@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"aipc/platform/common/events"
 	devicepb "aipc/platform/device-control/proto"
@@ -542,6 +544,10 @@ func (h *APIHandlers) GPIORead(c *gin.Context) {
 		Pin: uint32(pin),
 	})
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			Resp(c).FailMsg(CodeNotFound, status.Convert(err).Message())
+			return
+		}
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}

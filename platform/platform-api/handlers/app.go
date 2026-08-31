@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/yaml.v3"
 
@@ -384,6 +386,10 @@ func (h *APIHandlers) StartApp(c *gin.Context) {
 	}
 
 	if !resp.Success {
+		if resp.Code == 404 {
+			Resp(c).FailMsg(CodeAppNotFound, resp.Message)
+			return
+		}
 		if h.eventLogger != nil {
 			h.eventLogger.LogWithCodeAsync(
 				"app.crashed",
@@ -440,6 +446,10 @@ func (h *APIHandlers) StopApp(c *gin.Context) {
 	}
 
 	if !resp.Success {
+		if resp.Code == 404 {
+			Resp(c).FailMsg(CodeAppNotFound, resp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeAppStopFailed, resp.Message)
 		return
 	}
@@ -489,6 +499,10 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 		return
 	}
 	if !stopResp.Success {
+		if stopResp.Code == 404 {
+			Resp(c).FailMsg(CodeAppNotFound, stopResp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeAppStopFailed, stopResp.Message)
 		return
 	}
@@ -502,6 +516,10 @@ func (h *APIHandlers) RestartApp(c *gin.Context) {
 		return
 	}
 	if !startResp.Success {
+		if startResp.Code == 404 {
+			Resp(c).FailMsg(CodeAppNotFound, startResp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeAppStartFailed, startResp.Message)
 		return
 	}
@@ -596,6 +614,10 @@ func (h *APIHandlers) UninstallApp(c *gin.Context) {
 	}
 
 	if !resp.Success {
+		if resp.Code == 404 {
+			Resp(c).FailMsg(CodeAppNotFound, resp.Message)
+			return
+		}
 		Resp(c).FailMsg(CodeAppStopFailed, resp.Message)
 		return
 	}
@@ -673,6 +695,10 @@ func (h *APIHandlers) GetInstallProgress(c *gin.Context) {
 		TaskId: taskID,
 	})
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			Resp(c).FailMsg(CodeNotFound, status.Convert(err).Message())
+			return
+		}
 		Resp(c).FailMsg(CodeServiceError, err.Error())
 		return
 	}
