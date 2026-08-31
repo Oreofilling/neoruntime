@@ -5952,7 +5952,7 @@ paths:
     post:
       tags: [Media]
       summary: Upload an OSD overlay image
-      description: PNG or BMP only; stored under /opt/aipc/etc/osd and referenced by
+      description: PNG or BMP only; stored under /data/aipc/etc/osd and referenced by
         image overlays via image_path.
       operationId: uploadOsdImage
       requestBody:
@@ -5994,7 +5994,7 @@ paths:
         '200':
           description: TTF font file (cacheable, max-age 86400)
           content:
-            application/octet-stream:
+            font/ttf:
               schema:
                 type: string
                 format: binary
@@ -6009,7 +6009,7 @@ paths:
         required: true
         schema:
           type: string
-        description: Image filename under /opt/aipc/etc/osd
+        description: Image filename under /data/aipc/etc/osd
       responses:
         '200':
           description: Image binary
