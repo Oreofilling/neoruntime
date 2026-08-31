@@ -119,8 +119,9 @@ func (r *Runner) Install() error {
 	if job.UpgradeMode != "" && job.UpgradeMode != layout.Mode {
 		return r.fail(job, fmt.Sprintf("partition layout changed after validation: was %s, now %s", job.UpgradeMode, layout.Mode))
 	}
-	// OS upgrades are unconditional: app compatibility is evaluated after the
-	// reboot (see Verify) and is never a reason to refuse the install.
+	if err := r.checkTargetCompatibility(job); err != nil {
+		return r.fail(job, "OS/App compatibility check failed: "+err.Error())
+	}
 	if job.SHA256 != "" {
 		sum, err := fileSHA256(job.PackagePath)
 		if err != nil {
@@ -577,10 +578,9 @@ func (r *Runner) Verify() error {
 	if err := r.checkVersion(job.TargetVersion); err != nil {
 		return r.verificationFailure(job, err.Error())
 	}
-	// App compatibility after the reboot is advisory: the OS upgrade itself
-	// succeeded, so the job still reaches success and the operator restores
-	// service by installing a compatible app package (see docs/os-upgrade.md).
-	compatWarning := r.checkBootedAppCompatibility()
+	if err := r.checkBootedCompatibility(job); err != nil {
+		return r.verificationFailure(job, err.Error())
+	}
 
 	// Verify that the post-upgrade restore
 	// (aipc-restore.service) completed successfully before checking service
@@ -592,34 +592,28 @@ func (r *Runner) Verify() error {
 		return r.verificationFailure(job, "post-upgrade restore did not complete (missing "+donePath+")")
 	}
 
-	// Skip the service health window when the restored app is incompatible
-	// with the new OS: every service except platform-api is gated by
-	// aipc-compat-check and is expected to stay down until a compatible app
-	// package is installed.
-	if compatWarning == "" {
-		overallDeadline := time.Now().Add(3 * r.HealthDuration)
-		stableSince := time.Time{}
-		var lastHealthErr error
-		for {
-			if err := r.checkHealth(); err != nil {
-				lastHealthErr = err
-				stableSince = time.Time{}
-			} else {
-				if stableSince.IsZero() {
-					stableSince = time.Now()
-				}
-				if time.Since(stableSince) >= r.HealthDuration {
-					break
-				}
+	overallDeadline := time.Now().Add(3 * r.HealthDuration)
+	stableSince := time.Time{}
+	var lastHealthErr error
+	for {
+		if err := r.checkHealth(); err != nil {
+			lastHealthErr = err
+			stableSince = time.Time{}
+		} else {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
 			}
-			if time.Now().After(overallDeadline) {
-				if lastHealthErr == nil {
-					lastHealthErr = fmt.Errorf("services did not remain healthy for %s", r.HealthDuration)
-				}
-				return r.verificationFailure(job, lastHealthErr.Error())
+			if time.Since(stableSince) >= r.HealthDuration {
+				break
 			}
-			time.Sleep(5 * time.Second)
 		}
+		if time.Now().After(overallDeadline) {
+			if lastHealthErr == nil {
+				lastHealthErr = fmt.Errorf("services did not remain healthy for %s", r.HealthDuration)
+			}
+			return r.verificationFailure(job, lastHealthErr.Error())
+		}
+		time.Sleep(5 * time.Second)
 	}
 	if job.UpgradeMode == LayoutSingle {
 		if err := r.restoreStoredBootEnv(job, true); err != nil {
@@ -629,15 +623,7 @@ func (r *Runner) Verify() error {
 	}
 	job.State = StateSuccess
 	job.Progress = 100
-	if compatWarning != "" {
-		job.CompatibilityValid = false
-		job.CompatibilityWarning = compatWarning
-		job.Message = "OS upgrade verified; the installed app is incompatible with the new OS"
-	} else {
-		job.CompatibilityValid = true
-		job.CompatibilityWarning = ""
-		job.Message = "OS upgrade verified successfully"
-	}
+	job.Message = "OS upgrade verified successfully"
 	job.Error = ""
 	_ = os.Remove(filepath.Join(r.Store.JobDir(job.ID), "recovery.success"))
 	_ = r.deactivateBackup(job.ID)
@@ -792,29 +778,45 @@ func (r *Runner) checkHealth() error {
 	return nil
 }
 
-// checkBootedAppCompatibility evaluates the restored app against the booted
-// OS. It never fails the OS upgrade: the result is "" when the app is
-// compatible, otherwise a human-readable warning that is surfaced on the job
-// (CompatibilityValid=false) so the operator can install a matching app
-// package while platform-api keeps serving as the rescue channel.
-func (r *Runner) checkBootedAppCompatibility() string {
+func (r *Runner) checkTargetCompatibility(job *Job) error {
+	app, err := LoadAppManifest(rootedPath(r.BackupSourceRoot, r.AppManifestPath))
+	if err != nil {
+		return fmt.Errorf("cannot read App manifest: %w", err)
+	}
+	schema, err := ReadDataSchema(rootedPath(r.BackupSourceRoot, r.DataSchemaPath))
+	if err != nil {
+		return fmt.Errorf("cannot read data schema: %w", err)
+	}
+	target := &OSCompatibility{
+		OSVersion:   job.TargetVersion,
+		Machine:     job.Machine,
+		Product:     job.Product,
+		CompatLevel: job.CompatLevel,
+		DataSchema:  job.DataSchema,
+	}
+	return CheckCompatibility(target, app, schema)
+}
+
+func (r *Runner) checkBootedCompatibility(job *Job) error {
 	osInfo, err := LoadOSCompatibility(r.OSCompatibilityPath)
 	if err != nil {
-		return "cannot evaluate app compatibility: " + err.Error()
+		return fmt.Errorf("cannot read booted OS compatibility metadata: %w", err)
 	}
 	app, err := LoadAppManifest(r.AppManifestPath)
 	if err != nil {
-		return "cannot evaluate app compatibility: " + err.Error()
+		return fmt.Errorf("cannot read restored App manifest: %w", err)
 	}
 	schema, err := ReadDataSchema(r.DataSchemaPath)
 	if err != nil {
-		// No persisted schema yet (fresh device): assume the app's target.
-		schema = app.TargetDataSchema
+		return fmt.Errorf("cannot read data schema: %w", err)
 	}
-	if err := CheckCompatibility(osInfo, app, schema); err != nil {
-		return err.Error()
+	if job.CompatLevel > 0 && osInfo.CompatLevel != job.CompatLevel {
+		return fmt.Errorf("booted OS compatibility level %d does not match target %d", osInfo.CompatLevel, job.CompatLevel)
 	}
-	return ""
+	if job.DataSchema > 0 && osInfo.DataSchema != job.DataSchema {
+		return fmt.Errorf("booted OS data schema %d does not match target %d", osInfo.DataSchema, job.DataSchema)
+	}
+	return CheckCompatibility(osInfo, app, schema)
 }
 
 func (r *Runner) rollback(job *Job, reason string) error {

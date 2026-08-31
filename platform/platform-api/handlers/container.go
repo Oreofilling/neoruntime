@@ -214,24 +214,6 @@ func (h *ContainerHandlers) StreamContainerLogs(c *gin.Context) {
 	}
 }
 
-// containerOpFailure maps a container operation failure to the right response:
-// app-manager reports Status.Code=404 for unknown container ids, which becomes
-// a 404 (CodeNotFound); every other failure keeps the operation's generic
-// business code (mapped to 5xx).
-func containerOpFailure(c *gin.Context, st *apppb.Status, err error, genericCode int, prefix string) {
-	var msg string
-	if err != nil {
-		msg = err.Error()
-	} else {
-		msg = st.Message
-	}
-	if st != nil && st.Code == 404 {
-		Resp(c).FailMsg(CodeNotFound, prefix+msg)
-		return
-	}
-	Resp(c).FailMsg(genericCode, prefix+msg)
-}
-
 // StartContainer starts a container
 func (h *ContainerHandlers) StartContainer(c *gin.Context) {
 	if h.appManagerConn == nil {
@@ -246,7 +228,13 @@ func (h *ContainerHandlers) StartContainer(c *gin.Context) {
 
 	status, err := client.StartContainer(ctx, &apppb.ContainerRequest{Id: id})
 	if err != nil || !status.Success {
-		containerOpFailure(c, status, err, CodeAppStartFailed, "Failed to start container: ")
+		var msg string
+		if err != nil {
+			msg = err.Error()
+		} else {
+			msg = status.Message
+		}
+		Resp(c).FailMsg(CodeAppStartFailed, "Failed to start container: "+msg)
 		return
 	}
 
@@ -267,7 +255,13 @@ func (h *ContainerHandlers) StopContainer(c *gin.Context) {
 
 	status, err := client.StopContainer(ctx, &apppb.ContainerRequest{Id: id})
 	if err != nil || !status.Success {
-		containerOpFailure(c, status, err, CodeAppStopFailed, "Failed to stop container: ")
+		var msg string
+		if err != nil {
+			msg = err.Error()
+		} else {
+			msg = status.Message
+		}
+		Resp(c).FailMsg(CodeAppStopFailed, "Failed to stop container: "+msg)
 		return
 	}
 
@@ -288,7 +282,13 @@ func (h *ContainerHandlers) RestartContainer(c *gin.Context) {
 
 	status, err := client.RestartContainer(ctx, &apppb.ContainerRequest{Id: id})
 	if err != nil || !status.Success {
-		containerOpFailure(c, status, err, CodeOperationFailed, "Failed to restart container: ")
+		var msg string
+		if err != nil {
+			msg = err.Error()
+		} else {
+			msg = status.Message
+		}
+		Resp(c).FailMsg(CodeOperationFailed, "Failed to restart container: "+msg)
 		return
 	}
 
@@ -310,7 +310,13 @@ func (h *ContainerHandlers) RemoveContainer(c *gin.Context) {
 
 	status, err := client.RemoveContainer(ctx, &apppb.RemoveContainerRequest{Id: id, Force: force})
 	if err != nil || !status.Success {
-		containerOpFailure(c, status, err, CodeOperationFailed, "Failed to remove container: ")
+		var msg string
+		if err != nil {
+			msg = err.Error()
+		} else {
+			msg = status.Message
+		}
+		Resp(c).FailMsg(CodeOperationFailed, "Failed to remove container: "+msg)
 		return
 	}
 

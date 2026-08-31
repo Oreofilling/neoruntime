@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/camthink/ct-disc/pkg/discover"
@@ -35,7 +34,6 @@ type DeviceItem struct {
 	Online    bool     `json:"online"`
 	LastSeen  string   `json:"lastSeen"`
 	FirstSeen string   `json:"firstSeen"`
-	Manual    bool     `json:"manual,omitempty"`
 }
 
 type Settings struct {
@@ -46,16 +44,11 @@ type Settings struct {
 }
 
 type App struct {
-	ctx            context.Context
-	registry       *discover.Registry
-	listener       *discover.Listener
-	mqttCfg        mqttclient.Config
-	settings       Settings
-	recordMu       sync.Mutex
-	recordCancel   context.CancelFunc
-	recordStatus   RecordStatus
-	recordStopDone chan struct{}
-	recordHistory  []MetricRecord
+	ctx      context.Context
+	registry *discover.Registry
+	listener *discover.Listener
+	mqttCfg  mqttclient.Config
+	settings Settings
 }
 
 func NewApp() *App {

@@ -13,7 +13,6 @@ import (
 	"aipc/platform/app-manager/proto"
 	"aipc/platform/app-manager/registry"
 	"aipc/platform/common/logger"
-	"github.com/containerd/containerd/errdefs"
 	"google.golang.org/grpc"
 )
 
@@ -334,7 +333,7 @@ func (s *AppManagerServer) StartContainer(ctx context.Context, req *proto.Contai
 	ctx = s.withNamespace(ctx)
 	c, err := s.client.GetContainer(ctx, req.Id)
 	if err != nil {
-		return &proto.Status{Success: false, Message: err.Error(), Code: statusErrCode(err)}, nil
+		return &proto.Status{Success: false, Message: err.Error()}, nil
 	}
 
 	// Prefer app instance log path if container belongs to an app
@@ -372,7 +371,7 @@ func (s *AppManagerServer) StopContainer(ctx context.Context, req *proto.Contain
 	ctx = s.withNamespace(ctx)
 	c, err := s.client.GetContainer(ctx, req.Id)
 	if err != nil {
-		return &proto.Status{Success: false, Message: err.Error(), Code: statusErrCode(err)}, nil
+		return &proto.Status{Success: false, Message: err.Error()}, nil
 	}
 
 	task, err := c.Task(ctx, nil)
@@ -421,7 +420,7 @@ func (s *AppManagerServer) RemoveContainer(ctx context.Context, req *proto.Remov
 	ctx = s.withNamespace(ctx)
 	c, err := s.client.GetContainer(ctx, req.Id)
 	if err != nil {
-		return &proto.Status{Success: false, Message: err.Error(), Code: statusErrCode(err)}, nil
+		return &proto.Status{Success: false, Message: err.Error()}, nil
 	}
 
 	// Check if this container belongs to an app
@@ -449,18 +448,8 @@ func (s *AppManagerServer) RemoveContainer(ctx context.Context, req *proto.Remov
 
 	err = s.client.RemoveContainer(remCtx, c)
 	if err != nil {
-		return &proto.Status{Success: false, Message: err.Error(), Code: statusErrCode(err)}, nil
+		return &proto.Status{Success: false, Message: err.Error()}, nil
 	}
 
 	return &proto.Status{Success: true, Message: "Container removed"}, nil
-}
-
-// statusErrCode maps containerd errors onto HTTP-style codes carried in
-// proto.Status so callers (platform-api) can distinguish not-found (404)
-// from real failures (500). 0 means "no mapping" -> generic failure.
-func statusErrCode(err error) int32 {
-	if errdefs.IsNotFound(err) {
-		return 404
-	}
-	return 0
 }

@@ -5,10 +5,9 @@ interface Props {
   onClearSelection: () => void
   onBatchCommand: () => void
   onBatchNetwork: () => void
-  onBatchRecord: () => void
 }
 
-export function BatchToolbar({ selectedDevices, onClearSelection, onBatchCommand, onBatchNetwork, onBatchRecord }: Props) {
+export function BatchToolbar({ selectedDevices, onClearSelection, onBatchCommand, onBatchNetwork }: Props) {
   if (selectedDevices.length === 0) return null
 
   return (
@@ -28,12 +27,6 @@ export function BatchToolbar({ selectedDevices, onClearSelection, onBatchCommand
         className="px-3 py-1 text-xs bg-white/15 hover:bg-white/25 rounded transition-colors"
       >
         Network Config
-      </button>
-      <button
-        onClick={onBatchRecord}
-        className="px-3 py-1 text-xs bg-white/15 hover:bg-white/25 rounded transition-colors"
-      >
-        Record Data
       </button>
       <button
         onClick={onClearSelection}

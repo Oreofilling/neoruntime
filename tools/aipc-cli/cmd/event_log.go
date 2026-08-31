@@ -159,7 +159,7 @@ var eventLogCleanupCmd = &cobra.Command{
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := apiHTTPClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("request failed: %w", err)
 		}

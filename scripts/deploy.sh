@@ -409,7 +409,7 @@ validate_release_integrity() {
 
     require_nonempty_file "$context" "$root/app-manifest.json" || failed=1
     require_nonempty_file "$context" "$metadata_root/VERSION" || failed=1
-    for item in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
+    for item in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
         require_nonempty_file "$context" "$root/etc/$item" || failed=1
     done
     validate_camera_daemon_config_paths "$context" "$root" || failed=1
@@ -543,45 +543,20 @@ validate_hal_runtime_deps() {
     (( failed == 0 ))
 }
 
-aipc_os_updater_supports_exchange_dirs() {
-    local candidate="$1" probe
-    [[ -x "$candidate" && -s "$candidate" ]] || return 1
-
-    # Probe without OLD/NEW paths: new helpers fail safely with the
-    # command-specific argument error, while legacy helpers reject the command
-    # or only print the old usage string. Keep stderr captured so probing an old
-    # helper does not leak a confusing usage line into deploy logs.
-    probe="$("$candidate" exchange-dirs 2>&1 || true)"
-    case "$probe" in
-        *"exchange-dirs requires OLD and NEW directory paths"*|*"exchange-dirs OLD NEW"*)
-            return 0
-            ;;
-    esac
-
-    # Fallback for future wording changes in the Go helper.
-    command -v strings >/dev/null 2>&1 &&
-        strings "$candidate" 2>/dev/null | grep -q 'exchange-dirs'
-}
-
 exchange_dirs_with_helper() {
-    local left="$1" right="$2" helper candidate seen="|"
+    local left="$1" right="$2" helper candidate
     for candidate in \
-        "${STAGING_DIR:+$STAGING_DIR/libexec/aipc-os-updater}" \
-        "$right/libexec/aipc-os-updater" \
-        "$left/libexec/aipc-os-updater" \
         "$INSTALL_PREFIX/libexec/aipc-os-updater" \
-        "${PREVIOUS_DIR:+$PREVIOUS_DIR/libexec/aipc-os-updater}" \
+        "$PREVIOUS_DIR/libexec/aipc-os-updater" \
+        "$STAGING_DIR/libexec/aipc-os-updater" \
         "/usr/libexec/aipc-os-updater"; do
-        [[ -n "$candidate" ]] || continue
-        case "$seen" in *"|$candidate|"*) continue ;; esac
-        seen="${seen}${candidate}|"
-        if aipc_os_updater_supports_exchange_dirs "$candidate"; then
+        if [[ -x "$candidate" && -s "$candidate" ]]; then
             helper="$candidate"
             break
         fi
     done
     [[ -n "${helper:-}" ]] || {
-        err "No aipc-os-updater with exchange-dirs support is available for atomic directory exchange"
+        err "No executable aipc-os-updater available for atomic directory exchange"
         return 1
     }
     "$helper" exchange-dirs "$left" "$right"
@@ -777,21 +752,6 @@ get_current_version() {
     fi
 }
 
-version_valid() {
-    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-}
-
-# version_lte A B — numeric x.y.z comparison. Hand-rolled because busybox
-# `sort -V` availability is not guaranteed across image configurations.
-version_lte() {
-    local a=(${1//./ }) b=(${2//./ }) i
-    for i in 0 1 2; do
-        (( 10#${a[i]} < 10#${b[i]} )) && return 0
-        (( 10#${a[i]} > 10#${b[i]} )) && return 1
-    done
-    return 0
-}
-
 check_package_compatibility() {
     local manifest="$SCRIPT_DIR/opt/aipc/app-manifest.json"
     local os_compat="/etc/aipc-os-release"
@@ -810,37 +770,25 @@ check_package_compatibility() {
     # diagnostics and emergency rollback remain available on a damaged system.
     local missing_os_fields=()
     grep -Eq '^MACHINE=.+$' "$os_compat" || missing_os_fields+=("MACHINE")
-    grep -Eq '^OS_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$os_compat" || \
-        missing_os_fields+=("OS_VERSION")
+    grep -Eq '^AIPC_COMPAT_LEVEL=[1-9][0-9]*$' "$os_compat" || \
+        missing_os_fields+=("AIPC_COMPAT_LEVEL")
+    grep -Eq '^DATA_SCHEMA=[1-9][0-9]*$' "$os_compat" || \
+        missing_os_fields+=("DATA_SCHEMA")
     if (( ${#missing_os_fields[@]} > 0 )); then
         err "$os_compat is missing or invalid: ${missing_os_fields[*]}"
         return 1
     fi
 
-    local os_machine os_product os_version app_machine app_product app_min app_max target_schema current_schema
+    local os_machine os_product os_level os_schema app_machine app_product app_level current_schema target_schema
     os_machine=$(sed -n 's/^MACHINE=//p' "$os_compat" | tr -d "\"'" | head -1)
     os_product=$(sed -n 's/^PRODUCT=//p' "$os_compat" | tr -d "\"'" | head -1)
-    os_version=$(sed -n 's/^OS_VERSION=//p' "$os_compat" | tr -d "\"'" | head -1)
+    os_level=$(sed -n 's/^AIPC_COMPAT_LEVEL=//p' "$os_compat" | tr -d "\"'" | head -1)
+    os_schema=$(sed -n 's/^DATA_SCHEMA=//p' "$os_compat" | tr -d "\"'" | head -1)
     app_machine=$(sed -n 's/.*"machine"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)
     app_product=$(sed -n 's/.*"product"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)
-    app_min=$(sed -n 's/.*"min_os_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)
-    app_max=$(sed -n 's/.*"max_os_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -1)
+    app_level=$(sed -n 's/.*"required_compat_level"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$manifest" | head -1)
     target_schema=$(sed -n 's/.*"target_data_schema"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$manifest" | head -1)
     current_schema=$(tr -d '[:space:]' < "$schema_file" 2>/dev/null || echo "$target_schema")
-    [[ -n "$current_schema" ]] || current_schema="$target_schema"
-
-    if [[ -z "$app_machine" || -z "$app_min" || -z "$app_max" ]]; then
-        err "APP_COMPATIBILITY_METADATA_INVALID: app manifest lacks machine/min_os_version/max_os_version (old-format packages must be repackaged)"
-        return 1
-    fi
-    if ! version_valid "$app_min" || ! version_valid "$app_max"; then
-        err "APP_COMPATIBILITY_METADATA_INVALID: min_os_version=$app_min max_os_version=$app_max must be x.y.z"
-        return 1
-    fi
-    if ! version_lte "$app_min" "$app_max"; then
-        err "APP_COMPATIBILITY_METADATA_INVALID: min_os_version $app_min is greater than max_os_version $app_max"
-        return 1
-    fi
 
     [[ "$os_machine" == "$app_machine" ]] || {
         err "APP_MACHINE_MISMATCH: OS=$os_machine App=$app_machine"; return 1;
@@ -848,17 +796,22 @@ check_package_compatibility() {
     if [[ -n "$os_product" && -n "$app_product" && "$os_product" != "$app_product" ]]; then
         err "APP_PRODUCT_MISMATCH: OS=$os_product App=$app_product"; return 1
     fi
-    if ! version_lte "$app_min" "$os_version" || ! version_lte "$os_version" "$app_max"; then
-        err "APP_OS_VERSION_UNSUPPORTED: current OS $os_version is outside the app range $app_min-$app_max"
-        return 1
-    fi
+    [[ "$os_level" == "$app_level" ]] || {
+        err "APP_COMPAT_LEVEL_MISMATCH: OS=$os_level App=$app_level"; return 1;
+    }
+    [[ "$os_schema" == "$current_schema" ]] || {
+        err "APP_DATA_SCHEMA_UNSUPPORTED: OS=$os_schema current=$current_schema"; return 1;
+    }
+    [[ "$os_schema" == "$target_schema" ]] || {
+        err "APP_DATA_SCHEMA_UNSUPPORTED: OS=$os_schema App target=$target_schema"; return 1;
+    }
     if ! tr '\n' ' ' < "$manifest" |
         sed -n 's/.*"supported_data_schema"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' |
         tr ',' '\n' | tr -d '[:space:]' | grep -qx "$current_schema"; then
         err "APP_DATA_SCHEMA_UNSUPPORTED: App does not support schema $current_schema"
         return 1
     fi
-    log "Compatibility check passed: os=$os_version range=$app_min-$app_max schema=$current_schema"
+    log "Compatibility check passed: level=$os_level schema=$current_schema"
 }
 
 get_package_version() {
@@ -941,7 +894,7 @@ validate_package_preflight() {
         err "Preflight failed: missing $SCRIPT_DIR/VERSION"
         failed=1
     }
-    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
+    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
         [[ -s "$package_root/etc/$cfg" ]] || {
             err "Preflight failed: missing config $package_root/etc/$cfg"
             failed=1
@@ -1145,14 +1098,7 @@ prepare_staging() {
     mkdir -p "$STAGING_DIR"
 
     if [[ -d "$INSTALL_PREFIX" ]]; then
-        local entry name
-        shopt -s dotglob nullglob
-        for entry in "$INSTALL_PREFIX"/*; do
-            name="$(basename -- "$entry")"
-            case "$name" in data|models|apps|logs|backups|images) continue ;; esac
-            cp -a "$entry" "$STAGING_DIR"/
-        done
-        shopt -u dotglob nullglob
+        cp -a "$INSTALL_PREFIX"/. "$STAGING_DIR"/
     fi
 
     local package_root="$SCRIPT_DIR/opt/aipc"
@@ -1184,15 +1130,6 @@ prepare_staging() {
         for cfg in "$package_root"/etc/*.yaml; do
             [[ -f "$cfg" ]] || continue
             cp -f "$cfg" "$STAGING_DIR/etc/"
-        done
-        # The IR zoom LUTs and the factory lens identity are release content
-        # too: stage them with the yaml set so fresh installs land them (the
-        # LUT previously never reached a clean /data/aipc/etc).
-        rm -f "$STAGING_DIR"/etc/*.csv "$STAGING_DIR/etc/product.yaml"
-        local extra
-        for extra in "$package_root"/etc/*.csv "$package_root"/etc/product.yaml; do
-            [[ -f "$extra" ]] || continue
-            cp -f "$extra" "$STAGING_DIR/etc/"
         done
     fi
     # Package-owned rootfs configuration (journald/systemd/sysctl/security) is
@@ -1258,7 +1195,7 @@ validate_staging() {
         err "Validation failed: staged HAL symlink chain is broken"
         failed=1
     }
-    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml product.yaml; do
+    for cfg in camera-daemon.yaml ai-runtime.yaml app-manager.yaml event-bus.yaml platform-api.yaml; do
         [[ -s "$STAGING_DIR/etc/$cfg" ]] || {
             err "Validation failed: missing config $STAGING_DIR/etc/$cfg"
             failed=1
@@ -1416,7 +1353,7 @@ create_backup() {
         shopt -s dotglob nullglob
         for entry in "$INSTALL_PREFIX"/*; do
             name="$(basename -- "$entry")"
-            case "$name" in data|models|apps|logs|backups|images) continue ;; esac
+            case "$name" in data|models|apps|logs) continue ;; esac
             cp -a "$entry" "$backup_dir/release/"
         done
         shopt -u dotglob nullglob
@@ -1747,23 +1684,15 @@ if [[ -d "$SCRIPT_DIR/opt/aipc/models" ]]; then
         [[ -d "$catdir" ]] || continue
         cat_name=$(basename "$catdir")
         mkdir -p "$MODELS_DIR/$cat_name"
-        # Copy the full supported set: HEF binaries plus their vendor postproc
-        # JSON sidecars. camera-daemon's DPM yolov8n detector REQUIRES
-        # hailo_yolov8n_384_640.json next to the HEF (labels + label_offset);
-        # without it d.label stays empty and keep_labels never matches.
-        for src in "$catdir"*; do
-            [[ -f "$src" ]] || continue
-            case "$src" in
-                *.hef|*.json) ;;
-                *) continue ;;
-            esac
-            src_name=$(basename "$src")
-            target="$MODELS_DIR/$cat_name/$src_name"
-            if [[ -f "$target" ]] && cmp -s "$src" "$target"; then
-                log "  = models/$cat_name/$src_name (unchanged)"
+        for hef in "$catdir"*.hef; do
+            [[ -f "$hef" ]] || continue
+            hef_name=$(basename "$hef")
+            target="$MODELS_DIR/$cat_name/$hef_name"
+            if [[ -f "$target" ]] && cmp -s "$hef" "$target"; then
+                log "  = models/$cat_name/$hef_name (unchanged)"
             else
-                cp -f "$src" "$target"
-                log "  + models/$cat_name/$src_name -> $MODELS_DIR/$cat_name/"
+                cp -f "$hef" "$target"
+                log "  + models/$cat_name/$hef_name -> $MODELS_DIR/$cat_name/"
             fi
         done
     done

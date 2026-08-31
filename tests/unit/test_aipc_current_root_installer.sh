@@ -27,32 +27,22 @@ cat >"$DATA/app-manifest.json" <<'EOF'
   "app_version": "test",
   "machine": "hailo15-ne503",
   "product": "ne503",
-  "min_os_version": "1.12.0",
-  "max_os_version": "1.12.0",
+  "required_compat_level": 1,
   "supported_data_schema": [1],
   "target_data_schema": 1
 }
 EOF
 cat >"$ROOTFS/etc/aipc-os-release" <<'EOF'
 OS_VERSION=1.12.0
+AIPC_COMPAT_LEVEL=1
+DATA_SCHEMA=1
 MACHINE=hailo15-ne503
 PRODUCT=ne503
 EOF
 cp "$ROOTFS/etc/aipc-os-release" "$TMP/os-release.before"
-printf 'test\n' >"$DATA/VERSION"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/bin/platform-api"
-printf '#!/bin/sh\nexit 0\n' >"$DATA/bin/camera-daemon"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/libexec/aipc-restore"
-printf '#!/bin/sh\nexit 0\n' >"$DATA/libexec/aipc-os-updater"
-printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-configure-platform-api-gateway.py"
-printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-install-current-root.sh"
-printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-firstboot.sh"
-chmod 0755 "$DATA/bin/platform-api" "$DATA/bin/camera-daemon" \
-    "$DATA/libexec/aipc-restore" "$DATA/libexec/aipc-os-updater" \
-    "$DATA/scripts/aipc-configure-platform-api-gateway.py" \
-    "$DATA/scripts/aipc-install-current-root.sh" "$DATA/scripts/aipc-firstboot.sh"
-printf 'listen: 8443\n' >"$DATA/etc/platform-api.yaml"
-printf 'driver: test\n' >"$DATA/etc/camera-daemon.yaml"
+chmod 0755 "$DATA/bin/platform-api" "$DATA/libexec/aipc-restore"
 printf '[Unit]\nDescription=Test\n' >"$DATA/systemd/aipc-platform.target"
 printf '[Manager]\nRuntimeWatchdogSec=20s\n' >"$DATA/etc/systemd/system.conf.d/watchdog.conf"
 printf '[Journal]\nStorage=persistent\n' >"$DATA/etc/systemd/journald.conf.d/persist.conf"
@@ -64,11 +54,11 @@ AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" "$INSTALLER"
 cmp "$TMP/os-release.before" "$ROOTFS/etc/aipc-os-release"
 grep -qx 'OS_VERSION=1.12.0' "$ROOTFS/etc/aipc-os-release"
 grep -qx 'MACHINE=hailo15-ne503' "$ROOTFS/etc/aipc-os-release"
+grep -qx 'AIPC_COMPAT_LEVEL=1' "$ROOTFS/etc/aipc-os-release"
+grep -qx 'DATA_SCHEMA=1' "$ROOTFS/etc/aipc-os-release"
 grep -qx 'PRODUCT=ne503' "$ROOTFS/etc/aipc-os-release"
 [[ "$(readlink "$ROOTFS/usr/bin/platform-api")" == "$DATA/bin/platform-api" ]]
-[[ "$(readlink "$ROOTFS/usr/bin/camera-daemon")" == "$DATA/bin/camera-daemon" ]]
 [[ "$(readlink "$ROOTFS/usr/libexec/aipc-restore")" == "$DATA/libexec/aipc-restore" ]]
-[[ "$(readlink "$ROOTFS/usr/libexec/aipc-os-updater")" == "$DATA/libexec/aipc-os-updater" ]]
 cmp "$DATA/systemd/aipc-platform.target" "$ROOTFS/etc/systemd/system/aipc-platform.target"
 cmp "$DATA/etc/systemd/system.conf.d/watchdog.conf" "$ROOTFS/etc/systemd/system.conf.d/watchdog.conf"
 cmp "$DATA/etc/systemd/journald.conf.d/persist.conf" "$ROOTFS/etc/systemd/journald.conf.d/persist.conf"
@@ -97,29 +87,5 @@ if AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" "$INSTALLER" >/dev/nul
     echo "installer unexpectedly accepted a missing compatibility checker" >&2
     exit 1
 fi
-mv "$DATA/libexec/aipc-compat-check.missing" "$DATA/libexec/aipc-compat-check"
-
-# Legacy manifests that only carry required_compat_level (no min/max OS
-# version range) must be rejected: the version-range metadata is mandatory.
-cat >"$DATA/app-manifest.json" <<'EOF'
-{
-  "app_version": "test",
-  "machine": "hailo15-ne503",
-  "product": "ne503",
-  "required_compat_level": 1,
-  "supported_data_schema": [1],
-  "target_data_schema": 1
-}
-EOF
-if AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" \
-    "$INSTALLER" >"$TMP/legacy.out" 2>"$TMP/legacy.err"; then
-    echo "installer unexpectedly accepted a legacy compat-level manifest" >&2
-    exit 1
-fi
-grep -q 'persistent app manifest has incomplete compatibility metadata' "$TMP/legacy.err" || {
-    echo "legacy manifest rejection message mismatch:" >&2
-    cat "$TMP/legacy.err" >&2
-    exit 1
-}
 
 echo "test_aipc_current_root_installer: OK"

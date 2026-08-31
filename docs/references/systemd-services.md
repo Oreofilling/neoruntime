@@ -22,7 +22,6 @@ Two groups of units exist:
 | device-control | `device-control.service` | Device/MCU control |
 | app-manager | `app-manager.service` | Application/container management |
 | device-discovery | `device-discovery.service` | CT-Disc device discovery |
-| onvif-device | `onvif-device.service` | ONVIF Profile S device service (WS-Discovery + Device/Media SOAP) |
 | platform-api | `platform-api.service` | Web API gateway |
 
 All application units:
@@ -30,7 +29,7 @@ All application units:
 - `Wants=aipc-restore.service` and `Requires=aipc-firstboot.service`
 - `After=aipc-restore.service aipc-firstboot.service network.target`
 - `ExecStart=/usr/bin/<name> -config /data/aipc/etc/<name>.yaml`
-  (`camera-daemon` uses `-c`; `device-discovery` and `onvif-device` use `--config`)
+  (`camera-daemon` uses `-c`, `device-discovery` uses `--config`)
 - `WantedBy=multi-user.target`
 
 Additional dependencies:
@@ -158,13 +157,9 @@ aipc-cli system stop         # Stop in reverse order
 aipc-cli system restart      # Restart
 aipc-cli system status       # View status
 aipc-cli system health       # Health check
-aipc-cli system enable       # Enable auto-start on boot (incl. aipc-autostart)
-aipc-cli system disable      # Stop now + disable auto-start (incl. aipc-autostart)
+aipc-cli system enable       # Enable auto-start on boot
+aipc-cli system disable      # Disable auto-start
 ```
-
-`disable` survives a reboot because it also disables `aipc-autostart.service`
-(the boot unit that re-enables the service set); a redeploy or an OS-upgrade
-verify boot re-enables the platform by design.
 
 ## Service File Locations
 

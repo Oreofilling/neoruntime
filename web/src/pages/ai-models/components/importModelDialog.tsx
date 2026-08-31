@@ -398,12 +398,12 @@ export default function ImportModelDialog({
   };
 
   const handleCancel = () => {
-    cancelRequestedRef.current = true;
-    cleanupUploadedFiles([parseResult?.file_path]);
-    handleReset();
-    onOpenChange(false);
-    navigate('/models');
-  };
+    cancelRequestedRef.current = true
+    cleanupUploadedFiles([parseResult?.file_path])
+    handleReset()
+    onOpenChange(false)
+    navigate('/models')
+  }
 
   const handleOpenChange = (nextOpen: boolean) => {
     if (nextOpen) {
@@ -655,14 +655,11 @@ export default function ImportModelDialog({
             {parseResult && (
               <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
                 <div className="space-y-2 text-sm">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center justify-between gap-4">
                     <Label className="shrink-0 text-muted-foreground">
                       {t('sys.ai_models.wizard.preview_title', 'Model Preview')}
                     </Label>
-                    <Badge
-                      variant="secondary"
-                      className="max-w-full whitespace-normal break-words"
-                    >
+                    <Badge variant="secondary">
                       {t('sys.ai_models.wizard.suggested_type', 'Suggested')}:{' '}
                       {t(
                         `sys.ai_models.model_type.${parseResult.suggested_type}`,
@@ -670,30 +667,30 @@ export default function ImportModelDialog({
                       )}
                     </Badge>
                   </div>
-                  <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-center justify-between gap-4">
                     <Label className="shrink-0 text-muted-foreground">
                       {t('sys.ai_models.wizard.preview_network', 'Network')}
                     </Label>
-                    <div className="min-w-0 flex-1 text-right break-all">
+                    <div className="min-w-0 flex-1 truncate text-right">
                       {parseResult.network_name || '—'}
                     </div>
                   </div>
 
-                  <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-center justify-between gap-4">
                     <Label className="shrink-0 text-muted-foreground">
                       {t('sys.ai_models.wizard.preview_file', 'File')}
                     </Label>
-                    <div className="min-w-0 flex-1 text-right break-all">
+                    <div className="min-w-0 flex-1 truncate text-right">
                       {parseResult.filename} (
                       {formatFileSize(parseResult.file_size)})
                     </div>
                   </div>
 
-                  <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-center justify-between gap-4">
                     <Label className="shrink-0 text-muted-foreground">
                       {t('sys.ai_models.wizard.preview_input', 'Input')}
                     </Label>
-                    <div className="min-w-0 flex-1 text-right break-all">
+                    <div className="min-w-0 flex-1 text-right">
                       {parseResult.input_width && parseResult.input_height
                         ? `${parseResult.input_width}x${parseResult.input_height}`
                         : '—'}

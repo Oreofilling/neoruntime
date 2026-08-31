@@ -7,8 +7,6 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { StatusBar } from './components/StatusBar'
 import { NetworkConfigDialog } from './components/NetworkConfigDialog'
 import { BatchToolbar } from './components/BatchToolbar'
-import { RecordDialog } from './components/RecordDialog'
-import { AddDeviceDialog } from './components/AddDeviceDialog'
 import { GetNetworkInterfaces } from '../wailsjs/go/main/App'
 import './style.css'
 
@@ -18,7 +16,6 @@ export default function App() {
     scanning, listening, status, listenerStats,
     start, scan, refresh,
     selectedMacs, batchDevices,
-    addManualDevices, removeManualDevice,
     toggleSelect, selectAll, clearSelection,
   } = useDevices()
 
@@ -29,9 +26,6 @@ export default function App() {
   const [commandForBatch, setCommandForBatch] = useState(false)
   const [showNetwork, setShowNetwork] = useState(false)
   const [networkForBatch, setNetworkForBatch] = useState(false)
-  const [showRecord, setShowRecord] = useState(false)
-  const [recordForBatch, setRecordForBatch] = useState(false)
-  const [showAddDevice, setShowAddDevice] = useState(false)
   const [showDetail, setShowDetail] = useState(false)
 
   useEffect(() => {
@@ -83,12 +77,6 @@ export default function App() {
             {scanning ? 'Scanning...' : 'Scan'}
           </button>
           <button
-            onClick={() => setShowAddDevice(true)}
-            className="px-3 py-1.5 text-sm border border-gray-600 text-gray-200 rounded hover:bg-gray-700 transition-colors"
-          >
-            Add Device
-          </button>
-          <button
             onClick={() => { setCommandForBatch(true); setShowCommand(true) }}
             disabled={!hasSelection && !selectedDevice}
             className="px-3 py-1.5 text-sm border border-gray-600 text-gray-200 rounded hover:bg-gray-700 disabled:opacity-40 transition-colors"
@@ -101,12 +89,6 @@ export default function App() {
             className="px-3 py-1.5 text-sm border border-gray-600 text-gray-200 rounded hover:bg-gray-700 disabled:opacity-40 transition-colors"
           >
             Network Config
-          </button>
-          <button
-            onClick={() => { setRecordForBatch(hasSelection); setShowRecord(true) }}
-            className="px-3 py-1.5 text-sm border border-gray-600 text-gray-200 rounded hover:bg-gray-700 transition-colors"
-          >
-            Record Data
           </button>
           <button
             onClick={() => setShowSettings(true)}
@@ -123,7 +105,6 @@ export default function App() {
         onClearSelection={clearSelection}
         onBatchCommand={() => { setCommandForBatch(true); setShowCommand(true) }}
         onBatchNetwork={() => { setNetworkForBatch(true); setShowNetwork(true) }}
-        onBatchRecord={() => { setRecordForBatch(true); setShowRecord(true) }}
       />
 
       {/* Status message */}
@@ -153,10 +134,6 @@ export default function App() {
         onClose={() => setShowDetail(false)}
         onCommand={() => { setShowDetail(false); setCommandForBatch(false); setShowCommand(true) }}
         onNetwork={() => { setShowDetail(false); setNetworkForBatch(false); setShowNetwork(true) }}
-        onRemoveManual={() => {
-          if (selectedDevice) removeManualDevice(selectedDevice.ip || selectedDevice.mac || selectedDevice.sn)
-          setShowDetail(false)
-        }}
       />
 
       {/* Dialogs */}
@@ -175,19 +152,6 @@ export default function App() {
           device={selectedDevice}
           devices={networkForBatch && hasSelection ? batchDevices : undefined}
           onClose={() => setShowNetwork(false)}
-        />
-      )}
-      {showRecord && (
-        <RecordDialog
-          device={selectedDevice}
-          devices={recordForBatch && hasSelection ? batchDevices : undefined}
-          onClose={() => setShowRecord(false)}
-        />
-      )}
-      {showAddDevice && (
-        <AddDeviceDialog
-          onAdd={addManualDevices}
-          onClose={() => setShowAddDevice(false)}
         />
       )}
     </div>
