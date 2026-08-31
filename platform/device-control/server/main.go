@@ -1899,8 +1899,25 @@ func (s *DeviceControlServer) readGPIOOnce(ctx context.Context, pin uint32) *pb.
 	}
 }
 
+// gpioPinKnown reports whether pin is listed in the configured GPIO catalog.
+// The MCU GPIO-read command takes a raw pin byte with no catalog awareness,
+// so unknown pins must be rejected here instead of forwarded to the MCU.
+func gpioPinKnown(available []uint32, pin uint32) bool {
+	for _, p := range available {
+		if p == pin {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *DeviceControlServer) GPIORead(ctx context.Context, req *pb.GPIOReadRequest) (*pb.GPIOReadResponse, error) {
 	logger.Debug("GPIORead: pin=%d", req.Pin)
+	gpio := s.config.Capabilities.GPIO
+	if !gpioPinKnown(gpio.AvailablePins, req.Pin) {
+		logger.Warn("GPIORead: pin %d rejected: not in catalog %v", req.Pin, gpio.AvailablePins)
+		return nil, status.Errorf(codes.NotFound, "pin %d is not in the GPIO catalog", req.Pin)
+	}
 	return s.readGPIOOnce(ctx, req.Pin), nil
 }
 
@@ -1928,6 +1945,17 @@ func (s *DeviceControlServer) GPIOBatchRead(ctx context.Context, req *pb.GPIOBat
 
 	results := make([]*pb.GPIOReadResponse, 0, len(target))
 	for _, pin := range target {
+		// Never forward out-of-catalog pins to the MCU: the command takes a
+		// raw pin byte and would address whatever hardware maps there.
+		if !gpioPinKnown(gpio.AvailablePins, pin) {
+			logger.Warn("GPIOBatchRead: pin %d rejected: not in catalog %v", pin, gpio.AvailablePins)
+			results = append(results, &pb.GPIOReadResponse{
+				Pin:    pin,
+				Value:  false,
+				Status: &pb.Status{Success: false, Message: fmt.Sprintf("pin %d is not in the GPIO catalog", pin)},
+			})
+			continue
+		}
 		state := s.readGPIOOnce(ctx, pin)
 		state.Direction = direction[pin]
 		results = append(results, state)
