@@ -50,11 +50,17 @@ public:
     /**
      * @brief Deliver frame to all FD clients subscribed to this stream.
      *
-     * Called from FrameRouter callback thread. For each client:
+     * Called from FrameRouter dispatch thread. The whole pass runs under
+     * clients_mu_ (sends are non-blocking, so bounded): a disconnecting
+     * client cannot be freed or closed mid-iteration, and its
+     * release_all_outstanding() cannot interleave with our tracking.
+     * For each client:
      *   - If outstanding >= max_outstanding → skip (frame dropped for this client)
-     *   - retain(mf) to bump ref count
-     *   - sendmsg(SCM_RIGHTS, dma_fds) with frame metadata
-     *   - Track in client's outstanding map
+     *   - retain(mf), then track in outstanding BEFORE sendmsg, so a RELEASE
+     *     arriving right after delivery always finds its entry (the old
+     *     send-then-track order discarded such RELEASEs and pinned the slot)
+     *   - sendmsg(SCM_RIGHTS, dma_fds) with MSG_DONTWAIT; EAGAIN drops the
+     *     frame for that client, a hard/partial send drops the client
      *
      * After iterating all clients, releases the original ref.
      */
@@ -125,7 +131,17 @@ private:
     void handle_dsp_buf_release(ClientState* client, const void* msg_data);
     void disconnect_client(int client_fd);
     void release_all_outstanding(ClientState* client);
+    /** Remove one outstanding entry (used to undo a tracked-but-unsent frame). */
+    void erase_outstanding(ClientState* client, uint64_t frame_id);
 
-    /** Send FdPubFrameMsg + SCM_RIGHTS to one client. Returns true on success. */
-    bool send_frame_to_client(ClientState* client, ManagedFrame* mf);
+    /** Frame send outcome, consumed by the dispatch loop. */
+    enum class FrameSendResult {
+        kOk,            /**< Full message queued */
+        kSlowClient,    /**< EAGAIN — nothing queued, no fds crossed; drop frame, keep client */
+        kHardError,     /**< Error or partial send — stream desynced or fd broken; drop client */
+        kUndeliverable, /**< Frame not fd-passable (no dma-buf fds); drop frame, keep client */
+    };
+
+    /** Send FdPubFrameMsg + SCM_RIGHTS to one client (non-blocking). */
+    FrameSendResult send_frame_to_client(ClientState* client, ManagedFrame* mf);
 };

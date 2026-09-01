@@ -120,9 +120,17 @@ typedef struct {
 /* ========== Helper: Send message with optional FDs via SCM_RIGHTS ==========
  * General form: the ancillary buffer is sized for `fd_capacity` fds (must
  * be >= num_fds). Callers passing more than a few fds (e.g. the DSP alloc
- * response, up to FD_PUB_DSP_MAX_FDS) must heap-allocate via this path. */
-static inline int fd_pub_sendmsg_capped(int sock_fd, const void* data, size_t data_len,
-                                        const int* fds, int num_fds, int fd_capacity) {
+ * response, up to FD_PUB_DSP_MAX_FDS) must heap-allocate via this path.
+ *
+ * Returns 0 when the full message was sent, -1 otherwise.
+ * On a partial send errno is set to EMSGSIZE: with SCM_RIGHTS the fds cross
+ * with the FIRST byte queued, so a partial send has already leaked the fds
+ * to the receiver and desynced its stream — callers must treat that as a
+ * hard failure, not retry. sendmsg() returns EAGAIN only when nothing at
+ * all was queued, so an EAGAIN failure never transfers fds. */
+static inline int fd_pub_sendmsg_capped_flags(int sock_fd, const void* data, size_t data_len,
+                                              const int* fds, int num_fds, int fd_capacity,
+                                              int extra_flags) {
     struct msghdr msg;
     struct iovec iov;
     memset(&msg, 0, sizeof(msg));
@@ -151,9 +159,18 @@ static inline int fd_pub_sendmsg_capped(int sock_fd, const void* data, size_t da
         memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * (size_t)num_fds);
     }
 
-    ssize_t sent = sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
+    ssize_t sent = sendmsg(sock_fd, &msg, MSG_NOSIGNAL | extra_flags);
     if (cmsg_buf != cmsg_buf_stack) free(cmsg_buf);
-    return (sent == (ssize_t)data_len) ? 0 : -1;
+    if (sent == (ssize_t)data_len) return 0;
+    if (sent >= 0) errno = EMSGSIZE;    /* partial send: fds already crossed */
+    return -1;
+}
+
+/* Blocking form (control-plane replies: backpressure is acceptable there). */
+static inline int fd_pub_sendmsg_capped(int sock_fd, const void* data, size_t data_len,
+                                        const int* fds, int num_fds, int fd_capacity) {
+    return fd_pub_sendmsg_capped_flags(sock_fd, data, data_len, fds, num_fds,
+                                       fd_capacity, 0);
 }
 
 /* Original 3-fd form (frames). */
@@ -162,6 +179,15 @@ static inline int fd_pub_sendmsg(int sock_fd, const void* data, size_t data_len,
     if (num_fds > FD_PUB_MAX_FDS) return -1;
     return fd_pub_sendmsg_capped(sock_fd, data, data_len, fds, num_fds,
                                  FD_PUB_MAX_FDS);
+}
+
+/* Non-blocking 3-fd form: frame delivery runs on the dispatch thread and
+ * must never stall on a slow client. EAGAIN maps to "client too slow". */
+static inline int fd_pub_sendmsg_flags(int sock_fd, const void* data, size_t data_len,
+                                       const int* fds, int num_fds, int flags) {
+    if (num_fds > FD_PUB_MAX_FDS) return -1;
+    return fd_pub_sendmsg_capped_flags(sock_fd, data, data_len, fds, num_fds,
+                                       FD_PUB_MAX_FDS, flags);
 }
 
 /* ========== Helper: Receive message with optional FDs ========== */

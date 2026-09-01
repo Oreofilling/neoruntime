@@ -107,58 +107,98 @@ void FdPublisher::stop() {
 }
 
 void FdPublisher::on_frame(const std::string& stream_name, ManagedFrame* mf) {
-    // Collect clients subscribed to this stream
-    std::vector<ClientState*> targets;
+    // The whole dispatch pass runs under clients_mu_ (sends are non-blocking,
+    // so the hold is bounded):
+    //   - a client erased by disconnect_client() cannot be freed, and its fd
+    //     cannot be closed/recycled, mid-iteration (the old collect-then-
+    //     unlock loop was a use-after-free: SIGSEGV under connect churn),
+    //   - disconnect's release_all_outstanding() cannot interleave with the
+    //     outstanding insert below, which would leak the retained ref.
+    std::vector<int> desync_fds;
 
     {
         std::lock_guard<std::mutex> lock(clients_mu_);
+
         for (auto& [fd, client] : clients_) {
-            if (client->subscribed && client->stream_name == stream_name) {
-                targets.push_back(client);
+            if (!client->subscribed || client->stream_name != stream_name) {
+                continue;
             }
-        }
-    }
 
-    if (targets.empty()) {
-        // No FD clients for this stream — release our ref immediately
-        router_->release(mf);
-        return;
-    }
+            // Retain + track BEFORE sendmsg. A RELEASE can only name a frame
+            // the client already received — this frame is not on the wire
+            // yet, so nothing can release this entry between insert and
+            // send. With the old send-then-track order, a RELEASE landing
+            // in that gap was discarded as "unknown" and pinned one of the
+            // max_outstanding slots until disconnect (permanent delivery
+            // stall for that client, no negative ack to detect it).
+            bool tracked = false;
+            {
+                std::lock_guard<std::mutex> ol(client->outstanding_mu);
+                if (client->outstanding.size() < config_.max_outstanding_per_client) {
+                    router_->retain(mf);   // ref first: never publish an un-retained entry
+                    client->outstanding[mf->frame_id] = mf;
+                    tracked = true;
+                }
+            }
 
-    // For each target client:
-    //   retain(mf) → bump ref count → send FD → track in outstanding
-    int sent_count = 0;
-
-    for (auto* client : targets) {
-        // Check outstanding limit
-        {
-            std::lock_guard<std::mutex> lock(client->outstanding_mu);
-            if (client->outstanding.size() >= config_.max_outstanding_per_client) {
+            if (!tracked) {
                 // Client too slow — drop frame for this client
                 std::lock_guard<std::mutex> sl(stats_mu_);
                 stats_.frames_dropped++;
                 continue;
             }
+
+            switch (send_frame_to_client(client, mf)) {
+            case FrameSendResult::kOk: {
+                std::lock_guard<std::mutex> sl(stats_mu_);
+                stats_.frames_sent++;
+                break;
+            }
+
+            case FrameSendResult::kSlowClient:
+                // EAGAIN: nothing was queued and no fds crossed — the client
+                // is behind. Drop this frame, keep the connection.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.frames_dropped++;
+                }
+                break;
+
+            case FrameSendResult::kHardError:
+                // Hard error, or a partial send: with SCM_RIGHTS the fds
+                // cross with the first byte, so a partial send desyncs the
+                // client's stream — drop it after the pass.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.send_errors++;
+                }
+                desync_fds.push_back(fd);
+                break;
+
+            case FrameSendResult::kUndeliverable:
+                // Frame carries no dma-buf fds — drop it for this client,
+                // the connection itself is fine.
+                erase_outstanding(client, mf->frame_id);
+                router_->release(mf);
+                {
+                    std::lock_guard<std::mutex> sl(stats_mu_);
+                    stats_.send_errors++;
+                }
+                break;
+            }
         }
+    }
 
-        // Bump ref count before sending
-        router_->retain(mf);
-
-        if (send_frame_to_client(client, mf)) {
-            // Track in outstanding
-            std::lock_guard<std::mutex> lock(client->outstanding_mu);
-            client->outstanding[mf->frame_id] = mf;
-            sent_count++;
-
-            std::lock_guard<std::mutex> sl(stats_mu_);
-            stats_.frames_sent++;
-        } else {
-            // Send failed — release the retained ref
-            router_->release(mf);
-
-            std::lock_guard<std::mutex> sl(stats_mu_);
-            stats_.send_errors++;
-        }
+    // disconnect_client() takes clients_mu_ itself — call it only after the
+    // dispatch pass released the lock (we are on the router dispatch thread,
+    // so joining the client's recv thread here cannot self-join).
+    for (int fd : desync_fds) {
+        HAL_LOG_WARNING("FdPublisher: Dropping desynced client fd=%d", fd);
+        disconnect_client(fd);
     }
 
     // Release our original ref (from FrameRouter subscription)
@@ -212,10 +252,10 @@ void FdPublisher::accept_loop() {
             }
         }
 
-        // Set send non-blocking (frame delivery must not block HAL callback)
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        // Keep recv blocking (client recv thread blocks on recv)
-        // Send will use MSG_NOSIGNAL | MSG_DONTWAIT in sendmsg
+        // Recv stays blocking (client recv threads use blocking recv). Frame
+        // delivery on the dispatch thread sends with a per-call MSG_DONTWAIT
+        // (see send_frame_to_client): O_NONBLOCK on the fd would break the
+        // blocking recv loops, so it must stay per-sendmsg.
 
         auto* client = new ClientState();
         client->fd = client_fd;
@@ -312,7 +352,12 @@ void FdPublisher::client_recv_loop(ClientState* client) {
         }
 
         case FD_PUB_MSG_UNSUBSCRIBE: {
-            client->subscribed = false;
+            // subscribed/stream_name are read on the dispatch thread under
+            // clients_mu_ — flip the flag under the same lock.
+            {
+                std::lock_guard<std::mutex> lock(clients_mu_);
+                client->subscribed = false;
+            }
             HAL_LOG_INFO("FdPublisher: Client fd=%d unsubscribed from %s",
                         client->fd, client->stream_name.c_str());
             // Send OK
@@ -347,8 +392,14 @@ void FdPublisher::handle_subscribe(ClientState* client, const void* msg_data) {
     char name[FD_PUB_MAX_STREAM_NAME + 1] = {};
     memcpy(name, msg->stream_name, FD_PUB_MAX_STREAM_NAME);
 
-    client->stream_name = name;
-    client->subscribed = true;
+    // stream_name is a std::string read concurrently on the dispatch thread
+    // (under clients_mu_) — a torn concurrent read is UB, not just a stale
+    // value, so the assignment and the flag flip take the same lock.
+    {
+        std::lock_guard<std::mutex> lock(clients_mu_);
+        client->stream_name = name;
+        client->subscribed = true;
+    }
 
     FdPubResponseMsg resp;
     resp.hdr.type = FD_PUB_MSG_OK;
@@ -507,7 +558,13 @@ void FdPublisher::release_all_outstanding(ClientState* client) {
     client->outstanding.clear();
 }
 
-bool FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
+void FdPublisher::erase_outstanding(ClientState* client, uint64_t frame_id) {
+    std::lock_guard<std::mutex> ol(client->outstanding_mu);
+    client->outstanding.erase(frame_id);
+}
+
+FdPublisher::FrameSendResult
+FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
     const HalFrameBuffer& frame = mf->frame;
 
     // Build frame message
@@ -546,9 +603,17 @@ bool FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
         // No DMA-BUF fds — this frame type doesn't support FD passing
         HAL_LOG_WARNING("FdPublisher: Frame has no DMA-BUF fds, cannot send to fd=%d",
                        client->fd);
-        return false;
+        return FrameSendResult::kUndeliverable;
     }
 
-    // Send via SCM_RIGHTS (non-blocking via MSG_NOSIGNAL in fd_pub_sendmsg)
-    return fd_pub_sendmsg(client->fd, &msg, sizeof(msg), fds, num_fds) == 0;
+    // Non-blocking send: this runs on the FrameRouter dispatch thread and
+    // must never stall on a slow client. EAGAIN means nothing was queued
+    // (no fds crossed); a partial send sets EMSGSIZE in the helper and has
+    // already desynced the client's stream.
+    if (fd_pub_sendmsg_flags(client->fd, &msg, sizeof(msg), fds, num_fds,
+                             MSG_DONTWAIT) == 0) {
+        return FrameSendResult::kOk;
+    }
+    return (errno == EAGAIN) ? FrameSendResult::kSlowClient
+                             : FrameSendResult::kHardError;
 }
