@@ -273,8 +273,8 @@ int ModelManager::init_post_process(const std::string& model_id,
     // /home/root/apps/shared/resources/configs/yolov8.json). Two accepted
     // shapes for `variant`:
     //   1. Full JSON blob (first char '{') → used verbatim as config_json.
-    //   2. Bare backend_function name → legacy {"backend_function":"<name>"}
-    //      (schema-invalid; kept for backward compat, logs a warning).
+    //   2. Bare backend_function name → a full default blob is composed around
+    //      it (schema-valid; tuning reused from pp_cfg).
     // The local string only needs to outlive the create() call below, which
     // copies what it needs into merged_vendor_json.
     std::string detection_cfg_json;
@@ -282,13 +282,38 @@ int ModelManager::init_post_process(const std::string& model_id,
         if (variant.front() == '{') {
             detection_cfg_json = variant;
         } else {
+            // Compose a FULL schema-valid blob around the bare backend_function
+            // name. The legacy stub {"backend_function":"<name>"} is rejected by
+            // the plugin's schema validation ("Invalid keyword: required") after
+            // HAL strips the backend_* loader keys, silently falling back to the
+            // hailo_yolov8n default. Field set mirrors the device reference
+            // /home/root/apps/shared/resources/configs/yolov8.json; tuning
+            // values reuse the pp_cfg already set for this model. labels is the
+            // plugin's compiled-in table — output class_id semantics (model
+            // class index + 1) are unchanged; consumers map ids themselves.
+            char cfg_buf[512];
+            snprintf(cfg_buf, sizeof(cfg_buf),
+                     "{\"backend_function\":\"%s\","
+                     "\"iou_threshold\":%.4f,"
+                     "\"detection_threshold\":%.4f,"
+                     "\"output_activation\":\"none\","
+                     "\"label_offset\":1,"
+                     "\"max_boxes\":%u,"
+                     "\"labels\":[\"unlabeled\",\"person\",\"vehicle\","
+                     "\"face\",\"license_plate\"]}",
+                     variant.c_str(),
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.max_detections);
+            detection_cfg_json = cfg_buf;
             LOG_WARN("init_post_process: variant='%s' is a bare backend_function "
-                     "name — config_json {\"backend_function\":\"%s\"} is "
-                     "schema-invalid for the YOLO plugin (will fall back to "
-                     "hailo_yolov8n). Pass a full config_json blob instead.",
-                     variant.c_str(), variant.c_str());
-            detection_cfg_json = std::string("{\"backend_function\":\"") +
-                                 variant + "\"}";
+                     "name — injecting a full default config_json around it "
+                     "(detection_threshold=%.2f iou_threshold=%.2f "
+                     "max_boxes=%u).",
+                     variant.c_str(),
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.max_detections);
         }
         pp_cfg.config.detection.config_json = detection_cfg_json.c_str();
     }
