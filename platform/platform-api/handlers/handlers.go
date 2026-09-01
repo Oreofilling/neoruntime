@@ -3,6 +3,9 @@ package handlers
 import (
 	"context"
 	"crypto/rsa"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -109,9 +112,30 @@ func (h *APIHandlers) ConfigManager() *config.Manager {
 
 // System handlers
 
+// firmwareVersion reports the release tag baked at package time
+// (e.g. "v1.0.2"). The deployed VERSION file is key=value lines; the first
+// line is version=<tag>. Read once per process.
+var (
+	firmwareVersionOnce sync.Once
+	firmwareVersionVal  string
+)
+
+func firmwareVersion() string {
+	firmwareVersionOnce.Do(func() {
+		raw, err := os.ReadFile(constants.RootPath() + "/VERSION")
+		if err != nil {
+			firmwareVersionVal = "unknown"
+			return
+		}
+		line := strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
+		firmwareVersionVal = strings.TrimPrefix(line, "version=")
+	})
+	return firmwareVersionVal
+}
+
 func (h *APIHandlers) GetSystemInfo(c *gin.Context) {
 	info := map[string]interface{}{
-		"version": "0.1.0",
+		"version": firmwareVersion(),
 		"services": map[string]bool{
 			"ai-runtime":     h.grpcClients.AIRuntime != nil,
 			"event-bus":      h.grpcClients.EventBus != nil,
