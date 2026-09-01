@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -6,6 +6,7 @@ import {
   useCapabilities,
   useParseModel,
   useRegisterModelV2,
+  useUpdateModel,
   type ModelTypeDef,
   type ModelFieldDef,
 } from '@/hooks/useModels';
@@ -32,10 +33,23 @@ import {
 } from '@/components/ui/dialog';
 import { filesApi } from '@/services/api';
 
+/** Existing-model shape needed to prefill the update mode. */
+interface UpdateTargetModel {
+  model_id: string;
+  model_type?: string;
+  variant?: string;
+  config?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 interface ImportModelDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess?: () => unknown;
+  /** update = edit an existing model (model_id fixed, file optional) */
+  mode?: 'create' | 'update';
+  /** required when mode="update" — the model being edited */
+  model?: UpdateTargetModel | null;
 }
 
 interface ParseResult {
@@ -93,10 +107,14 @@ export default function ImportModelDialog({
   open,
   onOpenChange,
   onSuccess,
+  mode = 'create',
+  model,
 }: ImportModelDialogProps) {
   const { t } = useTranslation();
   const { toast } = useToast();
   const navigate = useNavigate();
+
+  const isUpdate = mode === 'update';
 
   const cancelRequestedRef = useRef(false);
 
@@ -111,6 +129,7 @@ export default function ImportModelDialog({
   const { data: existingModels = [], isSuccess: modelsReady } = useModels();
   const parseMutation = useParseModel();
   const registerMutation = useRegisterModelV2();
+  const updateMutation = useUpdateModel();
 
   // 每次重新打开对话框时，重置取消标记，避免新一轮上传被当作“已取消”而丢弃 parseResult
   if (open && cancelRequestedRef.current) {
@@ -176,6 +195,34 @@ export default function ImportModelDialog({
     return opt?.fields ?? [];
   }, [modelTypeOptions, form.modelType]);
 
+  // Update mode: prefill the form from the existing model each time the
+  // dialog opens (config values live at the model row's top level, e.g.
+  // threshold / max_detections, falling back to schema defaults).
+  useEffect(() => {
+    if (!open || !isUpdate || !model) return;
+    const typeOpt = modelTypeOptions.find(o => o.value === model.model_type);
+    const config: Record<string, unknown> = {};
+    for (const f of typeOpt?.fields ?? []) {
+      const current = model[f.key];
+      if (current !== undefined && current !== null && current !== '') {
+        config[f.key] = current;
+      } else if (f.default !== undefined) {
+        config[f.key] = f.default;
+      }
+    }
+    setStep(0);
+    setFile(null);
+    setParseResult(null);
+    setErrors({});
+    setTouched({});
+    setForm({
+      modelId: model.model_id,
+      modelType: model.model_type ?? '',
+      variant: model.variant ?? '',
+      config,
+    });
+  }, [open, isUpdate, model, modelTypeOptions]);
+
   const steps = useMemo(
     () => [
       { title: t('sys.ai_models.wizard.step_upload', 'Upload') },
@@ -210,16 +257,20 @@ export default function ImportModelDialog({
           ? fieldDefaultToState(typeOpt.fields)
           : {};
 
-        setForm({
-          modelId: sanitizeModelId(
-            result.network_name
-              || result.filename?.replace(/\.[^.]+$/, '')
-              || ''
-          ),
+        setForm(prev => ({
+          // Update mode: the model_id is fixed — a swapped file must not
+          // rename the model being edited.
+          modelId: isUpdate
+            ? prev.modelId
+            : sanitizeModelId(
+                result.network_name
+                  || result.filename?.replace(/\.[^.]+$/, '')
+                  || ''
+              ),
           modelType: suggestedType,
           variant: '',
           config: configDefaults,
-        });
+        }));
       },
       onError: (error: any) => {
         toast({
@@ -243,7 +294,9 @@ export default function ImportModelDialog({
   const validate = (): boolean => {
     const newErrors: Record<string, string> = {};
     if (!form.modelId.trim()) newErrors.modelId = t('sys.ai_models.form.required');
-    if (!newErrors.modelId && isDuplicateModelId(form.modelId)) {
+    // Update mode edits an existing id in place — the duplicate check
+    // (which flags any existing id) does not apply.
+    if (!newErrors.modelId && !isUpdate && isDuplicateModelId(form.modelId)) {
       newErrors.modelId = t(
         'sys.ai_models.form.model_id_exists',
         'Model ID already exists'
@@ -350,7 +403,52 @@ export default function ImportModelDialog({
     }
     setTouched(newTouched);
 
-    if (!validate() || !parseResult) return;
+    if (!validate()) return;
+
+    if (isUpdate) {
+      // No file uploaded → metadata-only update (file_hash omitted).
+      updateMutation.mutate(
+        {
+          modelId: form.modelId.trim(),
+          model_type: form.modelType,
+          model_variant: form.variant.trim(),
+          config: form.config,
+          ...(parseResult
+            ? {
+                file_hash: parseResult.file_hash,
+                file_size: parseResult.file_size,
+                network_name: parseResult.network_name,
+                vstream_info: parseResult.vstream_info,
+                input_width: parseResult.input_width ?? 0,
+                input_height: parseResult.input_height ?? 0,
+              }
+            : {}),
+        },
+        {
+          onSuccess: async () => {
+            toast({
+              title: t(
+                'sys.ai_models.message.update_success',
+                'Model updated successfully'
+              ),
+            });
+            handleReset();
+            onOpenChange(false);
+            await onSuccess?.();
+          },
+          onError: (error: any) => {
+            toast({
+              title: t('common.error', 'Error'),
+              description: error?.response?.data?.message || error?.message,
+              variant: 'destructive',
+            });
+          },
+        }
+      );
+      return;
+    }
+
+    if (!parseResult) return;
 
     registerMutation.mutate(
       {
@@ -415,7 +513,9 @@ export default function ImportModelDialog({
   };
 
   const ph = t('sys.ai_models.form.placeholder', 'Please enter');
-  const isLoading = parseMutation.isPending || registerMutation.isPending;
+  const isLoading =    parseMutation.isPending
+    || registerMutation.isPending
+    || updateMutation.isPending;
 
   // Render a dynamic field based on its schema definition
   const renderField = (field: ModelFieldDef) => {
@@ -585,9 +685,11 @@ export default function ImportModelDialog({
       >
         <DialogHeader className="shrink-0">
           <DialogTitle>
-            {step === 0
-              ? t('sys.ai_models.action.import', 'Import Model')
-              : t('sys.ai_models.wizard.step_confirm', 'Configure Model')}
+            {isUpdate
+              ? t('sys.ai_models.dialog.update_title', 'Update Model')
+              : step === 0
+                ? t('sys.ai_models.action.import', 'Import Model')
+                : t('sys.ai_models.wizard.step_confirm', 'Configure Model')}
           </DialogTitle>
         </DialogHeader>
 
@@ -629,8 +731,16 @@ export default function ImportModelDialog({
         </div>
 
         {step === 0 ? (
-          /* Step 0: Upload + Parse */
+          /* Step 0: Upload + Parse (optional in update mode) */
           <div className="grid gap-4 py-2 flex-1 min-h-0 overflow-y-auto">
+            {isUpdate && (
+              <p className="text-sm text-muted-foreground">
+                {t(
+                  'sys.ai_models.wizard.update_file_optional',
+                  'Optional: upload a new model file to replace the current one; skip to update configuration only'
+                )}
+              </p>
+            )}
             <FileUpload
               single
               value={file ? [file] : []}
@@ -714,6 +824,15 @@ export default function ImportModelDialog({
               <Input
                 id="model-id"
                 value={form.modelId}
+                readOnly={isUpdate}
+                title={
+                  isUpdate
+                    ? t(
+                        'sys.ai_models.form.model_id_readonly',
+                        'Model ID cannot be changed on update'
+                      )
+                    : undefined
+                }
                 onChange={e => {
                   setForm(prev => ({ ...prev, modelId: e.target.value }));
                   if (touched.modelId) {
@@ -825,7 +944,7 @@ export default function ImportModelDialog({
               <Button
                 variant="carbon"
                 onClick={handleNext}
-                disabled={!parseResult || isLoading}
+                disabled={(!parseResult && !isUpdate) || isLoading}
               >
                 {t('common.next', 'Next')}
               </Button>
@@ -844,9 +963,13 @@ export default function ImportModelDialog({
                 onClick={handleRegister}
                 disabled={isLoading}
               >
-                {registerMutation.isPending
+                {isUpdate && updateMutation.isPending
                   ? t('common.loading', 'Loading...')
-                  : t('sys.ai_models.wizard.confirm_register', 'Register')}
+                  : isUpdate
+                    ? t('sys.ai_models.wizard.confirm_update', 'Update')
+                    : registerMutation.isPending
+                      ? t('common.loading', 'Loading...')
+                      : t('sys.ai_models.wizard.confirm_register', 'Register')}
               </Button>
             </>
           )}

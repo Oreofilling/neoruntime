@@ -182,3 +182,32 @@ export const useRegisterModelV2 = () => {
     },
   });
 };
+
+export const useUpdateModel = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      modelId,
+      ...data
+    }: {
+      modelId: string;
+    } & Partial<{
+      file_hash: string;
+      model_type: string;
+      model_variant: string;
+      config: Record<string, unknown>;
+      file_size: number;
+      network_name: string;
+      vstream_info: string;
+      input_width: number;
+      input_height: number;
+    }>) => {
+      const response = await aiApi.update(modelId, data);
+      return unwrapApiData(response);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ai', 'models'] });
+    },
+  });
+};

@@ -24,6 +24,22 @@ export const aiApi = {
     input_height: number;
   }) => request.post('/api/v1/ai/models', data),
 
+  // Update an existing model (PUT); file_hash empty/omitted = metadata-only
+  update: (
+    modelId: string,
+    data: Partial<{
+      file_hash: string;
+      model_type: string;
+      model_variant: string;
+      config: Record<string, unknown>;
+      file_size: number;
+      network_name: string;
+      vstream_info: string;
+      input_width: number;
+      input_height: number;
+    }>
+  ) => request.put(`/api/v1/ai/models/${modelId}`, data),
+
   // Legacy: register by path
   register: (modelPath: string, modelId?: string) => request.post('/api/v1/ai/models', {
       model_path: modelPath,

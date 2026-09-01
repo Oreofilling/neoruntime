@@ -73,11 +73,20 @@ bool ModelManager::has_async() const {
 
 int ModelManager::register_model(const std::string& model_id,
                                  const std::string& model_path,
-                                 const std::string& owner_id) {
+                                 const std::string& owner_id,
+                                 bool transient) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
-        // Model already loaded — add co-ownership if owner_id is provided
+        // Model already loaded — add co-ownership if owner_id is provided.
+        // The stored transient flag wins: a model already registered under a
+        // visibility contract (e.g. system-visible) keeps it even when a
+        // transient re-registration arrives for the same id.
+        if (transient != models_[model_id].transient) {
+            LOG_INFO("Model %s: registration transient=%d differs from stored "
+                     "transient=%d, keeping stored flag",
+                     model_id.c_str(), transient, models_[model_id].transient);
+        }
         if (!owner_id.empty()) {
             owners_[model_id].insert(owner_id);
             LOG_INFO("Model %s: added co-owner '%s' (total owners: %zu)",
@@ -100,8 +109,9 @@ int ModelManager::register_model(const std::string& model_id,
             HalInferenceSession*   shared_infer = entry.infer_session;
             HalPostprocessSession* shared_post  = entry.post_session.session;
             ModelEntry alias = entry;
-            alias.id   = model_id;   // alias must carry its own id, not the original's
-            alias.name = model_id;   // display name must match the alias id
+            alias.id        = model_id;   // alias must carry its own id, not the original's
+            alias.name      = model_id;   // display name must match the alias id
+            alias.transient = transient;  // visibility is per-id, follows this registration
             models_.emplace(model_id, alias);
             add_infer_locked(shared_infer);
             add_post_locked(shared_post);
@@ -135,6 +145,7 @@ int ModelManager::register_model(const std::string& model_id,
     entry.id        = model_id;
     entry.name      = model_id;
     entry.path      = model_path;
+    entry.transient = transient;
     entry.ref_count = 0;
     entry.load_time = std::time(nullptr);
 
@@ -142,9 +153,9 @@ int ModelManager::register_model(const std::string& model_id,
     if (infer_ops_->get_model_info) {
         infer_ops_->get_model_info(session, &entry.model_info);
     }
-    LOG_INFO("Model registered: %s (session=%p, owner=%s)",
+    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d)",
              model_id.c_str(), (void*)session,
-             owner_id.empty() ? "<system>" : owner_id.c_str());
+             owner_id.empty() ? "<system>" : owner_id.c_str(), transient);
 
     models_.emplace(model_id, std::move(entry));
     add_infer_locked(session);  // first reference to the freshly created session

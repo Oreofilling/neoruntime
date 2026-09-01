@@ -12,7 +12,15 @@ import {
   AlertDialogCancel,
   AlertDialogAction,
 } from '@/components/ui/alert-dialog';
-import { Eye, Trash2, Plus, Power, PowerOff, Loader2 } from 'lucide-react';
+import {
+  Eye,
+  Trash2,
+  Plus,
+  Power,
+  PowerOff,
+  Loader2,
+  RefreshCw,
+} from 'lucide-react';
 import { useState } from 'react';
 import ModelDetailDialog from './ModelDetailDialog';
 import { resolveModelType } from '../utils';
@@ -32,6 +40,8 @@ interface ModelData {
   used_by_apps?: string[];
   input_width?: number;
   input_height?: number;
+  /** provenance: "disk" = system preset, anything else = manually imported */
+  source?: string;
 }
 
 interface ModelCardProps {
@@ -40,6 +50,7 @@ interface ModelCardProps {
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
   onImportClick?: () => void;
+  onUpdate?: (model: ModelData) => void;
   loadingAction?: string | null;
 }
 
@@ -73,6 +84,7 @@ export default function ModelCard({
   onLoad,
   onUnload,
   onImportClick,
+  onUpdate,
   loadingAction,
 }: ModelCardProps) {
   const { t } = useTranslation();
@@ -87,6 +99,8 @@ export default function ModelCard({
     id: string;
     name: string;
   } | null>(null);
+
+  const [updateConfirm, setUpdateConfirm] = useState<ModelData | null>(null);
 
   if (models.length === 0) {
     return (
@@ -154,6 +168,19 @@ export default function ModelCard({
                       {isLoaded
                         ? t('sys.ai_models.status.loaded', '已加载')
                         : t('sys.ai_models.status.uploaded', '未加载')}
+                    </Badge>
+                    <Badge
+                      variant="outline"
+                      className="text-xs max-w-[150px] truncate text-muted-foreground"
+                      title={
+                        model.source === 'disk'
+                          ? 'system preset'
+                          : 'manually imported'
+                      }
+                    >
+                      {model.source === 'disk'
+                        ? t('sys.ai_models.provenance.system')
+                        : t('sys.ai_models.provenance.manual')}
                     </Badge>
                     {appsCount > 0 && (
                       <Badge variant="secondary" className="text-xs">
@@ -269,6 +296,24 @@ export default function ModelCard({
                 >
                   <Eye className="w-4 h-4" />
                 </Button>
+                {onUpdate && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-3 text-muted-foreground hover:text-primary"
+                    title={t('sys.ai_models.action.update', '更新')}
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (appsCount > 0) {
+                        setUpdateConfirm(model);
+                      } else {
+                        onUpdate(model);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                  </Button>
+                )}
                 <Button
                   variant="ghost"
                   size="sm"
@@ -391,6 +436,43 @@ export default function ModelCard({
               }}
             >
               {t('sys.ai_models.action.unload', '卸载')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Update confirmation (model in use by apps) */}
+      <AlertDialog
+        open={!!updateConfirm}
+        onOpenChange={open => !open && setUpdateConfirm(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('sys.ai_models.confirm.update_title', '确认更新')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'sys.ai_models.confirm.update_in_use',
+                '模型 "{{name}}" 正被 {{count}} 个应用使用，更新后相关应用可能受影响。确定继续？',
+                {
+                  name: updateConfirm?.name || updateConfirm?.model_id,
+                  count: updateConfirm?.used_by_apps?.length ?? 0,
+                }
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.cancel', '取消')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (updateConfirm) {
+                  onUpdate?.(updateConfirm);
+                  setUpdateConfirm(null);
+                }
+              }}
+            >
+              {t('sys.ai_models.action.update', '更新')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -123,6 +124,9 @@ func (h *APIHandlers) ScanModels(c *gin.Context) {
 		return
 	}
 	result := platformdb.SeedDiskModels(h.db)
+	// Newly seeded rows have no hash either — backfill asynchronously so the
+	// scan response stays fast.
+	go h.BackfillMissingHashes()
 	Resp(c).OK(result)
 }
 
@@ -181,6 +185,12 @@ func (h *APIHandlers) ListModels(c *gin.Context) {
 		dbModels, err := h.aiModelRepo.List()
 		if err == nil {
 			for _, db := range dbModels {
+				// App-origin rows (dynamic registration / legacy owner
+				// backfill) are invisible on the model page — it lists only
+				// device-level models. The sync pass heals or GCs them.
+				if db.OwnerAppID != "" {
+					continue
+				}
 				em := EnrichedModel{
 					ModelId:       db.ModelID,
 					Name:          db.Name,
@@ -226,6 +236,9 @@ func (h *APIHandlers) ListModels(c *gin.Context) {
 
 // syncRuntimeModelsToDB ensures the DB reflects the actual runtime state.
 // This makes platform-api the single source of truth for model metadata.
+// App-origin registrations (bundled transient models, owner-tagged dynamic
+// registrations and legacy preloads) never get DB rows: the model page lists
+// only device-level models.
 func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[string]*inferencepb.ModelInfo, runtimeOK bool) {
 	if h.aiModelRepo == nil {
 		return
@@ -233,6 +246,11 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 
 	// 1. Upsert: runtime models → DB
 	for modelID, rt := range runtimeMap {
+		if rt.Transient || rt.OwnerId != "" {
+			// App-bundled and app-registered models serve only the app that
+			// shipped them: never persisted, never listed on the model page.
+			continue
+		}
 		existing, _ := h.aiModelRepo.GetByModelID(modelID)
 		if existing == nil {
 			newModel := &model.AIModel{
@@ -242,7 +260,6 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 				Version:      rt.Version,
 				Status:       "loaded",
 				Source:       "dynamic",
-				OwnerAppID:   rt.OwnerId,
 				DesiredState: "loaded",
 			}
 			if err := h.aiModelRepo.Create(newModel); err != nil {
@@ -259,11 +276,6 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 			if err := h.aiModelRepo.Update(existing); err != nil {
 				logger.Warn("syncRuntimeModelsToDB: failed to update %s: %v", modelID, err)
 			}
-		} else if existing.Status == "loaded" && rt.OwnerId != "" && existing.OwnerAppID == "" {
-			existing.OwnerAppID = rt.OwnerId
-			if err := h.aiModelRepo.Update(existing); err != nil {
-				logger.Warn("syncRuntimeModelsToDB: failed to update owner for %s: %v", modelID, err)
-			}
 		}
 	}
 
@@ -277,12 +289,44 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 	if err != nil {
 		return
 	}
+
+	// 2a. Heal: owner stamps on non-dynamic rows came from the legacy
+	// backfill of preloaded disk models — clear them so system models read
+	// as device-level again.
 	for i := range dbModels {
 		db := &dbModels[i]
+		if db.OwnerAppID == "" || db.Source == "dynamic" {
+			continue
+		}
+		owner := db.OwnerAppID
+		db.OwnerAppID = ""
+		if err := h.aiModelRepo.Update(db); err != nil {
+			logger.Warn("syncRuntimeModelsToDB: failed to heal owner on %s: %v", db.ModelID, err)
+		} else {
+			logger.Info("syncRuntimeModelsToDB: healed legacy owner %q on %s", owner, db.ModelID)
+		}
+	}
+
+	for i := range dbModels {
+		db := &dbModels[i]
+		// 2b. GC app-origin rows: they are page-invisible by design, so once
+		// the app's model is gone from runtime the row is garbage (stopped/
+		// uninstalled apps, probe leftovers).
+		if db.OwnerAppID != "" {
+			if rt, inRuntime := runtimeMap[db.ModelID]; inRuntime && !rt.Transient {
+				continue
+			}
+			if err := h.aiModelRepo.DeleteByModelID(db.ModelID); err != nil {
+				logger.Warn("syncRuntimeModelsToDB: failed to GC %s (owner %s): %v", db.ModelID, db.OwnerAppID, err)
+			} else {
+				logger.Info("syncRuntimeModelsToDB: GC'd app-origin row %s (owner %s)", db.ModelID, db.OwnerAppID)
+			}
+			continue
+		}
 		if db.Status != "loaded" {
 			continue
 		}
-		if _, inRuntime := runtimeMap[db.ModelID]; inRuntime {
+		if rt, inRuntime := runtimeMap[db.ModelID]; inRuntime && !rt.Transient {
 			continue
 		}
 		// Preserve DesiredState: if user intentionally loaded this model,
@@ -328,6 +372,7 @@ func (h *APIHandlers) GetModelInfo(c *gin.Context) {
 				"threshold":      dbModel.Threshold,
 				"max_detections": dbModel.MaxDetections,
 				"file_size":      dbModel.FileSize,
+				"file_hash":      dbModel.FileHash,
 				"network_name":   dbModel.NetworkName,
 				"input_width":    dbModel.InputWidth,
 				"input_height":   dbModel.InputHeight,
@@ -461,7 +506,7 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 
 	if h.aiModelRepo != nil {
 		if existing, _ := h.aiModelRepo.GetByModelID(req.ModelID); existing != nil {
-			Resp(c).OK(gin.H{"model_id": existing.ModelID, "status": existing.Status})
+			Resp(c).FailMsg(CodeInvalidRequest, "Model ID already exists: "+req.ModelID+" (use update instead)")
 			return
 		}
 	}
@@ -505,7 +550,8 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			Status:        "uploaded",
 		}
 		if err := h.aiModelRepo.Create(dbModel); err != nil {
-			logger.Warn("Failed to persist model to DB: %v", err)
+			Resp(c).FailMsg(CodeServiceError, "Failed to persist model to DB: "+err.Error())
+			return
 		}
 	}
 
@@ -525,6 +571,184 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			getUsernameFromContext(c),
 		)
 	}
+}
+
+// UpdateModel updates an existing device-level model: metadata always, the
+// underlying file optionally (file_hash from a prior parse). A loaded model
+// whose file or inference-relevant settings changed is reloaded on the NPU.
+func (h *APIHandlers) UpdateModel(c *gin.Context) {
+	modelID := c.Param("model_id")
+	if modelID == "" {
+		Resp(c).FailMsg(CodeInvalidRequest, "Model ID is required")
+		return
+	}
+	if h.aiModelRepo == nil {
+		Resp(c).FailMsg(CodeServiceError, "Model repository not available")
+		return
+	}
+
+	// Pointer fields distinguish "absent" (keep current) from zero values —
+	// the update applies exactly what the body carries.
+	var req struct {
+		FileHash    string                 `json:"file_hash"`
+		ModelType   string                 `json:"model_type"`
+		Variant     *string                `json:"model_variant"`
+		Config      map[string]interface{} `json:"config"`
+		FileSize    *int64                 `json:"file_size"`
+		NetworkName *string                `json:"network_name"`
+		VStreamInfo *string                `json:"vstream_info"`
+		InputWidth  *int                   `json:"input_width"`
+		InputHeight *int                   `json:"input_height"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+
+	dbModel, err := h.aiModelRepo.GetByModelID(modelID)
+	if err != nil || dbModel == nil || dbModel.OwnerAppID != "" {
+		// App-origin rows are not device-level models — same as not found.
+		Resp(c).FailMsg(CodeNotFound, "Model not found")
+		return
+	}
+
+	newModelType := dbModel.ModelType
+	if req.ModelType != "" {
+		resolved := model.ResolveModelType(req.ModelType)
+		if resolved == "" {
+			Resp(c).FailMsg(CodeInvalidRequest, "Unsupported model_type: "+req.ModelType)
+			return
+		}
+		newModelType = resolved
+	}
+
+	// Optional file swap: an empty file_hash is a metadata-only update.
+	newPath, newHash := dbModel.FilePath, dbModel.FileHash
+	fileChanged := false
+	if req.FileHash != "" {
+		if h.modelStore == nil {
+			Resp(c).FailMsg(CodeServiceError, "Model storage not available")
+			return
+		}
+		ext := ".hef"
+		if !h.modelStore.Exists(req.FileHash, ext) {
+			Resp(c).FailMsg(CodeInvalidRequest, "Model file not found. Please re-parse the model first.")
+			return
+		}
+		newPath = h.modelStore.BlobPath(req.FileHash, ext)
+		fileChanged = req.FileHash != dbModel.FileHash
+		newHash = req.FileHash
+	}
+	needsReload := fileChanged || newModelType != dbModel.ModelType ||
+		(req.Variant != nil && *req.Variant != dbModel.Variant)
+	wasLoaded := dbModel.Status == "loaded"
+
+	// A loaded model whose runtime view changes must be unloaded first so
+	// the NPU never serves stale weights under the new row.
+	if wasLoaded && needsReload && h.grpcClients.AIRuntime != nil {
+		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID}); err != nil {
+			Resp(c).FailMsg(CodeOperationFailed, "Failed to unload model before update: "+err.Error())
+			return
+		}
+	}
+
+	dbModel.FilePath = newPath
+	dbModel.FileHash = newHash
+	dbModel.ModelType = newModelType
+	if req.Variant != nil {
+		dbModel.Variant = *req.Variant
+	}
+	if req.FileSize != nil {
+		dbModel.FileSize = *req.FileSize
+	}
+	if req.NetworkName != nil {
+		dbModel.NetworkName = *req.NetworkName
+	}
+	if req.VStreamInfo != nil {
+		dbModel.VStreamInfo = *req.VStreamInfo
+	}
+	if req.InputWidth != nil {
+		dbModel.InputWidth = *req.InputWidth
+	}
+	if req.InputHeight != nil {
+		dbModel.InputHeight = *req.InputHeight
+	}
+	if req.Config != nil {
+		merged := make(map[string]interface{})
+		for k, v := range model.GetFieldDefaults(newModelType) {
+			merged[k] = v
+		}
+		for k, v := range req.Config {
+			merged[k] = v
+		}
+		configJSON, _ := json.Marshal(merged)
+		dbModel.Config = string(configJSON)
+
+		var threshold float32
+		if v, ok := merged["threshold"].(float64); ok {
+			threshold = float32(v)
+		}
+		var maxDet int
+		if v, ok := merged["max_detections"].(float64); ok {
+			maxDet = int(v)
+		}
+		dbModel.Threshold = threshold
+		dbModel.MaxDetections = maxDet
+	}
+
+	if wasLoaded && needsReload {
+		dbModel.Status = "uploaded"
+		dbModel.DesiredState = "loaded"
+	}
+	if err := h.aiModelRepo.Update(dbModel); err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to persist model update: "+err.Error())
+		return
+	}
+
+	// Reload the swapped model so a previously loaded one stays in service.
+	if wasLoaded && needsReload && h.grpcClients.AIRuntime != nil {
+		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		resp, loadErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+			ModelPath:    dbModel.FilePath,
+			ModelId:      dbModel.ModelID,
+			ModelType:    dbModel.ModelType,
+			ModelVariant: dbModel.Variant,
+		})
+		if loadErr == nil && resp.Status != nil && !resp.Status.Success {
+			loadErr = fmt.Errorf("%s", resp.Status.Message)
+		}
+		if loadErr != nil {
+			// The row already reflects the new file as uploaded — report the
+			// reload failure explicitly instead of claiming success.
+			Resp(c).FailMsg(CodeModelLoadFailed, "Model updated but failed to reload on NPU: "+loadErr.Error())
+			return
+		}
+		dbModel.Status = "loaded"
+		if err := h.aiModelRepo.Update(dbModel); err != nil {
+			logger.Warn("Failed to update model status to loaded: %v", err)
+		}
+	}
+
+	if h.eventLogger != nil {
+		h.eventLogger.LogWithCodeAsync(
+			"ai.model.updated",
+			events.MessageParams{
+				"model_id": modelID,
+				"size":     dbModel.FileSize,
+			},
+			getUsernameFromContext(c),
+		)
+	}
+
+	Resp(c).OK(gin.H{
+		"model_id": dbModel.ModelID,
+		"status":   dbModel.Status,
+	})
 }
 
 // UploadModel saves a model file to storage without loading to NPU (legacy endpoint).

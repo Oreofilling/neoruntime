@@ -61,6 +61,8 @@ message ModelRegisterRequest {
   // Post-process configuration
   string model_type = 13;       // Model type: detection, landmarks, segmentation, classification
   string model_variant = 14;    // Variant: yolov8n, yolov8s, etc. (for detection models)
+
+  bool transient = 15;          // App-bundled model (extracted from an app image): hidden from the model page, never persisted to platform.db
 }
 
 message ModelRegisterResponse {
@@ -81,6 +83,7 @@ message ModelInfo {
   uint32 estimated_memory = 11;
   uint64 load_timestamp = 12;
   string owner_id = 13;         // Used during UnregisterModel to specify the caller's identity
+  bool transient = 14;          // True for app-bundled models (see ModelRegisterRequest.transient)
 }
 
 message ModelListResponse {

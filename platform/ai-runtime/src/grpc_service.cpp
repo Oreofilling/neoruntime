@@ -88,12 +88,32 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     const pb::ModelRegisterRequest* req,
     pb::ModelRegisterResponse* resp) {
 
-    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s",
-             req->model_id().c_str(), req->model_path().c_str(), req->model_type().c_str());
+    LOG_INFO("RegisterModel: model_id=%s path=%s type=%s transient=%d",
+             req->model_id().c_str(), req->model_path().c_str(),
+             req->model_type().c_str(), req->transient());
 
     if (req->model_id().empty() || req->model_path().empty()) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("model_id and model_path required");
+        return grpc::Status::OK;
+    }
+
+    // App-bundled (transient) models have no platform.db metadata to supply a
+    // postprocess type later — this registration is the only chance to get it.
+    // An empty model_type means raw-tensor-only output: the model would load
+    // fine and then silently return nothing useful to apps expecting
+    // structured results (the DPM failure mode). Fail loudly instead. Apps
+    // that genuinely want raw tensors can still set raw_output_only per
+    // request on a post-configured model, so nothing is lost.
+    if (req->transient() && req->model_type().empty()) {
+        LOG_ERROR("RegisterModel: transient model '%s' registered without "
+                  "model_type — post-processing would be unavailable "
+                  "(raw tensors only). Rejecting.",
+                  req->model_id().c_str());
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(
+            "model_type is required for app-bundled (transient) model '" +
+            req->model_id() + "'");
         return grpc::Status::OK;
     }
 
@@ -103,7 +123,8 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         owner_id = "<system>";
     }
 
-    int rc = model_mgr_->register_model(req->model_id(), req->model_path(), owner_id);
+    int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
+                                        owner_id, req->transient());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("Failed to register model");
@@ -114,6 +135,20 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     if (!req->model_type().empty() && model_mgr_->has_post_ops()) {
         int post_rc = model_mgr_->init_post_process(
             req->model_id(), req->model_type(), req->model_variant());
+        if (post_rc != 0 && req->transient()) {
+            // A transient model that declared a postprocess type but failed to
+            // initialize it would answer inference with raw tensors — silent
+            // degradation. Roll the registration back and fail loudly.
+            LOG_ERROR("RegisterModel: post-process init failed for transient "
+                      "model %s (type=%s, rc=%d), rolling back registration",
+                      req->model_id().c_str(), req->model_type().c_str(), post_rc);
+            model_mgr_->unregister_model(req->model_id(), owner_id);
+            resp->mutable_status()->set_success(false);
+            resp->mutable_status()->set_message(
+                "post-process init failed for app-bundled model '" +
+                req->model_id() + "' (type=" + req->model_type() + ")");
+            return grpc::Status::OK;
+        }
         if (post_rc != 0) {
             LOG_WARN("Post-process init failed for %s: %d (inference will return raw tensors)",
                      req->model_id().c_str(), post_rc);
@@ -169,6 +204,7 @@ grpc::Status AIRuntimeServiceImpl::ListModels(
         info->set_model_path(m.path);
         info->set_version(m.model_info.version);
         info->set_load_timestamp(static_cast<uint64_t>(m.load_time));
+        info->set_transient(m.transient);
         // Include first owner_id if available
         auto owners = model_mgr_->get_owners(m.id);
         if (!owners.empty()) {
@@ -195,6 +231,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
     resp->set_model_path(m.path);
     resp->set_version(m.model_info.version);
     resp->set_load_timestamp(static_cast<uint64_t>(m.load_time));
+    resp->set_transient(m.transient);
 
     for (uint32_t i = 0; i < m.model_info.num_inputs; i++) {
         auto* spec = resp->add_inputs();
