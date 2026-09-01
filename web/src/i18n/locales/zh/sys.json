@@ -1516,7 +1516,14 @@
         "number_min": "数值应 ≥ {{min}}",
         "number_max": "数值应 ≤ {{max}}",
         "model_id_exists": "模型 ID 已存在，请更换",
-        "model_id_readonly": "更新时不可修改"
+        "model_id_readonly": "更新时不可修改",
+        "postprocess_profile": "后处理 Profile",
+        "postprocess_profile_hint": "加载时模型会以该文件名物化后交给 Hailo 后处理插件，须与模型实际网络对应（n/s/m 分别对应 yolov8n/s/m）",
+        "postprocess_profile_hailo_yolov8n_384_640": "yolov8n 384x640（默认）",
+        "postprocess_profile_hailo_yolov8s_384_640": "yolov8s 384x640",
+        "postprocess_profile_hailo_yolov8m_384_640": "yolov8m 384x640",
+        "labels": "类别标签",
+        "labels_hint": "逗号分隔、按训练顺序排列；检测结果 class_id 从 1 起，对应 labels[N-1]，不含背景类。仅作为元数据保存，运行时标签由模型内置。"
       },
       "empty": {
         "templates": "暂无可用的 AI 模型",
@@ -1608,7 +1615,8 @@
         "suggested_type": "推荐",
         "confirm_register": "注册",
         "confirm_update": "更新",
-        "update_file_optional": "可选：上传新的模型文件以替换现有文件；不上传则仅更新配置。"
+        "update_file_optional": "可选：上传新的模型文件以替换现有文件；不上传则仅更新配置。",
+        "nms_warning": "该 HEF 输出层未见 yolov8_nms_postprocess，可能与 Hailo yolov8 后处理不兼容"
       },
       "type": {
         "landmark": "关键点检测",

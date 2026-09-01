@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check } from 'lucide-react';
+import { Check, AlertTriangle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import {
   useCapabilities,
@@ -517,6 +517,25 @@ export default function ImportModelDialog({
     || registerMutation.isPending
     || updateMutation.isPending;
 
+  // Detection HEFs whose output layers carry no yolov8_nms_postprocess
+  // tensor cannot enter the Hailo yolov8 postprocess pipeline. Advisory
+  // only — the operator may still know better than the vstream metadata.
+  const nmsIncompatible = !!parseResult
+    && (form.modelType === 'detection'
+      || parseResult.suggested_type === 'detection')
+    && !(parseResult.vstream_info || '').includes('yolov8_nms_postprocess');
+  const nmsWarning = nmsIncompatible ? (
+    <div className="flex items-start gap-2 rounded-md border border-yellow-500/60 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-400">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>
+        {t(
+          'sys.ai_models.wizard.nms_warning',
+          'No yolov8_nms_postprocess output layer detected in this HEF; it may be incompatible with the Hailo yolov8 postprocess pipeline'
+        )}
+      </span>
+    </div>
+  ) : null;
+
   // Render a dynamic field based on its schema definition
   const renderField = (field: ModelFieldDef) => {
     const errKey = `config_${field.key}`;
@@ -651,6 +670,11 @@ export default function ImportModelDialog({
                 ))}
               </SelectContent>
             </Select>
+            {t(`sys.ai_models.form.${field.key}_hint`, '') && (
+              <p className="text-xs text-muted-foreground">
+                {t(`sys.ai_models.form.${field.key}_hint`, '')}
+              </p>
+            )}
           </div>
         );
       }
@@ -669,6 +693,28 @@ export default function ImportModelDialog({
             <Label htmlFor={field.key} className="font-normal">
               {t(`sys.ai_models.form.${field.key}`, field.key)}
             </Label>
+          </div>
+        );
+      }
+      case 'text': {
+        const val = String(form.config[field.key] ?? '');
+        const hint = t(`sys.ai_models.form.${field.key}_hint`, '');
+        return (
+          <div className="grid gap-2 sm:col-span-2" key={field.key}>
+            <Label htmlFor={field.key}>
+              {t(`sys.ai_models.form.${field.key}`, field.key)}
+            </Label>
+            <Input
+              id={field.key}
+              type="text"
+              value={val}
+              onChange={e => updateConfig(field.key, e.target.value)}
+              placeholder={ph}
+              disabled={isLoading}
+            />
+            {hint && (
+              <p className="text-xs text-muted-foreground">{hint}</p>
+            )}
           </div>
         );
       }
@@ -810,6 +856,7 @@ export default function ImportModelDialog({
                     </div>
                   </div>
                 </div>
+                {nmsWarning}
               </div>
             )}
           </div>
@@ -921,6 +968,8 @@ export default function ImportModelDialog({
                 />
               </div>
             </div>
+
+            {nmsWarning}
 
             {/* Dynamic fields from schema */}
             {currentFields.length > 0 && (

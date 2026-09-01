@@ -1599,7 +1599,14 @@
         "number_min": "Value must be ≥ {{min}}",
         "number_max": "Value must be ≤ {{max}}",
         "model_id_exists": "This Model ID already exists. Please use a different one.",
-        "model_id_readonly": "Model ID cannot be changed on update"
+        "model_id_readonly": "Model ID cannot be changed on update",
+        "postprocess_profile": "Postprocess Profile",
+        "postprocess_profile_hint": "At load time the model is materialized under this file name for the Hailo postprocess plugin; it must match the actual network (n/s/m map to yolov8n/s/m)",
+        "postprocess_profile_hailo_yolov8n_384_640": "yolov8n 384x640 (default)",
+        "postprocess_profile_hailo_yolov8s_384_640": "yolov8s 384x640",
+        "postprocess_profile_hailo_yolov8m_384_640": "yolov8m 384x640",
+        "labels": "Class Labels",
+        "labels_hint": "Comma-separated, in training order; detection class_id starts at 1 and maps to labels[N-1], with no background class. Stored as metadata only — runtime labels are baked into the model."
       },
       "empty": {
         "templates": "No AI models available",
@@ -1691,7 +1698,8 @@
         "suggested_type": "Suggested",
         "confirm_register": "Register",
         "confirm_update": "Update",
-        "update_file_optional": "Optional: upload a new model file to replace the current one; skip to update configuration only."
+        "update_file_optional": "Optional: upload a new model file to replace the current one; skip to update configuration only.",
+        "nms_warning": "No yolov8_nms_postprocess output layer detected in this HEF; it may be incompatible with the Hailo yolov8 postprocess pipeline"
       },
       "type": {
         "landmark": "Keypoint Detection",
