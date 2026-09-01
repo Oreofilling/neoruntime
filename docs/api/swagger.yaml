@@ -22,16 +22,19 @@ info:
     name: AIPC Platform Team
     email: support@camthink.ai
 servers:
+- url: https://{host}/api/v1
+  description: Production — nginx TLS gateway on port 443 (self-signed
+    certificate, disable certificate verification in clients). The only
+    base reachable from remote machines.
+  variables:
+    host:
+      default: localhost
 - url: /api/v1
   description: Current host (resolved against wherever this spec is served,
     e.g. http://<device>:8080/api/v1 — same-origin, no CORS)
 - url: http://localhost:8080/api/v1
-  description: Local development
-- url: http://{host}:8080/api/v1
-  description: Explicit host
-  variables:
-    host:
-      default: localhost
+  description: Local debugging on the device only — platform-api binds
+    127.0.0.1:8080, the port is not reachable remotely
 security:
 - BearerAuth: []
 tags:
@@ -582,7 +585,8 @@ paths:
       description: 'WebSocket endpoint for real-time event subscription.
 
 
-        Connect with: `ws://{host}/api/v1/events/stream?token={jwt_token}`
+        Remote (nginx TLS): `wss://{host}/api/v1/events/stream?token={jwt_token}`;
+        local on the device: `ws://localhost:8080/api/v1/events/stream?token={jwt_token}`
 
         '
       operationId: eventStream
@@ -1979,7 +1983,8 @@ paths:
       summary: Subscribe to H264 video stream (WebSocket)
       description: >
         WebSocket endpoint for zero-latency H264 video stream.
-        Connect with: `ws://{host}/api/v1/h264/{stream_id}`
+        Remote (nginx TLS): `wss://{host}/api/v1/h264/{stream_id}`;
+        local on the device: `ws://localhost:8080/api/v1/h264/{stream_id}`
       operationId: h264Stream
       parameters:
       - name: stream_id
@@ -2525,6 +2530,10 @@ paths:
         schema:
           type: string
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: File content
           content:
@@ -2562,6 +2571,10 @@ paths:
                 content:
                   type: string
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: File written
           content:
@@ -2591,6 +2604,10 @@ paths:
                   description: Destination directory
                   default: /data/aipc
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: File uploaded
           content:
@@ -2610,6 +2627,10 @@ paths:
         schema:
           type: string
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: File download
           content:
@@ -2635,6 +2656,10 @@ paths:
                 path:
                   type: string
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: Directory created
           content:
@@ -2662,6 +2687,10 @@ paths:
                 new_path:
                   type: string
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: File renamed/moved
           content:
@@ -2676,7 +2705,8 @@ paths:
       description: 'WebSocket endpoint for interactive shell access.
 
 
-        Connect with: `ws://{host}/api/v1/terminal/ws`
+        Remote (nginx TLS): `wss://{host}/api/v1/terminal/ws`;
+        local on the device: `ws://localhost:8080/api/v1/terminal/ws`
 
 
         - Text messages: terminal I/O
@@ -4489,6 +4519,13 @@ paths:
           group; relative so try-it-out hits the host serving this page
       tags: [System]
       summary: Authenticate and get API token
+      description: >
+        Notes for remote callers: (1) the full path is /api/login — there is
+        no /v1 segment; (2) the returned token string already carries the
+        "Bearer " prefix — send it verbatim in the Authorization header
+        (Authorization: Bearer eyJ...); (3) the JWT signing secret is
+        regenerated at every boot, so tokens are invalidated by a device
+        reboot — log in again after restarts.
       operationId: login
       security: []
       requestBody:
@@ -6268,6 +6305,10 @@ paths:
             schema:
               $ref: '#/components/schemas/FileBatchRequest'
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: ZIP archive
           content:
@@ -6288,6 +6329,10 @@ paths:
             schema:
               $ref: '#/components/schemas/FileBatchRequest'
       responses:
+        '403':
+          description: Path outside the allowed roots (device
+            data root and /tmp only) — the files API enforces a
+            whitelist of permitted roots
         '200':
           description: Deletion result
           content:
