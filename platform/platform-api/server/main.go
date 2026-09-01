@@ -663,6 +663,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	apps.POST("/wizard", apiHandlers.WizardInstall)
 	apps.POST("/upload-image", apiHandlers.UploadImage)
 	apps.POST("/upload-manifest", apiHandlers.UploadManifest)
+	apps.POST("/upload-package", apiHandlers.UploadPackage)
 	apps.PATCH("/manifest", apiHandlers.PatchManifest)
 	apps.POST("/install-package", apiHandlers.InstallPackage)
 	apps.GET("/install-progress/:task_id", apiHandlers.GetInstallProgress)

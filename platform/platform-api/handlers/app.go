@@ -3,8 +3,11 @@ package handlers
 import (
 	"aipc/platform/common/constants"
 	"aipc/platform/common/utils"
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -689,11 +693,28 @@ func (h *APIHandlers) GetInstallProgress(c *gin.Context) {
 	})
 }
 
+// maxImageUploadBytes caps image tar uploads at 2GB (kept in sync with the
+// wizard's frontend limit). A var so tests can shrink it.
+var maxImageUploadBytes int64 = 2 << 30
+
+// uploadDiskHeadroomBytes is the extra free space required beyond the file
+// size before accepting an image upload, so an install can still unpack.
+const uploadDiskHeadroomBytes int64 = 1 << 30
+
 // UploadImage handles container image upload
 // POST /api/v1/apps/upload-image
 func (h *APIHandlers) UploadImage(c *gin.Context) {
-	// Parse multipart form (max 2GB)
-	if err := c.Request.ParseMultipartForm(2 << 30); err != nil {
+	// Hard cap the request body so oversized uploads are cut off early
+	// instead of streaming to disk. ParseMultipartForm's argument is only
+	// an in-memory threshold, NOT a size limit.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageUploadBytes)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			Resp(c).FailMsg(CodeInvalidRequest, fmt.Sprintf(
+				"Image exceeds the maximum allowed size (%d bytes)", maxImageUploadBytes))
+			return
+		}
 		Resp(c).FailMsg(CodeInvalidRequest, "Failed to parse form: "+err.Error())
 		return
 	}
@@ -719,6 +740,18 @@ func (h *APIHandlers) UploadImage(c *gin.Context) {
 		return
 	}
 
+	// Refuse early when the target partition cannot hold the file plus
+	// unpack headroom — failing here is far cheaper than failing at install.
+	var statfs syscall.Statfs_t
+	if err := syscall.Statfs(uploadDir, &statfs); err == nil {
+		free := int64(statfs.Bavail) * int64(statfs.Bsize)
+		if need := header.Size + uploadDiskHeadroomBytes; free < need {
+			Resp(c).FailMsg(CodeStorageFull, fmt.Sprintf(
+				"No space left for upload: need %d bytes (with headroom), %d free", need, free))
+			return
+		}
+	}
+
 	// Generate unique filename
 	timestamp := time.Now().Unix()
 	savedName := fmt.Sprintf("%d_%s", timestamp, filename)
@@ -736,6 +769,23 @@ func (h *APIHandlers) UploadImage(c *gin.Context) {
 	if err != nil {
 		os.Remove(savedPath)
 		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to save file: "+err.Error())
+		return
+	}
+	if written > maxImageUploadBytes {
+		os.Remove(savedPath)
+		Resp(c).FailMsg(CodeInvalidRequest, fmt.Sprintf(
+			"Image exceeds the maximum allowed size (%d bytes)", maxImageUploadBytes))
+		return
+	}
+
+	// Structural pre-check: reject anything the containerd importer would
+	// only fail on at install time (wrong layout, digest-style layer refs,
+	// truncated archive). Fail fast here, not after the user waits through
+	// the whole install.
+	if err := utils.ValidateDockerSaveTar(savedPath); err != nil {
+		os.Remove(savedPath)
+		logger.Warn("Rejected invalid image tar %s: %v", savedPath, err)
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid image tar: "+err.Error())
 		return
 	}
 
@@ -824,6 +874,247 @@ func (h *APIHandlers) UploadManifest(c *gin.Context) {
 		// The wizard cannot express spec.containers; the web layer needs to
 		// know before offering editable install for this file.
 		"multi_container": appManifest.IsMultiContainer(),
+	})
+}
+
+// maxPackageManifestBytes caps the app.yaml entry extracted from a package at
+// 4MB — far beyond any real manifest, small enough to stop tar bombs.
+const maxPackageManifestBytes int64 = 4 << 20
+
+// UploadPackage handles single-file .neoapp app-package upload: a tar.gz bundle
+// holding app.yaml + image.tar (plus optional extras like SHA256SUMS). It
+// unpacks both entries server-side — the manifest goes through the same
+// parse-and-store path as upload-manifest, the image tar through the same
+// validation as upload-image — so the web import dialog can accept one file
+// and then call install-package with the returned paths.
+// POST /api/v1/apps/upload-package
+func (h *APIHandlers) UploadPackage(c *gin.Context) {
+	// Hard cap the request body like upload-image: the package holds the
+	// same image tar, just gzip-wrapped.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageUploadBytes)
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			Resp(c).FailMsg(CodeInvalidRequest, fmt.Sprintf(
+				"Package exceeds the maximum allowed size (%d bytes)", maxImageUploadBytes))
+			return
+		}
+		Resp(c).FailMsg(CodeInvalidRequest, "Failed to parse form: "+err.Error())
+		return
+	}
+
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "No file uploaded: "+err.Error())
+		return
+	}
+	defer file.Close()
+
+	// Validate file extension
+	filename := filepath.Base(header.Filename)
+	if !strings.HasSuffix(filename, ".neoapp") && !strings.HasSuffix(filename, ".tar.gz") && !strings.HasSuffix(filename, ".tgz") {
+		Resp(c).FailMsg(CodeInvalidRequest,
+			"Only .neoapp packages (tar.gz) are allowed; zip packages are not supported — rebuild with the repo build script")
+		return
+	}
+
+	// Create upload directory (shared with upload-image)
+	uploadDir := constants.RootPath() + "/images"
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create upload directory: "+err.Error())
+		return
+	}
+
+	// Refuse early when the target partition cannot hold the package plus
+	// the unpacked image plus headroom (worst case: package + 2× image).
+	var statfs syscall.Statfs_t
+	if err := syscall.Statfs(uploadDir, &statfs); err == nil {
+		free := int64(statfs.Bavail) * int64(statfs.Bsize)
+		if need := header.Size + uploadDiskHeadroomBytes; free < need {
+			Resp(c).FailMsg(CodeStorageFull, fmt.Sprintf(
+				"No space left for upload: need %d bytes (with headroom), %d free", need, free))
+			return
+		}
+	}
+
+	timestamp := time.Now().Unix()
+	pkgPath := filepath.Join(uploadDir, fmt.Sprintf("%d_pkg_%s", timestamp, filename))
+	imageTarPath := filepath.Join(uploadDir, fmt.Sprintf("%d_image.tar", timestamp))
+
+	// cleanup removes every partial artifact on failure paths; success
+	// removes only the package (the extracted image tar is the payload).
+	cleanup := func(keepImage bool) {
+		os.Remove(pkgPath)
+		if !keepImage {
+			os.Remove(imageTarPath)
+		}
+	}
+
+	// Save the uploaded package to a temp file first: tar.Reader needs a
+	// seekable-ish stream and we want the original off disk once unpacked.
+	pkgDst, err := os.Create(pkgPath)
+	if err != nil {
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create file: "+err.Error())
+		return
+	}
+	written, copyErr := io.Copy(pkgDst, file)
+	closeErr := pkgDst.Close()
+	if copyErr != nil || closeErr != nil {
+		cleanup(false)
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to save package")
+		return
+	}
+	if written > maxImageUploadBytes {
+		cleanup(false)
+		Resp(c).FailMsg(CodeInvalidRequest, fmt.Sprintf(
+			"Package exceeds the maximum allowed size (%d bytes)", maxImageUploadBytes))
+		return
+	}
+
+	// Unpack: iterate tar.gz entries, match by basename. Entries land under
+	// self-constructed paths, so hostile entry names (../x) are inert.
+	fail := func(msg string) {
+		cleanup(false)
+		Resp(c).FailMsg(CodeInvalidRequest, msg)
+	}
+
+	pkgFile, err := os.Open(pkgPath)
+	if err != nil {
+		cleanup(false)
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to reopen package: "+err.Error())
+		return
+	}
+	defer pkgFile.Close()
+
+	gz, err := gzip.NewReader(pkgFile)
+	if err != nil {
+		fail("Invalid .neoapp package: not a gzip/tar.gz archive")
+		return
+	}
+	defer gz.Close()
+
+	var manifestData []byte
+	manifestFound := false
+	imageFound := false
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fail("Invalid .neoapp package: failed to read archive: " + err.Error())
+			return
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue // directories, symlinks and friends are skipped
+		}
+		switch filepath.Base(hdr.Name) {
+		case "app.yaml":
+			if manifestFound {
+				continue
+			}
+			data, err := io.ReadAll(io.LimitReader(tr, maxPackageManifestBytes+1))
+			if err != nil {
+				fail("Invalid .neoapp package: failed to read app.yaml: " + err.Error())
+				return
+			}
+			if int64(len(data)) > maxPackageManifestBytes {
+				fail("Invalid .neoapp package: app.yaml exceeds 4MB")
+				return
+			}
+			manifestData = data
+			manifestFound = true
+		case "image.tar":
+			if imageFound {
+				continue
+			}
+			imageDst, err := os.Create(imageTarPath)
+			if err != nil {
+				fail("Failed to extract image.tar: " + err.Error())
+				return
+			}
+			n, copyErr := io.Copy(imageDst, io.LimitReader(tr, maxImageUploadBytes+1))
+			closeErr := imageDst.Close()
+			if copyErr != nil || closeErr != nil {
+				fail("Failed to extract image.tar")
+				return
+			}
+			if n > maxImageUploadBytes {
+				fail(fmt.Sprintf("Invalid .neoapp package: image.tar exceeds the maximum allowed size (%d bytes)", maxImageUploadBytes))
+				return
+			}
+			imageFound = true
+		default:
+			// SHA256SUMS / README / companion YAMLs: not needed for install
+		}
+	}
+	if !manifestFound || !imageFound {
+		fail("Invalid .neoapp package: both app.yaml and image.tar are required")
+		return
+	}
+
+	// Same structural pre-check as upload-image: fail fast here, not after
+	// the user waits through the whole install.
+	if err := utils.ValidateDockerSaveTar(imageTarPath); err != nil {
+		logger.Warn("Rejected invalid image tar in %s: %v", pkgPath, err)
+		fail("Invalid image tar inside package: " + err.Error())
+		return
+	}
+
+	// Parse via the shared parser (same as upload-manifest): full
+	// validation + spec.models merge.
+	appManifest, err := manifest.ParseManifest(manifestData)
+	if err != nil {
+		fail("Invalid manifest: " + err.Error())
+		return
+	}
+	if appManifest.Metadata.ID == "" {
+		fail("manifest metadata.id is required")
+		return
+	}
+
+	// Save the ORIGINAL manifest bytes untouched (fidelity first), exactly
+	// like upload-manifest.
+	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", appManifest.Metadata.ID)
+	if err := os.MkdirAll(manifestDir, 0755); err != nil {
+		cleanup(false)
+		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
+		return
+	}
+	manifestPath := filepath.Join(manifestDir, "app.yaml")
+	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
+		cleanup(false)
+		Resp(c).FailMsg(CodeServiceError, "Failed to save manifest: "+err.Error())
+		return
+	}
+
+	// Success: the package file itself is no longer needed.
+	cleanup(true)
+
+	imageName := utils.ExtractImageNameFromTar(imageTarPath)
+	logger.Info("Package uploaded: %s (app_id=%s, image=%s, %d bytes)",
+		filename, appManifest.Metadata.ID, imageTarPath, written)
+
+	Resp(c).OK(gin.H{
+		// Manifest fields mirror upload-manifest so the wizard hydrates the
+		// same way; image fields mirror upload-image.
+		"path":     manifestPath,
+		"metadata": gin.H{
+			"id":          appManifest.Metadata.ID,
+			"name":        appManifest.Metadata.Name,
+			"version":     appManifest.Metadata.Version,
+			"description": appManifest.Metadata.Description,
+		},
+		"manifest":         appManifest,
+		"multi_container":  appManifest.IsMultiContainer(),
+		// Original manifest text so the web YAML editor gets the same
+		// byte-faithful baseline a direct app.yaml upload provides.
+		"manifest_yaml":    string(manifestData),
+		"image":            imageName,
+		"image_path":       imageTarPath,
+		"filename":         filename,
+		"size":             written,
 	})
 }
 
