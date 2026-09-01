@@ -492,6 +492,65 @@ func TestTimezoneCache_ConcurrentAccess(t *testing.T) {
 }
 
 // ============================================================
+// 4b. Timezone validation round-trip (#43)
+// ============================================================
+
+// seedIsolatedTzLists pins the cached list to one zone unrelated to the
+// system's current zone and drops the commonTimezones supplement, so a list
+// lookup can never rescue the value under test — only the current-zone
+// branch of isValidTimezone can.
+func seedIsolatedTzLists(t *testing.T) *TimeHandler {
+	t.Helper()
+	h := &TimeHandler{}
+	current := h.getTimezoneFast()
+	seed := "Europe/Berlin"
+	if current == seed {
+		seed = "Europe/Paris"
+	}
+	h.tzCacheMu.Lock()
+	h.tzCache = []TimezoneData{
+		{Name: seed, Country: "Europe", Offset: "UTC+01:00", OffsetSec: 3600},
+	}
+	h.tzCacheTime = time.Now()
+	h.tzCacheMu.Unlock()
+
+	orig := commonTimezones
+	commonTimezones = nil
+	t.Cleanup(func() { commonTimezones = orig })
+	return h
+}
+
+// GET /system/time/config reports getTimezoneFast(); PUTting that same value
+// back must not 400. On images whose live zone is a legacy link name
+// ("Universal", "GMT0") the whitelist never contains it — the exact defect
+// in issue #43.
+func TestIsValidTimezone_AcceptsCurrentSystemZone(t *testing.T) {
+	h := seedIsolatedTzLists(t)
+
+	current := h.getTimezoneFast()
+	if current == "" {
+		t.Skip("no timezone detectable on this system")
+	}
+	if h.isValidListedTimezone(current) {
+		t.Fatalf("test setup: current zone %q is in the lists; seed a different zone", current)
+	}
+	if !h.isValidTimezone(current) {
+		t.Errorf("isValidTimezone(%q) = false: the device must accept its own current zone (round-trip)", current)
+	}
+}
+
+func TestIsValidTimezone_StillRejectsUnknownZones(t *testing.T) {
+	h := seedIsolatedTzLists(t)
+
+	if h.isValidTimezone("Mars/Olympus_Mons") {
+		t.Error("isValidTimezone must still reject zones outside the lists")
+	}
+	if h.isValidTimezone("") {
+		t.Error("isValidTimezone must reject an empty timezone")
+	}
+}
+
+// ============================================================
 // 5. MCU RTC Sync Payload
 // ============================================================
 
