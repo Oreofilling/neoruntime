@@ -1,5 +1,7 @@
 #include "hailo15_dsp_priv.hpp"
 
+#include "common/hal_log.h"
+
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -18,11 +20,38 @@ static int hailo15_dsp_privacy_mask_sync(Hailo15DspContext *ctx, const HalDspPri
 
 /* ---------------------- Helpers ---------------------- */
 
+static const char *dsp_status_name(dsp_status status)
+{
+    switch (status) {
+    case DSP_SUCCESS:                   return "DSP_SUCCESS";
+    case DSP_UNINITIALIZED:             return "DSP_UNINITIALIZED";
+    case DSP_INVALID_ARGUMENT:          return "DSP_INVALID_ARGUMENT";
+    case DSP_OUT_OF_HOST_MEMORY:        return "DSP_OUT_OF_HOST_MEMORY";
+    case DSP_OPEN_DEVICE_FAILED:        return "DSP_OPEN_DEVICE_FAILED";
+    case DSP_CREATE_QUEUE_FAILED:       return "DSP_CREATE_QUEUE_FAILED";
+    case DSP_CREATE_BUFFER_FAILED:      return "DSP_CREATE_BUFFER_FAILED";
+    case DSP_CREATE_BUFFER_GROUP_FAILED:return "DSP_CREATE_BUFFER_GROUP_FAILED";
+    case DSP_ADD_BUFFER_GROUP_FAILED:   return "DSP_ADD_BUFFER_GROUP_FAILED";
+    case DSP_RUN_COMMAND_FAILED:        return "DSP_RUN_COMMAND_FAILED";
+    case DSP_MAP_BUFFER_FAILED:         return "DSP_MAP_BUFFER_FAILED";
+    case DSP_UNMAP_BUFFER_FAILED:       return "DSP_UNMAP_BUFFER_FAILED";
+    case DSP_SYNC_BUFFER_FAILED:        return "DSP_SYNC_BUFFER_FAILED";
+    case DSP_IOCTL_FAILED:              return "DSP_IOCTL_FAILED";
+    case DSP_TIMEOUT:                   return "DSP_TIMEOUT";
+    case DSP_ABORTED:                   return "DSP_ABORTED";
+    default:                            return "DSP_UNKNOWN";
+    }
+}
+
 static HalErrorCode dsp_status_to_hal(dsp_status status)
 {
     if (DSP_SUCCESS == status) {
         return HAL_OK;
     }
+    /* Vendor statuses are collapsed into HAL_ERR_RESULT upstream; surface the
+     * raw code here so driver/firmware failures stay diagnosable in the field. */
+    HAL_LOG_ERROR("hal_dsp: vendor dsp_status=%d (%s)",
+                  (int)status, dsp_status_name(status));
     return HAL_ERR_RESULT;
 }
 
