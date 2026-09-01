@@ -59,16 +59,11 @@ func (h *APIHandlers) SetLight(c *gin.Context) {
 	}
 
 	var req struct {
-		Level uint32 `json:"level"` // 0-100
+		Level *uint32 `json:"level" binding:"required,min=0,max=100"` // 0-100
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
-		return
-	}
-
-	if req.Level > 100 {
-		Resp(c).FailMsg(CodeInvalidRequest, "Level must be between 0 and 100")
 		return
 	}
 
@@ -77,7 +72,7 @@ func (h *APIHandlers) SetLight(c *gin.Context) {
 	defer cancel()
 
 	resp, err := client.SetWhiteLight(ctx, &devicepb.LightLevelRequest{
-		Level: req.Level,
+		Level: *req.Level,
 	})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
@@ -85,7 +80,7 @@ func (h *APIHandlers) SetLight(c *gin.Context) {
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.control", events.MessageParams{"device": "light", "action": "set_level", "level": req.Level}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.control", events.MessageParams{"device": "light", "action": "set_level", "level": *req.Level}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(resp)
@@ -98,16 +93,11 @@ func (h *APIHandlers) SetIrLed(c *gin.Context) {
 	}
 
 	var req struct {
-		Level uint32 `json:"level"`
+		Level *uint32 `json:"level" binding:"required,min=0,max=100"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
-		return
-	}
-
-	if req.Level > 100 {
-		Resp(c).FailMsg(CodeInvalidRequest, "Level must be 0-100")
 		return
 	}
 
@@ -116,7 +106,7 @@ func (h *APIHandlers) SetIrLed(c *gin.Context) {
 	defer cancel()
 
 	resp, err := client.SetIrLed(ctx, &devicepb.LightLevelRequest{
-		Level: req.Level,
+		Level: *req.Level,
 	})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
@@ -124,7 +114,7 @@ func (h *APIHandlers) SetIrLed(c *gin.Context) {
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.control", events.MessageParams{"device": "ir_led", "action": "set_level", "level": req.Level}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.control", events.MessageParams{"device": "ir_led", "action": "set_level", "level": *req.Level}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(resp)
@@ -137,7 +127,7 @@ func (h *APIHandlers) SetIrCut(c *gin.Context) {
 	}
 
 	var req struct {
-		Mode string `json:"mode"` // "auto", "day", "night"
+		Mode string `json:"mode" binding:"required"` // "auto", "day", "night"
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -278,7 +268,7 @@ func (h *APIHandlers) ControlZoom(c *gin.Context) {
 	}
 
 	var req struct {
-		Speed int32 `json:"speed"` // -100 ~ 100 (negative: zoom out, positive: zoom in)
+		Speed int32 `json:"speed" binding:"required,min=-100,max=100"` // -100 ~ 100 (negative: zoom out, positive: zoom in)
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -312,7 +302,7 @@ func (h *APIHandlers) ControlFocus(c *gin.Context) {
 	}
 
 	var req struct {
-		Speed int32 `json:"speed"` // -100 ~ 100 (negative: near, positive: far)
+		Speed int32 `json:"speed" binding:"required,min=-100,max=100"` // -100 ~ 100 (negative: near, positive: far)
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -346,7 +336,7 @@ func (h *APIHandlers) SetAutofocus(c *gin.Context) {
 	}
 
 	var req struct {
-		Enable bool `json:"enable"`
+		Enable *bool `json:"enable" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -359,7 +349,7 @@ func (h *APIHandlers) SetAutofocus(c *gin.Context) {
 	defer cancel()
 
 	resp, err := client.SetAutofocus(ctx, &devicepb.AutofocusRequest{
-		Enable: req.Enable,
+		Enable: *req.Enable,
 	})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
@@ -371,7 +361,7 @@ func (h *APIHandlers) SetAutofocus(c *gin.Context) {
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.autofocus.changed", events.MessageParams{"enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.autofocus.changed", events.MessageParams{"enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(resp)
@@ -489,8 +479,8 @@ func (h *APIHandlers) GPIOWrite(c *gin.Context) {
 	}
 
 	var req struct {
-		Pin   uint32 `json:"pin"`
-		Value bool   `json:"value"`
+		Pin   *uint32 `json:"pin" binding:"required"`
+		Value *bool   `json:"value" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -503,16 +493,21 @@ func (h *APIHandlers) GPIOWrite(c *gin.Context) {
 	defer cancel()
 
 	resp, err := client.GPIOWrite(ctx, &devicepb.GPIOWriteRequest{
-		Pin:   req.Pin,
-		Value: req.Value,
+		Pin:   *req.Pin,
+		Value: *req.Value,
 	})
 	if err != nil {
+		// Mirror GPIORead: an out-of-catalog pin is a 404, not a device error.
+		if status.Code(err) == codes.NotFound {
+			Resp(c).FailMsg(CodeNotFound, status.Convert(err).Message())
+			return
+		}
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.gpio.write", events.MessageParams{"pin": req.Pin, "value": req.Value}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.gpio.write", events.MessageParams{"pin": *req.Pin, "value": *req.Value}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(resp)
@@ -904,7 +899,7 @@ func (h *APIHandlers) SetFan(c *gin.Context) {
 	}
 
 	var req struct {
-		Enable bool `json:"enable"`
+		Enable *bool `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -915,14 +910,14 @@ func (h *APIHandlers) SetFan(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := client.SetFan(ctx, &devicepb.EnvCtrlRequest{Enable: req.Enable})
+	resp, err := client.SetFan(ctx, &devicepb.EnvCtrlRequest{Enable: *req.Enable})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "fan", "action": "set", "enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "fan", "action": "set", "enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"success": resp.Success, "enabled": resp.Enabled, "message": resp.Message})
@@ -954,7 +949,7 @@ func (h *APIHandlers) SetHeat(c *gin.Context) {
 	}
 
 	var req struct {
-		Enable bool `json:"enable"`
+		Enable *bool `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -965,14 +960,14 @@ func (h *APIHandlers) SetHeat(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := client.SetHeat(ctx, &devicepb.EnvCtrlRequest{Enable: req.Enable})
+	resp, err := client.SetHeat(ctx, &devicepb.EnvCtrlRequest{Enable: *req.Enable})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "heat", "action": "set", "enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "heat", "action": "set", "enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"success": resp.Success, "enabled": resp.Enabled, "message": resp.Message})
@@ -1004,7 +999,7 @@ func (h *APIHandlers) SetRadar(c *gin.Context) {
 	}
 
 	var req struct {
-		Enable bool `json:"enable"`
+		Enable *bool `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -1015,14 +1010,14 @@ func (h *APIHandlers) SetRadar(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := client.SetRadar(ctx, &devicepb.EnvCtrlRequest{Enable: req.Enable})
+	resp, err := client.SetRadar(ctx, &devicepb.EnvCtrlRequest{Enable: *req.Enable})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "radar", "action": "set", "enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "radar", "action": "set", "enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"success": resp.Success, "enabled": resp.Enabled, "message": resp.Message})
@@ -1055,7 +1050,7 @@ func (h *APIHandlers) SetAlarmOut(c *gin.Context) {
 
 	var req struct {
 		Channel uint32 `json:"channel"`
-		Enable  bool   `json:"enable"`
+		Enable  *bool   `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -1066,14 +1061,14 @@ func (h *APIHandlers) SetAlarmOut(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := client.SetAlarmOut(ctx, &devicepb.AlarmChannelRequest{Channel: req.Channel, Enable: req.Enable})
+	resp, err := client.SetAlarmOut(ctx, &devicepb.AlarmChannelRequest{Channel: req.Channel, Enable: *req.Enable})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "alarm_out", "action": "set", "channel": req.Channel, "enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "alarm_out", "action": "set", "channel": req.Channel, "enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"success": resp.Success, "enabled": resp.Enabled, "message": resp.Message})
@@ -1112,7 +1107,7 @@ func (h *APIHandlers) SetWiegand(c *gin.Context) {
 
 	var req struct {
 		Channel uint32 `json:"channel"`
-		Enable  bool   `json:"enable"`
+		Enable  *bool   `json:"enable" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
@@ -1123,14 +1118,14 @@ func (h *APIHandlers) SetWiegand(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := client.SetWiegandOut(ctx, &devicepb.AlarmChannelRequest{Channel: req.Channel, Enable: req.Enable})
+	resp, err := client.SetWiegandOut(ctx, &devicepb.AlarmChannelRequest{Channel: req.Channel, Enable: *req.Enable})
 	if err != nil {
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}
 
 	if h.eventLogger != nil {
-		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "wiegand", "action": "set", "channel": req.Channel, "enable": req.Enable}, getUsernameFromContext(c))
+		h.eventLogger.LogWithCodeAsync("device.peripheral", events.MessageParams{"device": "wiegand", "action": "set", "channel": req.Channel, "enable": *req.Enable}, getUsernameFromContext(c))
 	}
 
 	Resp(c).OK(gin.H{"success": resp.Success, "enabled": resp.Enabled, "message": resp.Message})

@@ -12,8 +12,9 @@ import (
 )
 
 // newGPIOCatalogServer builds a server with the NE503 GPIO catalog and no
-// camera-daemon link: readGPIOOnce then fails with "GPIO read not available",
-// which distinguishes cleanly from the catalog rejection message.
+// camera-daemon link: cataloged pins then fail with "GPIO not available"
+// (hardware layer unsupported), which distinguishes cleanly from the catalog
+// rejection message.
 func newGPIOCatalogServer() *DeviceControlServer {
 	cfg := &Config{}
 	cfg.Capabilities.GPIO.AvailablePins = []uint32{12, 13, 21, 22}
@@ -36,10 +37,10 @@ func TestGPIOPinKnown(t *testing.T) {
 	}
 }
 
-// TestGPIORead_PinOutsideCatalog_RejectedBeforeMCU pins down the contract the
+// TestGPIORead_PinOutsideCatalog_RejectedNotFound pins down the contract the
 // platform-api 404 mapping relies on: unknown pins surface as codes.NotFound
-// instead of being forwarded to the MCU as a raw pin byte.
-func TestGPIORead_PinOutsideCatalog_RejectedBeforeMCU(t *testing.T) {
+// instead of being processed.
+func TestGPIORead_PinOutsideCatalog_RejectedNotFound(t *testing.T) {
 	s := newGPIOCatalogServer()
 
 	_, err := s.GPIORead(context.Background(), &pb.GPIOReadRequest{Pin: 1})
@@ -54,9 +55,10 @@ func TestGPIORead_PinOutsideCatalog_RejectedBeforeMCU(t *testing.T) {
 	}
 }
 
-// TestGPIORead_CatalogPin_ReachesReader asserts known pins still flow through
-// to the reader (which reports the missing MCU link in this harness).
-func TestGPIORead_CatalogPin_ReachesReader(t *testing.T) {
+// TestGPIORead_CatalogPin_Unsupported asserts known pins get the per-pin
+// "not available" status (no GPIO command exists in the MCU host-link
+// protocol — issue #46), never a catalog rejection.
+func TestGPIORead_CatalogPin_Unsupported(t *testing.T) {
 	s := newGPIOCatalogServer()
 
 	resp, err := s.GPIORead(context.Background(), &pb.GPIOReadRequest{Pin: 12})
@@ -71,10 +73,10 @@ func TestGPIORead_CatalogPin_ReachesReader(t *testing.T) {
 	}
 }
 
-// TestGPIOBatchRead_OutOfCatalogPin_ReportedPerPinWithoutMCU asserts a batch
-// containing an unknown pin reports that pin as failed while still reading
-// the cataloged ones.
-func TestGPIOBatchRead_OutOfCatalogPin_ReportedPerPinWithoutMCU(t *testing.T) {
+// TestGPIOBatchRead_OutOfCatalogPin_ReportedPerPin asserts a batch containing
+// an unknown pin reports that pin as failed while still reporting the
+// cataloged ones (each with its own per-pin status).
+func TestGPIOBatchRead_OutOfCatalogPin_ReportedPerPin(t *testing.T) {
 	s := newGPIOCatalogServer()
 
 	resp, err := s.GPIOBatchRead(context.Background(), &pb.GPIOBatchReadRequest{
