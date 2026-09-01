@@ -6,6 +6,8 @@ Application:
 ct-disc-gui.exe
 ```
 
+Download: get `ct-disc-gui-windows-amd64-v<version>.zip` from GitHub Releases (`https://github.com/camthink-ai/neoruntime/releases`), unzip it, and double-click `ct-disc-gui.exe`. The zip also contains this guide.
+
 Default build path:
 
 ```text
