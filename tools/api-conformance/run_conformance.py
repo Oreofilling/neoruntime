@@ -49,6 +49,10 @@ def build_parser():
                              "device); reported as SKIP-excluded, never silent")
     parser.add_argument("--exclude-reason", default="excluded by operator",
                         help="reason string recorded for --exclude ops")
+    parser.add_argument("--request-delay", type=float, default=0.0,
+                        help="seconds to pause between operations; small "
+                             "values (0.2-0.5) keep watchdog-equipped "
+                             "devices from hard-resetting under sweep load")
     return parser
 
 
@@ -188,6 +192,8 @@ def main():
                 continue
         body = resolve_body(op_key, tier, safe_body, snapshots)
         results.append(probe_op(client, op, tier, body, instances, log))
+        if args.request_delay > 0:
+            time.sleep(args.request_delay)
 
     if not args.skip_ws:
         results.append(probe_events_ws(args.host, client.token, log=log,
