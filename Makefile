@@ -21,6 +21,7 @@ DOCKER_RELEASE_SDK_PATH ?= /opt/hailo-sdk
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
+AIPC_OS_VERSION ?= 1.12.0
 AIPC_COMPAT_LEVEL ?= 1
 AIPC_DATA_SCHEMA ?= 1
 AIPC_MACHINE ?= hailo15-ne503
@@ -441,6 +442,8 @@ _pack-stage:
 		'  "app_version": "$(VERSION)",' \
 		'  "machine": "$(AIPC_MACHINE)",' \
 		'  "product": "$(AIPC_PRODUCT)",' \
+		'  "min_os_version": "$(AIPC_OS_VERSION)",' \
+		'  "max_os_version": "$(AIPC_OS_VERSION)",' \
 		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
 		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
 		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
