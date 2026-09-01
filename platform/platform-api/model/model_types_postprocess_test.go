@@ -1,0 +1,71 @@
+package model
+
+import "testing"
+
+func TestLookupDetectionProfile(t *testing.T) {
+	p, ok := LookupDetectionProfile("hailo_yolov8s_384_640")
+	if !ok || p.BackendFunction != "hailo_yolov8s" {
+		t.Fatalf("lookup s profile = %+v ok=%v", p, ok)
+	}
+	if _, ok := LookupDetectionProfile(DefaultDetectionProfile); !ok {
+		t.Fatalf("default profile %q missing from table", DefaultDetectionProfile)
+	}
+	if _, ok := LookupDetectionProfile("yolov8x_640_640"); ok {
+		t.Fatal("unknown profile resolved")
+	}
+}
+
+func TestDetectionFieldsIncludePostprocessControls(t *testing.T) {
+	td := GetModelTypeDef("detection")
+	if td == nil {
+		t.Fatal("detection type def missing")
+	}
+
+	var profile *ModelFieldDef
+	var labels *ModelFieldDef
+	for i := range td.Fields {
+		switch td.Fields[i].Key {
+		case "postprocess_profile":
+			profile = &td.Fields[i]
+		case "labels":
+			labels = &td.Fields[i]
+		}
+	}
+	if profile == nil {
+		t.Fatal("postprocess_profile field missing from detection schema")
+	}
+	if profile.Type != FieldTypeSelect {
+		t.Fatalf("postprocess_profile type = %q, want select", profile.Type)
+	}
+	if profile.Default != DefaultDetectionProfile {
+		t.Fatalf("postprocess_profile default = %v, want %q", profile.Default, DefaultDetectionProfile)
+	}
+	if len(profile.Options) != len(DetectionPostprocessProfiles) {
+		t.Fatalf("postprocess_profile options = %d, want %d", len(profile.Options), len(DetectionPostprocessProfiles))
+	}
+	for _, opt := range profile.Options {
+		if _, ok := LookupDetectionProfile(opt.Value); !ok {
+			t.Fatalf("option %q not present in DetectionPostprocessProfiles", opt.Value)
+		}
+	}
+
+	if labels == nil {
+		t.Fatal("labels field missing from detection schema")
+	}
+	if labels.Type != FieldTypeText {
+		t.Fatalf("labels type = %q, want text", labels.Type)
+	}
+}
+
+func TestGetFieldDefaultsIncludesPostprocessControls(t *testing.T) {
+	defaults := GetFieldDefaults("detection")
+	if defaults == nil {
+		t.Fatal("no defaults for detection")
+	}
+	if defaults["postprocess_profile"] != DefaultDetectionProfile {
+		t.Fatalf("postprocess_profile default = %v, want %q", defaults["postprocess_profile"], DefaultDetectionProfile)
+	}
+	if _, ok := defaults["labels"]; !ok {
+		t.Fatal("labels key missing from detection defaults")
+	}
+}

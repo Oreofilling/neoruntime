@@ -21,6 +21,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
 	"aipc/platform/platform-api/repo"
 	"aipc/platform/platform-api/storage"
@@ -206,6 +207,10 @@ func TestUpdateModelMetadataOnly(t *testing.T) {
 
 func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
+	// Keep materialized runtime copies inside the test sandbox.
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	newBlob := seedBlob(t, store, "h2")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "live_det", Name: "live_det", Status: "loaded", Source: "web",
@@ -220,8 +225,22 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "unload:live_det" || calls[1] != "load:live_det" {
 		t.Fatalf("expected unload→load sequence, got %v", calls)
 	}
-	if regPaths["live_det"] != newBlob {
-		t.Errorf("reload used path %q, want blob path of new hash", regPaths["live_det"])
+	// Detection models reload via the materialized postprocess-profile path —
+	// a basename the vendor plugin recognizes — hardlinked to the new blob.
+	materialized := filepath.Join(constants.ModelsPath(), "runtime", "live_det", "hailo_yolov8n_384_640.hef")
+	if regPaths["live_det"] != materialized {
+		t.Errorf("reload used path %q, want materialized %q", regPaths["live_det"], materialized)
+	}
+	dstStat, err := os.Stat(materialized)
+	if err != nil {
+		t.Fatalf("materialized runtime copy missing: %v", err)
+	}
+	srcStat, err := os.Stat(newBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(dstStat, srcStat) {
+		t.Error("materialized copy is not linked to the swapped blob")
 	}
 	row, err := h.aiModelRepo.GetByModelID("live_det")
 	if err != nil || row == nil {
@@ -229,6 +248,9 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	}
 	if row.Status != "loaded" || row.FileHash != "h2" {
 		t.Errorf("row after swap: status=%q hash=%q, want loaded/h2", row.Status, row.FileHash)
+	}
+	if row.FilePath != newBlob {
+		t.Errorf("DB file path must track the swapped blob, got %q want %q", row.FilePath, newBlob)
 	}
 }
 

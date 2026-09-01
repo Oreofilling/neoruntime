@@ -713,14 +713,36 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		resp, loadErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-			ModelPath:    dbModel.FilePath,
-			ModelId:      dbModel.ModelID,
-			ModelType:    dbModel.ModelType,
-			ModelVariant: dbModel.Variant,
-		})
-		if loadErr == nil && resp.Status != nil && !resp.Status.Success {
-			loadErr = fmt.Errorf("%s", resp.Status.Message)
+		runtimePath, runtimeVariant, pathErr := runtimeRegistration(dbModel)
+		var loadErr error
+		if pathErr != nil {
+			loadErr = pathErr
+		} else {
+			resp, regErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+				ModelPath:    runtimePath,
+				ModelId:      dbModel.ModelID,
+				ModelType:    dbModel.ModelType,
+				ModelVariant: runtimeVariant,
+			})
+			loadErr = regErr
+			if loadErr == nil && resp.Status != nil && !resp.Status.Success {
+				loadErr = fmt.Errorf("%s", resp.Status.Message)
+			}
+			if loadErr == nil && model.ResolveModelType(dbModel.ModelType) == "detection" {
+				// Same load-time probe as LoadModel: catch broken postprocess
+				// before the swapped model enters service.
+				info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID})
+				if infoErr != nil {
+					info = nil
+				}
+				if smokeErr := runLoadSmokeTest(ctx, client, dbModel.ModelID, info); smokeErr != nil {
+					loadErr = smokeErr
+					// Roll back so runtime and DB agree on "not loaded".
+					if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
+						logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
+					}
+				}
+			}
 		}
 		if loadErr != nil {
 			// The row already reflects the new file as uploaded — report the
@@ -929,11 +951,21 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Wizard-imported detection models live under sha256 blob names the
+	// postprocess plugin cannot match; runtimeRegistration materializes them
+	// under a recognized basename and composes a schema-valid variant that
+	// carries the stored threshold / max_detections to the runtime.
+	runtimePath, runtimeVariant, pathErr := runtimeRegistration(dbModel)
+	if pathErr != nil {
+		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to prepare model for runtime: "+pathErr.Error())
+		return
+	}
+
 	resp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-		ModelPath:    dbModel.FilePath,
+		ModelPath:    runtimePath,
 		ModelId:      dbModel.ModelID,
 		ModelType:    dbModel.ModelType,
-		ModelVariant: dbModel.Variant,
+		ModelVariant: runtimeVariant,
 	})
 	if err != nil {
 		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to load model on NPU: "+err.Error())
@@ -946,30 +978,49 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 	}
 
 	// Update input dimensions from live model info
-	if resp.ModelId != "" {
-		modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
-			ModelId: resp.ModelId,
-		})
-		if infoErr == nil && modelInfo != nil && len(modelInfo.Inputs) > 0 {
-			input := modelInfo.Inputs[0]
-			layout := input.GetLayout()
-			switch layout {
-			case "NHWC":
-				if len(input.Shape) >= 4 {
-					dbModel.InputHeight = int(input.Shape[1])
-					dbModel.InputWidth = int(input.Shape[2])
-				}
-			case "NCHW":
-				if len(input.Shape) >= 4 {
-					dbModel.InputHeight = int(input.Shape[2])
-					dbModel.InputWidth = int(input.Shape[3])
-				}
-			default:
-				if len(input.Shape) >= 3 {
-					dbModel.InputHeight = int(input.Shape[0])
-					dbModel.InputWidth = int(input.Shape[1])
-				}
+	var modelInfo *inferencepb.ModelInfo
+	infoModelID := resp.ModelId
+	if infoModelID == "" {
+		infoModelID = dbModel.ModelID
+	}
+	modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
+		ModelId: infoModelID,
+	})
+	if infoErr != nil {
+		modelInfo = nil
+	}
+	if modelInfo != nil && len(modelInfo.Inputs) > 0 {
+		input := modelInfo.Inputs[0]
+		layout := input.GetLayout()
+		switch layout {
+		case "NHWC":
+			if len(input.Shape) >= 4 {
+				dbModel.InputHeight = int(input.Shape[1])
+				dbModel.InputWidth = int(input.Shape[2])
 			}
+		case "NCHW":
+			if len(input.Shape) >= 4 {
+				dbModel.InputHeight = int(input.Shape[2])
+				dbModel.InputWidth = int(input.Shape[3])
+			}
+		default:
+			if len(input.Shape) >= 3 {
+				dbModel.InputHeight = int(input.Shape[0])
+				dbModel.InputWidth = int(input.Shape[1])
+			}
+		}
+	}
+
+	// Postprocess failures only surface at infer time — probe the freshly
+	// loaded model once so a broken registration can be rolled back here
+	// instead of failing on every frame later.
+	if model.ResolveModelType(dbModel.ModelType) == "detection" {
+		if smokeErr := runLoadSmokeTest(ctx, client, dbModel.ModelID, modelInfo); smokeErr != nil {
+			if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
+				logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
+			}
+			Resp(c).FailMsg(CodeModelLoadFailed, "postprocess smoke test failed: "+smokeErr.Error())
+			return
 		}
 	}
 
@@ -1120,6 +1171,9 @@ func (h *APIHandlers) UnregisterModel(c *gin.Context) {
 			}
 			// Delete DB record first so ref-count excludes this entry
 			h.aiModelRepo.DeleteByModelID(modelID)
+			// Drop the materialized runtime copy, if this model had one
+			// (blob ref-count below is unaffected — hardlinks share the inode).
+			removeRuntimeCopy(modelID)
 
 			// Only delete the blob file when no other model references the same hash
 			if dbModel.FileHash != "" && h.modelStore != nil {
