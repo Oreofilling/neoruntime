@@ -24,6 +24,7 @@ DOCKER_PULL ?= 1
 AIPC_OS_VERSION ?= 1.12.0
 AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
+AIPC_COMPAT_LEVEL ?= 1
 AIPC_DATA_SCHEMA ?= 1
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
@@ -476,6 +477,7 @@ _pack-stage:
 		'  "product": "$(AIPC_PRODUCT)",' \
 		'  "min_os_version": "$(AIPC_MIN_OS_VERSION)",' \
 		'  "max_os_version": "$(AIPC_MAX_OS_VERSION)",' \
+		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
 		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
 		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
 		'}' > "$(STAGE_DIR)/opt/aipc/app-manifest.json"

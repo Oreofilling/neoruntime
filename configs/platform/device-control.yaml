@@ -38,9 +38,12 @@ capabilities:
     ir_led: true
     ir_cut: true
     
-  # PTZ control
+  # PTZ control — disabled: this platform has no motorized PTZ and the MCU
+  # host-link protocol has no PTZ command (the 0x20-0x24 IDs the first
+  # implementation assumed are LED_SET/LED_GET/IRCUT_SET/IRCUT_GET/PD_GET;
+  # see device-control server main.go).
   ptz:
-    enabled: true
+    enabled: false
     pan_range: [-180, 180]    # degrees
     tilt_range: [-45, 45]     # degrees
     max_speed: 100
@@ -57,11 +60,15 @@ capabilities:
     default_zoom_limit: [-3236, 760]   # AF0832-D09 micro steps
     default_focus_limit: [-844, 592]
     
-  # GPIO
+  # GPIO — intentionally empty. The MCU host-link protocol has no GPIO
+  # command (0x30/0x31 are AIN_GET/RESET_SOC; sending 0x31 power-cycles the
+  # SoC — issue #46), and SoC GPIO (hal_v2 hal_io.h, libgpiod) is not exposed
+  # through camera-daemon yet. With an empty catalog GET /device/gpio reports
+  # no pins and any pin-scoped call is rejected as out-of-catalog.
   gpio:
-    available_pins: [12, 13, 21, 22]
-    input_pins: [12, 13]
-    output_pins: [21, 22]
+    available_pins: []
+    input_pins: []
+    output_pins: []
 
 # Automation control
 automation:

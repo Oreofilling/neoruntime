@@ -1248,6 +1248,20 @@ func (h *TimeHandler) getSystemTimezones() []TimezoneData {
 }
 
 func (h *TimeHandler) isValidTimezone(tz string) bool {
+	// The zone the system currently runs — what getTimezoneFast reports and
+	// GET /system/time/config returns — is by definition a zone the system
+	// accepts. Legacy link names like "Universal" or "GMT0" lack the
+	// "Area/Location" shape and never appear in the lists below, which made
+	// the device reject its own reported value on read-modify-write (#43).
+	if tz != "" && tz == h.getTimezoneFast() {
+		return true
+	}
+	return h.isValidListedTimezone(tz)
+}
+
+// isValidListedTimezone accepts tz only when it appears in the system
+// timezone list or the commonTimezones supplement (the pre-#43 whitelist).
+func (h *TimeHandler) isValidListedTimezone(tz string) bool {
 	// Check against system timezones first
 	timezones := h.getSystemTimezones()
 
