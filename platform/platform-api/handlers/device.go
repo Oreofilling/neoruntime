@@ -692,6 +692,11 @@ func (h *APIHandlers) GPIOWrite(c *gin.Context) {
 		Value: *req.Value,
 	})
 	if err != nil {
+		// Mirror GPIORead: an out-of-catalog pin is a 404, not a device error.
+		if status.Code(err) == codes.NotFound {
+			Resp(c).FailMsg(CodeNotFound, status.Convert(err).Message())
+			return
+		}
 		Resp(c).FailMsg(CodeDeviceError, err.Error())
 		return
 	}

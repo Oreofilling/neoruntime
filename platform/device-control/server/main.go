@@ -928,6 +928,15 @@ func (s *DeviceControlServer) DeleteIrPreset(ctx context.Context, req *pb.Delete
 }
 
 // PTZ Control
+//
+// The MCU host-link protocol has no PTZ command: the IDs the original
+// implementation assumed (0x20 PAN … 0x24 CALL_PRESET) are actually
+// LED_SET / LED_GET / IRCUT_SET / IRCUT_GET / PD_GET (host_link_proto.h), so
+// a pan or tilt request drove the LED and a stop request poked the IR-cut
+// filter. This platform has no motorized PTZ; the handlers below report that
+// instead of issuing unrelated MCU commands.
+
+const ptzUnsupportedMsg = "PTZ not supported on this platform: no PTZ hardware and no PTZ command in the MCU host-link protocol"
 
 func (s *DeviceControlServer) Pan(ctx context.Context, req *pb.PanRequest) (*pb.Status, error) {
 	logger.Debug("Pan: direction=%v, speed=%d", req.Direction, req.Speed)
@@ -939,22 +948,7 @@ func (s *DeviceControlServer) Pan(ctx context.Context, req *pb.PanRequest) (*pb.
 		}, nil
 	}
 
-	if s.cameraDaemonClient != nil {
-		payload := []byte{byte(req.Direction), byte(req.Speed)}
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd:     0x20, // HOST_LINK_CMD_PTZ_PAN
-			Payload: payload,
-		})
-		if err != nil {
-			logger.Error("Pan: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
-	}
-
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: ptzUnsupportedMsg}, nil
 }
 
 func (s *DeviceControlServer) Tilt(ctx context.Context, req *pb.TiltRequest) (*pb.Status, error) {
@@ -967,46 +961,31 @@ func (s *DeviceControlServer) Tilt(ctx context.Context, req *pb.TiltRequest) (*p
 		}, nil
 	}
 
-	if s.cameraDaemonClient != nil {
-		payload := []byte{byte(req.Direction), byte(req.Speed)}
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd:     0x21, // HOST_LINK_CMD_PTZ_TILT
-			Payload: payload,
-		})
-		if err != nil {
-			logger.Error("Tilt: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
-	}
-
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: ptzUnsupportedMsg}, nil
 }
 
 func (s *DeviceControlServer) PTZStop(ctx context.Context, req *pb.PTZStopRequest) (*pb.Status, error) {
 	logger.Debug("PTZStop")
 
-	if s.cameraDaemonClient != nil {
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd: 0x22, // HOST_LINK_CMD_PTZ_STOP
-		})
-		if err != nil {
-			logger.Error("PTZStop: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
+	if !s.config.Capabilities.PTZ.Enabled {
+		return &pb.Status{
+			Success: false,
+			Message: "PTZ not enabled",
+		}, nil
 	}
 
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: ptzUnsupportedMsg}, nil
 }
 
 func (s *DeviceControlServer) SavePreset(ctx context.Context, req *pb.PresetRequest) (*pb.Status, error) {
 	logger.Info("SavePreset: id=%d", req.PresetId)
 
+	if !s.config.Capabilities.PTZ.Enabled {
+		return &pb.Status{
+			Success: false,
+			Message: "PTZ not enabled",
+		}, nil
+	}
 	if req.PresetId == 0 || req.PresetId > uint32(s.config.Capabilities.PTZ.Presets) {
 		return &pb.Status{
 			Success: false,
@@ -1014,27 +993,18 @@ func (s *DeviceControlServer) SavePreset(ctx context.Context, req *pb.PresetRequ
 		}, nil
 	}
 
-	if s.cameraDaemonClient != nil {
-		payload := []byte{byte(req.PresetId)}
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd:     0x23, // HOST_LINK_CMD_PTZ_SAVE_PRESET
-			Payload: payload,
-		})
-		if err != nil {
-			logger.Error("SavePreset: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
-	}
-
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: ptzUnsupportedMsg}, nil
 }
 
 func (s *DeviceControlServer) CallPreset(ctx context.Context, req *pb.PresetRequest) (*pb.Status, error) {
 	logger.Info("CallPreset: id=%d", req.PresetId)
 
+	if !s.config.Capabilities.PTZ.Enabled {
+		return &pb.Status{
+			Success: false,
+			Message: "PTZ not enabled",
+		}, nil
+	}
 	if req.PresetId == 0 || req.PresetId > uint32(s.config.Capabilities.PTZ.Presets) {
 		return &pb.Status{
 			Success: false,
@@ -1042,26 +1012,7 @@ func (s *DeviceControlServer) CallPreset(ctx context.Context, req *pb.PresetRequ
 		}, nil
 	}
 
-	if s.cameraDaemonClient != nil {
-		payload := []byte{byte(req.PresetId)}
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd:     0x24, // HOST_LINK_CMD_PTZ_CALL_PRESET
-			Payload: payload,
-		})
-		if err != nil {
-			logger.Error("CallPreset: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
-	}
-
-	s.publishEvent("ptz_preset_reached", map[string]interface{}{
-		"preset_id": req.PresetId,
-	})
-
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: ptzUnsupportedMsg}, nil
 }
 
 // Lens Control
@@ -1828,80 +1779,45 @@ func (s *DeviceControlServer) GetAfMeasurement(ctx context.Context, req *pb.Empt
 }
 
 // GPIO
+//
+// The MCU host-link protocol has no GPIO command. The IDs the original
+// implementation assumed (0x30 GPIO_WRITE / 0x31 GPIO_READ) are actually
+// HOST_LINK_CMD_AIN_GET (0x30) and HOST_LINK_CMD_RESET_SOC (0x31) — see
+// hal_v2/common/host_link/host_link_proto.h. Sending 0x31 power-cycles the
+// whole SoC, which is how a plain GET /device/gpio hard-reset the device
+// (issue #46). Until SoC GPIO is exposed through the HAL IO layer
+// (hal_v2/include/peripheral/hal_io.h, libgpiod), GPIO operations must not
+// touch the MCU link; they report per-op/per-pin failure instead.
+
+const gpioUnsupportedMsg = "GPIO not available: MCU host-link protocol has no GPIO command " +
+	"(0x30/0x31 are AIN_GET/RESET_SOC; sending 0x31 resets the SoC — issue #46)"
 
 func (s *DeviceControlServer) GPIOWrite(ctx context.Context, req *pb.GPIOWriteRequest) (*pb.Status, error) {
 	logger.Debug("GPIOWrite: pin=%d, value=%v", req.Pin, req.Value)
 
-	value := uint8(0)
-	if req.Value {
-		value = 1
-	}
-	payload := []byte{byte(req.Pin), value}
-
-	if s.cameraDaemonClient != nil {
-		resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-			Cmd:     0x30, // HOST_LINK_CMD_GPIO_WRITE
-			Payload: payload,
-		})
-		if err != nil {
-			logger.Error("GPIOWrite: MCU command failed: %v", err)
-			return &pb.Status{Success: false, Message: err.Error()}, nil
-		}
-		if !resp.Success {
-			return &pb.Status{Success: false, Message: resp.Message}, nil
-		}
+	gpio := s.config.Capabilities.GPIO
+	if !gpioPinKnown(gpio.AvailablePins, req.Pin) {
+		logger.Warn("GPIOWrite: pin %d rejected: not in catalog %v", req.Pin, gpio.AvailablePins)
+		return nil, status.Errorf(codes.NotFound, "pin %d is not in the GPIO catalog", req.Pin)
 	}
 
-	s.publishEvent("gpio_change", map[string]interface{}{
-		"pin":   req.Pin,
-		"value": req.Value,
-	})
-
-	return &pb.Status{Success: true}, nil
+	return &pb.Status{Success: false, Message: gpioUnsupportedMsg}, nil
 }
 
-// readGPIOOnce performs a single MCU GPIO read (HOST_LINK_CMD_GPIO_READ=0x31).
-// Failures are encoded in the returned Status (never returned as a Go error) so
-// that one bad pin cannot abort a whole batch read.
-func (s *DeviceControlServer) readGPIOOnce(ctx context.Context, pin uint32) *pb.GPIOReadResponse {
-	if s.cameraDaemonClient == nil {
-		return &pb.GPIOReadResponse{
-			Pin:    pin,
-			Value:  false,
-			Status: &pb.Status{Success: false, Message: "GPIO read not available"},
-		}
-	}
-
-	resp, err := s.cameraDaemonClient.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
-		Cmd:     0x31, // HOST_LINK_CMD_GPIO_READ
-		Payload: []byte{byte(pin)},
-	})
-	if err != nil {
-		logger.Error("GPIO read: MCU command failed for pin %d: %v", pin, err)
-		return &pb.GPIOReadResponse{
-			Pin:    pin,
-			Status: &pb.Status{Success: false, Message: err.Error()},
-		}
-	}
-
-	if resp.Success && len(resp.Payload) > 0 {
-		return &pb.GPIOReadResponse{
-			Pin:    pin,
-			Value:  resp.Payload[0] != 0,
-			Status: &pb.Status{Success: true},
-		}
-	}
-
+// gpioReadUnsupported builds the per-pin response used while GPIO is
+// unavailable on this platform. The failure is carried in the returned Status
+// (never as a Go error) so that one bad pin cannot abort a whole batch read.
+func gpioReadUnsupported(pin uint32) *pb.GPIOReadResponse {
 	return &pb.GPIOReadResponse{
 		Pin:    pin,
 		Value:  false,
-		Status: &pb.Status{Success: false, Message: "GPIO read returned no data"},
+		Status: &pb.Status{Success: false, Message: gpioUnsupportedMsg},
 	}
 }
 
 // gpioPinKnown reports whether pin is listed in the configured GPIO catalog.
-// The MCU GPIO-read command takes a raw pin byte with no catalog awareness,
-// so unknown pins must be rejected here instead of forwarded to the MCU.
+// The catalog is the single source of truth for which pins exist; unknown
+// pins are rejected with codes.NotFound instead of being processed.
 func gpioPinKnown(available []uint32, pin uint32) bool {
 	for _, p := range available {
 		if p == pin {
@@ -1918,13 +1834,15 @@ func (s *DeviceControlServer) GPIORead(ctx context.Context, req *pb.GPIOReadRequ
 		logger.Warn("GPIORead: pin %d rejected: not in catalog %v", req.Pin, gpio.AvailablePins)
 		return nil, status.Errorf(codes.NotFound, "pin %d is not in the GPIO catalog", req.Pin)
 	}
-	return s.readGPIOOnce(ctx, req.Pin), nil
+	return gpioReadUnsupported(req.Pin), nil
 }
 
-// GPIOBatchRead returns the GPIO pin catalog (from config, the single source of
-// truth) plus the live value of each requested pin. MCU GPIO read is a single-pin
-// command (0x31), so batch = server-side loop; each result carries its own Status.
-// Empty req.Pins reads every configured available pin.
+// GPIOBatchRead returns the GPIO pin catalog (from config, the single source
+// of truth) plus a per-pin result for each requested pin. GPIO is currently
+// unavailable at the hardware layer (see gpioUnsupportedMsg), so each
+// cataloged pin carries that failure in its own Status; out-of-catalog pins
+// report a catalog rejection. Empty req.Pins targets every configured
+// available pin.
 func (s *DeviceControlServer) GPIOBatchRead(ctx context.Context, req *pb.GPIOBatchReadRequest) (*pb.GPIOBatchReadResponse, error) {
 	gpio := s.config.Capabilities.GPIO
 
@@ -1945,8 +1863,8 @@ func (s *DeviceControlServer) GPIOBatchRead(ctx context.Context, req *pb.GPIOBat
 
 	results := make([]*pb.GPIOReadResponse, 0, len(target))
 	for _, pin := range target {
-		// Never forward out-of-catalog pins to the MCU: the command takes a
-		// raw pin byte and would address whatever hardware maps there.
+		// Out-of-catalog pins have no meaning on this platform; report them
+		// per-pin so one bad pin cannot abort the batch.
 		if !gpioPinKnown(gpio.AvailablePins, pin) {
 			logger.Warn("GPIOBatchRead: pin %d rejected: not in catalog %v", pin, gpio.AvailablePins)
 			results = append(results, &pb.GPIOReadResponse{
@@ -1956,7 +1874,7 @@ func (s *DeviceControlServer) GPIOBatchRead(ctx context.Context, req *pb.GPIOBat
 			})
 			continue
 		}
-		state := s.readGPIOOnce(ctx, pin)
+		state := gpioReadUnsupported(pin)
 		state.Direction = direction[pin]
 		results = append(results, state)
 	}
