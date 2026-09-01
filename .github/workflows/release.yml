@@ -2,7 +2,7 @@ name: Release Package
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', 'ct-disc-v*']
   workflow_dispatch:
     inputs:
       version:
@@ -25,6 +25,7 @@ concurrency:
 jobs:
   hailo-firmware:
     name: Build Hailo-15 release package
+    if: ${{ !startsWith(github.ref, 'refs/tags/ct-disc-') }}
     runs-on: [self-hosted, linux, x64, docker]
     env:
       DOCKER_RELEASE_IMAGE: zerobot/ne503-dev-env-full:4.0.23
@@ -62,3 +63,73 @@ jobs:
         with:
           generate_release_notes: true
           files: build/release/aipc-hailo15-*.tar.gz
+
+  ct-disc-tools:
+    name: Build ct-disc CLI + GUI tools
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: tools/ct-disc/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: tools/ct-disc/gui/ct-disc-gui/frontend/package-lock.json
+
+      - name: Resolve version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [[ "$GITHUB_REF_NAME" == ct-disc-v* ]]; then
+              VERSION="${GITHUB_REF_NAME#ct-disc-v}"
+            else
+              VERSION="$GITHUB_REF_NAME"
+            fi
+          else
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION:-dev-${GITHUB_SHA:0:7}}"
+          fi
+          echo "CT_DISC_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build CLI (all platforms)
+        run: make -C tools/ct-disc build-all VERSION="$CT_DISC_VERSION"
+
+      - name: Build GUI (windows/amd64)
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          cd tools/ct-disc/gui/ct-disc-gui
+          wails build -platform windows/amd64 -clean -ldflags "-s -w -X main.version=$CT_DISC_VERSION"
+
+      - name: Package and checksums
+        run: |
+          cd tools/ct-disc
+          rm -rf release-stage && mkdir -p release-stage
+          cp gui/ct-disc-gui/build/bin/ct-disc-gui.exe gui/ct-disc-gui/GUI_EXE_USER_GUIDE_EN.md release-stage/
+          (cd release-stage && zip -q "../ct-disc-gui-windows-amd64-v$CT_DISC_VERSION.zip" ct-disc-gui.exe GUI_EXE_USER_GUIDE_EN.md)
+          (cd dist && sha256sum ct-disc-* > ../ct-disc-sha256sums.txt)
+          sha256sum "ct-disc-gui-windows-amd64-v$CT_DISC_VERSION.zip" >> ct-disc-sha256sums.txt
+          cat ct-disc-sha256sums.txt
+
+      - name: Upload ct-disc tools artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-disc-tools
+          if-no-files-found: error
+          path: |
+            tools/ct-disc/dist/ct-disc-*
+            tools/ct-disc/ct-disc-gui-windows-amd64-v*.zip
+            tools/ct-disc/ct-disc-sha256sums.txt
+
+      - name: Publish ct-disc tools to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tools/ct-disc/dist/ct-disc-*
+            tools/ct-disc/ct-disc-gui-windows-amd64-v*.zip
+            tools/ct-disc/ct-disc-sha256sums.txt
