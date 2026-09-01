@@ -5,11 +5,27 @@
 - CLI: command-line scan, listen, record, and MQTT command sending.
 - GUI: a Windows desktop interface for scanning, manually adding devices, batch-recording CPU/memory/disk/NPU data, and viewing trend charts.
 
+## Download
+
+Prebuilt binaries are published on GitHub Releases:
+
+```text
+https://github.com/camthink-ai/neoruntime/releases
+```
+
+Assets per release:
+
+- `ct-disc-gui-windows-amd64-v<version>.zip` — Windows GUI; unzip and double-click `ct-disc-gui.exe`. The zip also contains the GUI user guide (`GUI_EXE_USER_GUIDE_EN.md`).
+- `ct-disc-<os>-<arch>[.exe]` — standalone CLI binaries (linux/darwin/windows, amd64/arm64).
+- `ct-disc-sha256sums.txt` — SHA-256 checksums for all assets above.
+
+Tool-only releases are tagged `ct-disc-v<version>`; full OS release tags (`v<version>`) carry the tools as well. To build from source instead, see [Build](#build).
+
 ## Quick start
 
 ### Windows GUI
 
-Current build output:
+Download `ct-disc-gui-windows-amd64-v<version>.zip` from [Releases](https://github.com/camthink-ai/neoruntime/releases) (see [Download](#download)), unzip it, and double-click `ct-disc-gui.exe`. From-source build output:
 
 ```text
 tools/ct-disc/gui/ct-disc-gui/build/bin/ct-disc-gui.exe
@@ -24,7 +40,7 @@ Once opened, you can:
 
 ### Windows CLI
 
-Current build output:
+Download `ct-disc-windows-amd64.exe` from [Releases](https://github.com/camthink-ai/neoruntime/releases), or build from source:
 
 ```text
 tools/ct-disc/dist/ct-disc-windows-amd64.exe
