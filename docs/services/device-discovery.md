@@ -560,6 +560,8 @@ flowchart TD
 
 ## Desktop Management Tools
 
+Prebuilt binaries (Windows GUI zip, cross-platform CLI, SHA-256 checksums) are published on GitHub Releases: `https://github.com/camthink-ai/neoruntime/releases`. Tool-only releases are tagged `ct-disc-v<version>`; full OS release tags (`v<version>`) carry the tools as well.
+
 ### ct-disc CLI
 
 A command-line tool for device discovery and management from a desktop/laptop:
