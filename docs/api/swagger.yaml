@@ -16,6 +16,13 @@ info:
 
     - Stream (HLS video streaming)
 
+    - Error semantics (all endpoints): validation failures return HTTP 400
+      with envelope {code: 1001, message: "Invalid request", error: {detail}};
+      a missing, invalid or revoked Bearer token returns HTTP 401 with
+      code 2000. Operations below document their success responses; the
+      400/401 error behaviour applies to every write endpoint even where
+      not repeated per-operation.
+
     '
   version: 1.0.1
   contact:
@@ -4825,7 +4832,9 @@ paths:
       tags: [System]
       summary: Get the device RSA public key
       description: PEM public key used by clients to encrypt password payloads for login.
+        No authentication required — this is fetched before a session token exists.
       operationId: getPublicKey
+      security: []
       responses:
         '200':
           description: Public key material
@@ -4854,7 +4863,10 @@ paths:
     get:
       tags: [System]
       summary: Get OTA upgrade status
+      description: Intentionally public (no session auth) so install progress
+        can be polled from a fresh client while an upgrade is in flight.
       operationId: getOTAStatus
+      security: []
       responses:
         '200':
           description: OTA status
@@ -5019,7 +5031,9 @@ paths:
     get:
       tags: [System]
       summary: Get the persistent OS upgrade status and log tail
+      description: Intentionally public (no session auth), same as OTA status.
       operationId: getOSUpgradeStatus
+      security: []
       parameters:
       - in: query
         name: job_id
@@ -5140,6 +5154,9 @@ paths:
                   properties:
                     data:
                       type: object
+        '400':
+          description: 'Invalid or rejected client_timestamp (e.g. zero or
+            far out of range): envelope code 1001, error.detail explains.'
   /system/time:
     get:
       tags: [System]
@@ -5223,6 +5240,10 @@ paths:
                     data:
                       type: object
                       description: Empty data
+        '400':
+          description: 'Timezone not accepted by the device zone list (known
+            device quirk: the value reported by GET may itself be rejected):
+            envelope code 1001, error.detail names the value.'
 
   /system/time/timezone:
     put:
