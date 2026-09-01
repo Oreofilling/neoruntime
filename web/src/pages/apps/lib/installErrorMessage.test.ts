@@ -20,6 +20,12 @@ const t = ((
   if (key === 'sys.apps.import.errors.import_image') {
     return `镜像导入失败：${options?.detail}`;
   }
+  if (key === 'sys.apps.import.errors.invalid_image_tar') {
+    return `镜像文件不合法：${options?.detail}`;
+  }
+  if (key === 'sys.apps.import.upload_errors.image_too_large') {
+    return '镜像文件超过 2GB 上限';
+  }
   if (key === 'sys.apps.import.errors.empty') {
     return options?.defaultValue ?? key;
   }
@@ -62,6 +68,33 @@ describe('translateInstallError', () => {
     expect(
       translateInstallError('Invalid YAML format: yaml: line 2', t)
     ).toContain('Invalid manifest YAML');
+  });
+
+  it('maps upload-time invalid tar rejection', () => {
+    expect(
+      translateInstallError(
+        'Invalid image tar: manifest entry 0: layer "sha256:deadbeef" not found in archive',
+        t
+      )
+    ).toBe('镜像文件不合法：manifest entry 0: layer "sha256:deadbeef" not found in archive');
+  });
+
+  it('maps upload-time size limit rejection', () => {
+    expect(
+      translateInstallError(
+        'Image exceeds the maximum allowed size (2147483648 bytes)',
+        t
+      )
+    ).toBe('镜像文件超过 2GB 上限');
+  });
+
+  it('maps upload-time no-space rejection to no_space', () => {
+    expect(
+      translateInstallError(
+        'No space left for upload: need 5368709120 bytes (with headroom), 1073741824 free',
+        t
+      )
+    ).toContain('Not enough disk space');
   });
 });
 

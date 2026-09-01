@@ -17,6 +17,8 @@ export interface ManifestUploadResult {
   } | null;
   manifest?: AppManifestDTO;
   multi_container?: boolean;
+  /** upload-package only: original app.yaml text inside the .neoapp bundle. */
+  manifest_yaml?: string;
 }
 
 export interface UseManifestYamlOptions {

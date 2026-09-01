@@ -58,7 +58,7 @@ import ResourcesSection from './import/ResourcesSection';
 import ModelsSection from './import/ModelsSection';
 import PermissionsSection from './import/PermissionsSection';
 import AdvancedSection from './import/AdvancedSection';
-import SourceLocalForm from './import/SourceLocalForm';
+import SourceLocalForm, { type LocalUpload } from './import/SourceLocalForm';
 import SectionNav from './import/SectionNav';
 import EditViewSwitch, { type EditView } from './import/EditViewSwitch';
 import {
@@ -123,11 +123,10 @@ export default function ImportAppDialog({
 
   // The old 6-step stepper collapses into three screens.
   const [page, setPage] = useState<'source' | 'form' | 'progress'>('source');
-  const [sourceType, setSourceType] = useState<'registry' | 'local'>(
-    'registry'
-  );
+  // Local upload is the default: on-device installs are usually offline
+  // (.neoapp package / image tar); registry pulls need network access.
+  const [sourceType, setSourceType] = useState<'registry' | 'local'>('local');
   const [config, setConfig] = useState<WizardConfig>({ ...defaultConfig });
-  const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [imageAddressError, setImageAddressError] = useState<string | null>(
     null
@@ -144,7 +143,11 @@ export default function ImportAppDialog({
   } | null>(null);
   const [imageTarPath, setImageTarPath] = useState('');
   const [imageTarName, setImageTarName] = useState('');
-  const [isUploadingManifest, setIsUploadingManifest] = useState(false);
+  // The single upload slot: a .neoapp package (server unpacks it into the two
+  // slots above) or a bare image tar. Drives the slot UI + upload progress.
+  const [localUpload, setLocalUpload] = useState<LocalUpload | null>(null);
+  const [isUploadingLocal, setIsUploadingLocal] = useState(false);
+  const [localProgress, setLocalProgress] = useState(0);
   // the uploaded manifest is multi-container (spec.containers) — the wizard
   // cannot express it, so edits are never written back.
   const [isMultiContainer, setIsMultiContainer] = useState(false);
@@ -275,9 +278,8 @@ export default function ImportAppDialog({
 
   const resetWizardState = () => {
     setPage('source');
-    setSourceType('registry');
+    setSourceType('local');
     setConfig({ ...defaultConfig });
-    setIsUploadingImage(false);
     setTaskId(null);
     setImageAddressError(null);
 
@@ -285,7 +287,9 @@ export default function ImportAppDialog({
     setManifestMeta(null);
     setImageTarPath('');
     setImageTarName('');
-    setIsUploadingManifest(false);
+    setLocalUpload(null);
+    setIsUploadingLocal(false);
+    setLocalProgress(0);
     setIsMultiContainer(false);
     hydratedConfigRef.current = null;
     setActiveSection('basic_info');
@@ -312,16 +316,31 @@ export default function ImportAppDialog({
     cancelRequestedRef.current = true;
 
     // Stop async polling immediately (best effort; backend task may still run)
+    const hadTask = !!taskId;
     setTaskId(null);
 
-    // Cleanup uploaded artifacts (best effort)
-    cleanupUploadedFiles(cleanupPaths);
+    // An install task was started — its manifest/image files may still be
+    // consumed server-side; deleting them here would break the install.
+    // (Closing while a task runs is the same as 后台运行: it keeps the files.)
+    if (!hadTask) cleanupUploadedFiles(cleanupPaths);
 
     // Reset local wizard state and close
     resetWizardState();
     onOpenChange(false);
 
     // Return to apps main page
+    navigate('/apps');
+  };
+
+  /** Progress-page exit: stop polling and close — the install task keeps
+   * running server-side, so the uploaded files stay in place. */
+  const handleRunInBackground = () => {
+    setTaskId(null);
+    resetWizardState();
+    onOpenChange(false);
+    // The list page's cached rows predate the install; refresh them.
+    queryClient.invalidateQueries({ queryKey: ['apps'] });
+    queryClient.invalidateQueries({ queryKey: ['store', 'apps'] });
     navigate('/apps');
   };
 
@@ -367,7 +386,7 @@ export default function ImportAppDialog({
     }
 
     setPage('source');
-    setSourceType('registry');
+    setSourceType('local');
     setConfig({ ...defaultConfig });
     setTaskId(null);
     setImageAddressError(null);
@@ -375,7 +394,9 @@ export default function ImportAppDialog({
     setManifestMeta(null);
     setImageTarPath('');
     setImageTarName('');
-    setIsUploadingManifest(false);
+    setLocalUpload(null);
+    setIsUploadingLocal(false);
+    setLocalProgress(0);
     setIsMultiContainer(false);
     hydratedConfigRef.current = null;
     setActiveSection('basic_info');
@@ -388,30 +409,9 @@ export default function ImportAppDialog({
 
   // ---- Local source handlers (upload side effects stay in the shell) ----
 
-  const handleManifestUpload = async (file: File) => {
-    setIsUploadingManifest(true);
-    try {
-      const res = await appsApi.uploadManifest(file);
-      const data = res?.data;
-      if (data?.path) {
-        // every uploaded version must be tracked for cancel-time cleanup
-        yaml.recordPath(data.path);
-        // A fresh file replaces the form outright (upload semantics — no
-        // form-edit merge), and its text becomes the YAML editor baseline.
-        applyManifestResponse(data, { source: 'upload' });
-        yaml.attachUpload(file);
-      }
-    } catch (err: unknown) {
-      toast.error(
-        resolveInstallApiError(err, t)
-          || t('sys.apps.import.manifest_upload_failed', 'Manifest upload failed')
-      );
-    } finally {
-      setIsUploadingManifest(false);
-    }
-  };
-
-  const handleManifestClear = () => {
+  /** Wipe the manifest-derived wizard state (both slots keep their upload
+   * paths — cleanup is the caller's job). */
+  const clearManifestState = () => {
     setManifestPath('');
     setManifestMeta(null);
     hydratedConfigRef.current = null;
@@ -421,20 +421,121 @@ export default function ImportAppDialog({
     yaml.reset();
   };
 
-  const handleTarUploadSuccess = (path: string, imageName: string) => {
-    if (cancelRequestedRef.current) {
-      cleanupUploadedFiles([path]);
-      return;
+  // ---- single local slot: .neoapp package (server-side unpack fills both
+  // slots) vs bare image tar (the form below generates the manifest) ----
+
+  const handlePackageUpload = async (file: File) => {
+    setIsUploadingLocal(true);
+    setLocalProgress(0);
+    try {
+      const res = await appsApi.uploadPackage(file, p => setLocalProgress(p));
+      const data = res?.data;
+      if (data?.path && data?.image_path) {
+        if (cancelRequestedRef.current) {
+          cleanupUploadedFiles([data.path, data.image_path]);
+          return;
+        }
+        // The package brings both halves — drop a previously uploaded image
+        // tar (manifest versions are tracked by uploadedPathsRef instead).
+        if (imageTarPath) cleanupUploadedFiles([imageTarPath]);
+        yaml.recordPath(data.path);
+        applyManifestResponse(data, { source: 'upload' });
+        // The original yaml text rides along in the response; feeding it
+        // through the File path keeps the YAML editor baseline byte-exact
+        // (comments, key order, unknown fields).
+        yaml.attachUpload(
+          new File([data.manifest_yaml ?? ''], 'app.yaml', {
+            type: 'application/x-yaml',
+          })
+        );
+        setImageTarPath(data.image_path);
+        setImageTarName(data.image || file.name);
+        setLocalUpload({
+          kind: 'package',
+          fileName: data.filename || file.name,
+          size: data.size,
+        });
+      }
+    } catch (err: unknown) {
+      toast.error(
+        resolveInstallApiError(err, t)
+          || t('sys.apps.import.package_upload_failed', 'Package upload failed')
+      );
+    } finally {
+      setIsUploadingLocal(false);
+      setLocalProgress(0);
     }
-    setImageTarPath(path);
-    setImageTarName(imageName);
   };
 
-  const handleTarClear = (path?: string) => {
-    const pathToDelete = path || imageTarPath;
-    if (pathToDelete) cleanupUploadedFiles([pathToDelete]);
-    setImageTarPath('');
-    setImageTarName('');
+  const handleImageUpload = async (file: File) => {
+    setIsUploadingLocal(true);
+    setLocalProgress(0);
+    try {
+      const res = await appsApi.uploadImage(file, p => setLocalProgress(p));
+      const data = res?.data;
+      if (!data?.path) {
+        throw new Error(
+          t('sys.apps.import.upload_no_path', '上传成功但未返回文件路径')
+        );
+      }
+      if (cancelRequestedRef.current) {
+        cleanupUploadedFiles([data.path]);
+        return;
+      }
+      // A bare tar only fills the image half; the manifest comes from the
+      // form (or a later .neoapp upload, which replaces this state outright).
+      setImageTarPath(data.path);
+      setImageTarName(data.image || data.filename || file.name);
+      setLocalUpload({
+        kind: 'image',
+        fileName: data.filename || file.name,
+        size: data.size ?? file.size,
+      });
+    } catch (err: unknown) {
+      toast.error(
+        resolveInstallApiError(err, t)
+          || t('sys.apps.import.image_upload_failed', '镜像上传失败')
+      );
+    } finally {
+      setIsUploadingLocal(false);
+      setLocalProgress(0);
+    }
+  };
+
+  /** Extension routing for the single slot: .neoapp → package unpack,
+   * tar-ish → image only, anything else is rejected outright. */
+  const handleLocalUpload = (file: File) => {
+    const name = file.name.toLowerCase();
+    if (name.endsWith('.neoapp')) return handlePackageUpload(file);
+    if (
+      name.endsWith('.tar')
+      || name.endsWith('.tar.gz')
+      || name.endsWith('.tgz')
+    ) {
+      return handleImageUpload(file);
+    }
+    return toast.error(
+      t(
+        'sys.apps.import.invalid_local_file',
+        '仅支持 .neoapp 应用包或 .tar / .tar.gz / .tgz 镜像'
+      )
+    );
+  };
+
+  /** Clearing the slot: a package clears both halves it unpacked into
+   * (all or nothing); a bare image only clears the image half. */
+  const handleLocalClear = () => {
+    if (localUpload?.kind === 'package') {
+      cleanupUploadedFiles([manifestPath, imageTarPath]);
+      clearManifestState();
+      setImageTarPath('');
+      setImageTarName('');
+    } else {
+      if (imageTarPath) cleanupUploadedFiles([imageTarPath]);
+      setImageTarPath('');
+      setImageTarName('');
+    }
+    setLocalUpload(null);
   };
 
   // ---- Navigation ----
@@ -510,7 +611,7 @@ export default function ImportAppDialog({
       return;
     }
 
-    if (isUploadingImage || isUploadingManifest) {
+    if (isUploadingLocal) {
       toast.error(
         t(
           'sys.apps.import.image_uploading',
@@ -523,7 +624,7 @@ export default function ImportAppDialog({
       toast.error(
         t(
           'sys.apps.import.local_source_required',
-          '请先上传 app.yaml 或镜像 tar 文件'
+          '请先上传 .neoapp 应用包或镜像 tar 文件'
         )
       );
       return;
@@ -706,10 +807,7 @@ export default function ImportAppDialog({
     { id: 'advanced', label: t('sys.apps.import.advanced', 'Advanced Config') },
   ];
 
-  const installDisabled =    installMutation.isPending
-    || isUploadingImage
-    || isUploadingManifest
-    || yaml.isFlushing;
+  const installDisabled =    installMutation.isPending || isUploadingLocal || yaml.isFlushing;
 
   const navHeader = (
     <div className="space-y-3">
@@ -721,8 +819,12 @@ export default function ImportAppDialog({
         </p>
         {sourceType === 'local' && (
           <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {/* Manifest mode = a .neoapp package (or a flushed app.yaml);
+             * show what the user actually uploaded. */}
             {localMode === 'manifest'
-              ? 'app.yaml'
+              ? localUpload?.kind === 'package'
+                ? localUpload.fileName
+                : 'app.yaml'
               : imageTarName || 'image.tar'}
           </p>
         )}
@@ -746,16 +848,6 @@ export default function ImportAppDialog({
             : t('sys.apps.import.manifest_untouched')}
         </div>
       )}
-      <Button
-        variant="carbon"
-        className="w-full"
-        onClick={handleInstall}
-        disabled={installDisabled}
-      >
-        {installMutation.isPending
-          ? t('sys.apps.import.installing', 'Installing…')
-          : t('common.install', 'Install')}
-      </Button>
     </div>
   );
 
@@ -771,6 +863,43 @@ export default function ImportAppDialog({
       </p>
 
       <div className="mb-6 grid grid-cols-1 gap-4 sm:mb-8 sm:grid-cols-2 sm:gap-4">
+        {/* Local upload card first — it is the default source (on-device
+         * installs are usually offline), so reading order matches default. */}
+        <div
+          className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
+            sourceType === 'local'
+              ? 'border-primary bg-primary/5'
+              : 'border-border hover:border-primary/50'
+          }`}
+          onClick={() => {
+            if (sourceType === 'local') return;
+            setSourceType('local');
+            setImageAddressError(null);
+          }}
+        >
+          {sourceType === 'local' && (
+            <div className="absolute top-2 right-2 text-primary">
+              <CheckCircle2
+                className="w-5 h-5"
+                fill="currentColor"
+                stroke="white"
+              />
+            </div>
+          )}
+          <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
+            <UploadCloud className="w-6 h-6" />
+          </div>
+          <h3 className="font-semibold text-foreground mb-1">
+            {t('sys.apps.import.local_title', '本地上传')}
+          </h3>
+          <p className="text-sm text-muted-foreground text-center">
+            {t(
+              'sys.apps.import.local_desc',
+              '上传 .neoapp 应用包或镜像 tar 文件'
+            )}
+          </p>
+        </div>
+
         {/* Registry card */}
         <div
           className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
@@ -803,47 +932,20 @@ export default function ImportAppDialog({
             {t('sys.apps.import.registry_desc')}
           </p>
         </div>
-
-        {/* Local upload card (merges the old upload + package sources) */}
-        <div
-          className={`relative flex cursor-pointer flex-col items-center rounded-xl border-2 p-4 transition-all sm:p-6 ${
-            sourceType === 'local'
-              ? 'border-primary bg-primary/5'
-              : 'border-border hover:border-primary/50'
-          }`}
-          onClick={() => {
-            if (sourceType === 'local') return;
-            setSourceType('local');
-            setImageAddressError(null);
-          }}
-        >
-          {sourceType === 'local' && (
-            <div className="absolute top-2 right-2 text-primary">
-              <CheckCircle2
-                className="w-5 h-5"
-                fill="currentColor"
-                stroke="white"
-              />
-            </div>
-          )}
-          <div className="w-12 h-12 bg-primary rounded-xl flex items-center justify-center text-primary-foreground mb-4">
-            <UploadCloud className="w-6 h-6" />
-          </div>
-          <h3 className="font-semibold text-foreground mb-1">
-            {t('sys.apps.import.local_title', '本地上传')}
-          </h3>
-          <p className="text-sm text-muted-foreground text-center">
-            {t(
-              'sys.apps.import.local_desc',
-              '上传 app.yaml 和/或镜像 tar 文件'
-            )}
-          </p>
-        </div>
       </div>
 
-      {sourceType === 'registry' ? (
-        <div>
-          <Label>
+      {/* Both panels stack in one grid cell; the inactive one keeps its
+       * layout via visibility (not display), so the cell sizes to the
+       * taller panel — switching cards never resizes the dialog and there
+       * is no hand-tuned height constant to drift out of sync. */}
+      <div className="grid">
+        <div
+          className={`col-start-1 row-start-1 ${
+            sourceType === 'registry' ? '' : 'invisible pointer-events-none'
+          }`}
+          aria-hidden={sourceType !== 'registry'}
+        >
+          <Label className="mb-2 block text-base font-semibold">
             {t('sys.apps.import.image_address')}
             <span className="text-red-500 ml-1">*</span>
           </Label>
@@ -854,28 +956,40 @@ export default function ImportAppDialog({
               setConfig({ ...config, image: e.target.value });
               setImageAddressError(null);
             }}
-            className={`mt-2 ${imageAddressError ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
+            className={`${imageAddressError ? 'border-red-500 focus-visible:ring-red-500' : ''}`}
           />
           {imageAddressError && (
             <div className="mt-2 text-sm text-red-500">{imageAddressError}</div>
           )}
+          {/* Same muted-hint idiom as the local panel's mode banner — plain
+           * text, no icon: the card above already carries the Globe. */}
+          <div className="mt-3 rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
+            {t(
+              'sys.apps.import.registry_network_hint',
+              '从注册表拉取镜像需要设备能够访问外网（如 docker.io）；离线设备请改用本地上传'
+            )}
+          </div>
         </div>
-      ) : (
-        <SourceLocalForm
-          manifestPath={manifestPath}
-          manifestMeta={manifestMeta}
-          imageTarPath={imageTarPath}
-          imageTarName={imageTarName}
-          isUploadingManifest={isUploadingManifest}
-          existingAppIds={existingAppIds}
-          localMode={localMode}
-          onManifestUpload={handleManifestUpload}
-          onManifestClear={handleManifestClear}
-          onTarUploadSuccess={handleTarUploadSuccess}
-          onTarUploadingChange={setIsUploadingImage}
-          onTarClear={handleTarClear}
-        />
-      )}
+
+        <div
+          className={`col-start-1 row-start-1 ${
+            sourceType === 'local' ? '' : 'invisible pointer-events-none'
+          }`}
+          aria-hidden={sourceType !== 'local'}
+        >
+          <SourceLocalForm
+            upload={localUpload}
+            isUploading={isUploadingLocal}
+            progress={localProgress}
+            manifestMeta={manifestMeta}
+            imageTarName={imageTarName}
+            existingAppIds={existingAppIds}
+            localMode={localMode}
+            onUpload={handleLocalUpload}
+            onClear={handleLocalClear}
+          />
+        </div>
+      </div>
     </div>
   );
 
@@ -1027,16 +1141,30 @@ export default function ImportAppDialog({
           <p className="text-sm text-muted-foreground mb-6 max-w-md text-center">
             {translateInstallError(progress?.error || progress?.message, t)}
           </p>
-          <Button
-            variant="carbon"
-            onClick={() => {
-              setTaskId(null);
-              setPage('source');
-              installMutation.reset();
-            }}
-          >
-            {t('common.retry', 'Retry')}
-          </Button>
+          <div className="flex items-center justify-center gap-3">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setTaskId(null);
+                installMutation.reset();
+                setPage('form');
+              }}
+            >
+              {t('sys.apps.import.back_to_edit', '返回修改')}
+            </Button>
+            <Button
+              variant="carbon"
+              onClick={() => {
+                // Uploaded files and form state survive the failure —
+                // retry re-runs the install with them unchanged.
+                setTaskId(null);
+                installMutation.reset();
+                handleInstall();
+              }}
+            >
+              {t('common.retry', 'Retry')}
+            </Button>
+          </div>
         </>
       ) : (
         <>
@@ -1129,8 +1257,7 @@ export default function ImportAppDialog({
                 onClick={handleContinue}
                 disabled={
                   !isSourceReady
-                  || isUploadingImage
-                  || isUploadingManifest
+                  || isUploadingLocal
                   || installMutation.isPending
                 }
               >
@@ -1143,23 +1270,42 @@ export default function ImportAppDialog({
 
         {page === 'form' && (
           <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">
+            <div className="flex flex-1 items-center gap-2 sm:flex-none sm:gap-4">
+              <Button
+                variant="outline"
+                className="flex-1 text-muted-foreground hover:text-foreground sm:flex-none"
+                onClick={() => setPage('source')}
+                disabled={installMutation.isPending}
+              >
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                {t('sys.apps.import.back_to_source', '返回来源')}
+              </Button>
+              <Button
+                variant="outline"
+                className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"
+                onClick={handleCancel}
+                disabled={installMutation.isPending}
+              >
+                {t('common.cancel')}
+              </Button>
+            </div>
             <Button
-              variant="outline"
-              className="flex-1 text-muted-foreground hover:text-foreground sm:flex-none"
-              onClick={() => setPage('source')}
-              disabled={installMutation.isPending}
+              variant="carbon"
+              className="flex-1 sm:flex-none"
+              onClick={handleInstall}
+              disabled={installDisabled}
             >
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              {t('sys.apps.import.back_to_source', '返回来源')}
+              {installMutation.isPending
+                ? t('sys.apps.import.installing', 'Installing…')
+                : t('common.install', 'Install')}
             </Button>
+          </div>
+        )}
 
-            <Button
-              variant="outline"
-              className="hidden text-muted-foreground hover:text-foreground sm:inline-flex"
-              onClick={handleCancel}
-              disabled={installMutation.isPending}
-            >
-              {t('common.cancel')}
+        {page === 'progress' && progress?.phase !== 'error' && (
+          <div className="flex flex-row items-center justify-end border-t border-border bg-muted/20 px-4 py-3 sm:px-6 sm:py-4">
+            <Button variant="outline" onClick={handleRunInBackground}>
+              {t('sys.apps.import.run_in_background', '后台运行')}
             </Button>
           </div>
         )}

@@ -2,48 +2,62 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import FileUpload from '@/components/file-upload';
 import { Label } from '@/components/ui/label';
-import { CheckCircle2, Package, X } from 'lucide-react';
+import { CheckCircle2, FileArchive, Package, X } from 'lucide-react';
 import type { LocalMode } from '@/pages/apps/lib/importFlow';
-import ImageUpload from '../ImageUpload';
+
+/** What currently sits in the single local upload slot. */
+export interface LocalUpload {
+  /** .neoapp app package (server unpacks app.yaml + image.tar) or bare image tar. */
+  kind: 'package' | 'image';
+  fileName: string;
+  /** Bytes as reported by the upload response (optional). */
+  size?: number;
+}
 
 export interface SourceLocalFormProps {
-  manifestPath: string;
+  /** Current slot content (null = empty slot). */
+  upload: LocalUpload | null;
+  isUploading: boolean;
+  progress: number;
   manifestMeta: { id: string; name?: string; version?: string } | null;
-  imageTarPath: string;
   imageTarName: string;
-  isUploadingManifest: boolean;
   existingAppIds: Set<string>;
-  /** Which local mode the current uploads resolve to (null = nothing yet). */
+  /** Which local mode the current upload resolves to (null = nothing yet). */
   localMode: LocalMode | null;
-  onManifestUpload: (file: File) => void;
-  /** Also resets hydrate snapshot / multi-container flag in the shell. */
-  onManifestClear: () => void;
-  onTarUploadSuccess: (path: string, name: string, size: number) => void;
-  onTarUploadingChange: (uploading: boolean) => void;
-  onTarClear: (path?: string) => void;
+  /** Shell routes by extension: .neoapp → package unpack, tar → image only. */
+  onUpload: (file: File) => void;
+  /** Clears the slot (and, for a package, both halves it unpacked into). */
+  onClear: () => void;
+}
+
+function formatFileSize(bytes?: number): string {
+  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 /**
- * The expanded panel of the 本地上传 source card: one optional app.yaml
- * slot + one optional image.tar slot. Both upload flows are migrated
- * verbatim from the old upload/package source steps — all upload, cleanup
- * and manifest-hydrate side effects live in the parent via callbacks.
+ * The expanded panel of the 本地上传 source card: ONE upload slot taking
+ * either a .neoapp app package (server-side unpack fills manifest + image) or
+ * a bare image tar (the form below generates the manifest). All upload,
+ * cleanup and manifest-hydrate side effects live in the parent.
  */
 export default function SourceLocalForm({
-  manifestPath,
+  upload,
+  isUploading,
+  progress,
   manifestMeta,
-  imageTarPath,
   imageTarName,
-  isUploadingManifest,
   existingAppIds,
   localMode,
-  onManifestUpload,
-  onManifestClear,
-  onTarUploadSuccess,
-  onTarUploadingChange,
-  onTarClear,
+  onUpload,
+  onClear,
 }: SourceLocalFormProps) {
   const { t } = useTranslation();
+
+  const sizeText = formatFileSize(upload?.size);
 
   return (
     <div className="space-y-6">
@@ -52,96 +66,99 @@ export default function SourceLocalForm({
           {localMode === 'manifest'
             ? t(
                 'sys.apps.import.local_mode_manifest_hint',
-                '已上传 app.yaml：以配置文件为准，可在后续表单中微调'
+                '已上传 .neoapp 包：以包内 app.yaml 为准，可在下方微调'
               )
             : t(
                 'sys.apps.import.local_mode_image_hint',
-                '未上传 app.yaml：由后续表单生成配置文件'
+                '仅上传镜像：由下方表单生成配置文件'
               )}
         </div>
       )}
 
-      {/* Manifest upload (optional) */}
       <div>
         <Label className="text-base font-semibold mb-2 block">
-          {t('sys.apps.import.manifest_file', 'App Manifest (app.yaml)')}
-          <span className="text-xs text-muted-foreground ml-2 font-normal">
-            {t('sys.apps.import.local_manifest_optional', '可选')}
-          </span>
+          {t('sys.apps.import.local_upload_label', '上传应用包 / 镜像')}
         </Label>
-        {manifestPath ? (
+        {upload ? (
           <>
             <div className="flex items-center justify-between gap-2 text-sm border rounded-lg p-3">
               <div className="flex items-center gap-2 min-w-0">
-                <CheckCircle2 className="w-5 h-5 text-green-500 shrink-0" />
-                <span className="font-medium text-foreground truncate">
-                  {manifestMeta?.id || 'app.yaml'}
-                </span>
-                <span className="text-muted-foreground truncate">
-                  {manifestMeta?.name
-                    && `(${manifestMeta.name} v${manifestMeta?.version || '1.0.0'})`}
-                </span>
+                <CheckCircle2
+                  className={`w-5 h-5 shrink-0 ${
+                    upload.kind === 'package'
+                      ? 'text-green-500'
+                      : 'text-muted-foreground'
+                  }`}
+                />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    {upload.kind === 'package' ? (
+                      <FileArchive className="w-4 h-4 text-muted-foreground shrink-0" />
+                    ) : (
+                      <Package className="w-4 h-4 text-muted-foreground shrink-0" />
+                    )}
+                    <span className="font-medium text-foreground truncate">
+                      {upload.fileName}
+                    </span>
+                    {sizeText && (
+                      <span className="text-muted-foreground shrink-0">
+                        · {sizeText}
+                      </span>
+                    )}
+                  </div>
+                  {upload.kind === 'package' ? (
+                    <div className="text-muted-foreground truncate">
+                      {t('sys.apps.import.package_extracted', '已解出')}
+                      {manifestMeta?.id && ` ${manifestMeta.id}`}
+                      {imageTarName && ` · ${imageTarName}`}
+                    </div>
+                  ) : (
+                    <div className="text-muted-foreground truncate">
+                      {imageTarName
+                        || t('sys.apps.import.image_only_hint', '镜像')}
+                    </div>
+                  )}
+                </div>
               </div>
-              <Button variant="ghost" size="sm" onClick={onManifestClear}>
+              <Button variant="ghost" size="sm" onClick={onClear}>
                 <X className="w-4 h-4" />
               </Button>
             </div>
-            {manifestMeta?.id && existingAppIds.has(manifestMeta.id) && (
-              <p className="mt-1 text-sm text-red-500">
-                {t(
-                  'sys.apps.import.duplicate_id_warning',
-                  '此应用ID已存在，安装时将覆盖已有应用'
-                )}
-              </p>
-            )}
+            {upload.kind === 'package'
+              && manifestMeta?.id
+              && existingAppIds.has(manifestMeta.id) && (
+                <p className="mt-1 text-sm text-red-500">
+                  {t(
+                    'sys.apps.import.duplicate_id_warning',
+                    '此应用ID已存在，安装时将覆盖已有应用'
+                  )}
+                </p>
+              )}
           </>
         ) : (
           <FileUpload
             single
-            loading={isUploadingManifest}
+            loading={isUploading}
+            showProgress={isUploading}
+            progress={progress}
             accept={{
-              'application/x-yaml': ['.yaml', '.yml'],
-              'text/yaml': ['.yaml', '.yml'],
-              'text/plain': ['.yaml', '.yml'],
+              'application/gzip': ['.neoapp', '.tar.gz', '.tgz'],
+              'application/x-gzip': ['.neoapp', '.tar.gz', '.tgz'],
+              'application/x-tar': ['.tar'],
             }}
+            maxSize={2 * 1024 * 1024 * 1024}
             placeholder={t(
-              'sys.apps.import.click_upload_manifest',
-              'Click to upload app.yaml'
+              'sys.apps.import.local_upload_placeholder',
+              '点击或拖入 .neoapp 应用包 / .tar 镜像'
+            )}
+            hint={t(
+              'sys.apps.import.local_upload_hint',
+              '.neoapp 自动解出配置与镜像；仅镜像时由表单生成配置。最大 2GB'
             )}
             onUpload={async files => {
               const file = files[0];
-              if (file) onManifestUpload(file);
+              if (file) onUpload(file);
             }}
-          />
-        )}
-      </div>
-
-      {/* Image upload (optional — app.yaml may reference registry image) */}
-      <div>
-        <Label className="text-base font-semibold mb-2 block">
-          {t('sys.apps.import.package_image', 'Container Image')}
-          <span className="text-xs text-muted-foreground ml-2 font-normal">
-            {t(
-              'sys.apps.import.package_image_hint',
-              'Optional if app.yaml uses registry image'
-            )}
-          </span>
-        </Label>
-        {imageTarPath ? (
-          <div className="flex items-center gap-2 text-sm border rounded-lg p-3">
-            <Package className="w-5 h-5 text-muted-foreground" />
-            <span className="font-medium text-foreground">
-              {imageTarName || 'image.tar'}
-            </span>
-            <Button variant="ghost" size="sm" onClick={() => onTarClear()}>
-              <X className="w-4 h-4" />
-            </Button>
-          </div>
-        ) : (
-          <ImageUpload
-            onUploadSuccess={(path, imageName, size) => onTarUploadSuccess(path, imageName, size)}
-            onUploadingChange={onTarUploadingChange}
-            onClear={path => onTarClear(path)}
           />
         )}
       </div>

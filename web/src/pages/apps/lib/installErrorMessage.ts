@@ -27,6 +27,20 @@ const ERROR_MATCHERS: ErrorMatcher[] = [
       }),
   },
   {
+    pattern: /^Invalid image tar:\s*(.+)$/is,
+    translate: (m, t) => t('sys.apps.import.errors.invalid_image_tar', {
+        detail: m[1].trim(),
+        defaultValue:
+          'The image file is not a valid docker-save archive. Export it with docker save and try again. {{detail}}',
+      }),
+  },
+  {
+    pattern: /^Image exceeds the maximum allowed size/i,
+    translate: (_m, t) => t('sys.apps.import.upload_errors.image_too_large', {
+        defaultValue: 'The image file exceeds the 2GB upload limit.',
+      }),
+  },
+  {
     pattern:
       /^Failed to (?:create upload directory|create file|save file|read file):\s*(.+)$/is,
     translate: (m, t) => t('sys.apps.import.upload_errors.save_failed', {

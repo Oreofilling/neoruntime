@@ -331,17 +331,24 @@ export default function ModelsSection({
           type="number"
           min={1}
           max={1000}
-          value={config.permissions?.inference?.max_qps || 10}
-          onChange={e => onChange({
+          value={config.permissions?.inference?.max_qps ?? ''}
+          onChange={e => {
+            // Empty clears the override (backend default applies); typed
+            // values clamp to 1–1000 without snapping back to a default.
+            const n = parseInt(e.target.value, 10);
+            onChange({
               ...config,
               permissions: {
                 ...config.permissions!,
                 inference: {
                   ...config.permissions!.inference!,
-                  max_qps: parseInt(e.target.value, 10) || 10,
+                  max_qps: Number.isNaN(n)
+                    ? undefined
+                    : Math.min(1000, Math.max(1, n)),
                 },
               },
-            })}
+            });
+          }}
           className="mt-2 w-full max-w-48 sm:w-32"
         />
       </div>
