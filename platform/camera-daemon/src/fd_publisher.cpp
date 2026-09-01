@@ -6,6 +6,7 @@
 #include "../include/fd_publisher.h"
 #include "../include/fd_protocol.h"
 #include "../include/frame_router.h"
+#include "../include/dsp_service.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -185,6 +186,10 @@ FdPublisher::Stats FdPublisher::get_stats() const {
     return stats_;
 }
 
+void FdPublisher::set_dsp_service(DspService* dsp_service) {
+    dsp_service_ = dsp_service;
+}
+
 /* ========== Private methods ========== */
 
 void FdPublisher::accept_loop() {
@@ -282,6 +287,30 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_DSP_ALLOC: {
+            if (payload_size != sizeof(FdPubDspAllocMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspAllocMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_alloc(client, buf);
+            break;
+        }
+
+        case FD_PUB_MSG_DSP_BUF_RELEASE: {
+            if (payload_size != sizeof(FdPubDspBufReleaseMsg) - sizeof(hdr)) break;
+
+            char buf[sizeof(FdPubDspBufReleaseMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) break;
+
+            handle_dsp_buf_release(client, buf);
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
             client->subscribed = false;
             HAL_LOG_INFO("FdPublisher: Client fd=%d unsubscribed from %s",
@@ -354,6 +383,72 @@ void FdPublisher::handle_release(ClientState* client, const void* msg_data) {
     }
 }
 
+void FdPublisher::handle_dsp_alloc(ClientState* client, const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspAllocMsg*>(msg_data);
+
+    FdPubDspAllocRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_ALLOC_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::AllocResult r = dsp_service_->alloc_buffers(
+        client->fd, msg->width, msg->height,
+        static_cast<HalPixelFormat>(msg->format), msg->count);
+    resp.code = r.rc;
+
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP alloc fd=%d %ux%u fmt=%u n=%u failed: "
+                        "rc=%d (%s)", client->fd, msg->width, msg->height,
+                        msg->format, msg->count, r.rc, r.message.c_str());
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    // count is capped by the service; ids/fds are 1:1 with count*num_planes
+    uint32_t count = std::min<uint32_t>(
+        static_cast<uint32_t>(r.ids.size()), FD_PUB_DSP_MAX_FDS);
+    int num_fds = std::min<int>(static_cast<int>(r.fds.size()),
+                                FD_PUB_DSP_MAX_FDS);
+
+    resp.count = count;
+    resp.num_planes = r.num_planes;
+    for (uint32_t i = 0; i < HAL_MAX_PLANES; i++) {
+        resp.strides[i] = r.strides[i];
+        resp.sizes[i] = r.sizes[i];
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        resp.buffer_ids[i] = r.ids[i];
+    }
+
+    // fds attached via SCM_RIGHTS in buffer-major order (count * num_planes)
+    if (fd_pub_sendmsg_capped(client->fd, &resp, sizeof(resp),
+                              r.fds.data(), num_fds, FD_PUB_DSP_MAX_FDS) != 0) {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.send_errors++;
+        HAL_LOG_ERROR("FdPublisher: DSP alloc resp send failed for fd=%d",
+                      client->fd);
+    }
+}
+
+void FdPublisher::handle_dsp_buf_release(ClientState* client,
+                                         const void* msg_data) {
+    auto* msg = static_cast<const FdPubDspBufReleaseMsg*>(msg_data);
+
+    if (!dsp_service_) return;
+
+    int rc = dsp_service_->release_buffer(client->fd, msg->buffer_id);
+    if (rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP buf release id=%lu from fd=%d rc=%d",
+                        (unsigned long)msg->buffer_id, client->fd, rc);
+    }
+}
+
 void FdPublisher::disconnect_client(int client_fd) {
     ClientState* client = nullptr;
 
@@ -369,6 +464,12 @@ void FdPublisher::disconnect_client(int client_fd) {
 
     // Release all outstanding frames
     release_all_outstanding(client);
+
+    // Detach every DSP buffer this client owns. Before close(): the fd number
+    // is the registry key and could be reused by a new client after close().
+    if (dsp_service_) {
+        dsp_service_->release_client_buffers(client_fd);
+    }
 
     // Close socket (will unblock recv in client_recv_loop)
     shutdown(client->fd, SHUT_RDWR);

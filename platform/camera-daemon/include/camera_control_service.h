@@ -332,6 +332,14 @@ public:
         const aipc::camera::GetConfigFieldRequest* request,
         aipc::camera::GetConfigFieldResponse* response) override;
 
+    // Synchronous DSP offload job (see docs proposal dsp-offload.md).
+    // Maps proto enums onto DspJobDesc and waits in DspService::submit_job
+    // (bounded by job_timeout_ms — a slow job fails the RPC, it never hangs).
+    grpc::Status SubmitDspJob(
+        grpc::ServerContext* context,
+        const aipc::camera::DspJobRequest* request,
+        aipc::camera::DspJobResponse* response) override;
+
 private:
     CameraDaemon* daemon_;
 };

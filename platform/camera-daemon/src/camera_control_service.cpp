@@ -1,6 +1,7 @@
 #include "camera_control_service.h"
 #include "camera_daemon.h"
 #include "hal_loader.h"
+#include "dsp_service.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1515,5 +1516,92 @@ grpc::Status CameraControlServiceImpl::GetConfigField(
     HAL_LOG_INFO("[CameraControl] GetConfigField: %s -> success=%d value=%s",
                  request->field_path().c_str(), success ? 1 : 0,
                  success ? value.c_str() : "(n/a)");
+    return grpc::Status::OK;
+}
+
+grpc::Status CameraControlServiceImpl::SubmitDspJob(
+    grpc::ServerContext* context,
+    const aipc::camera::DspJobRequest* request,
+    aipc::camera::DspJobResponse* response) {
+
+    if (!daemon_) {
+        response->set_success(false);
+        response->set_message("CameraDaemon not initialized");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
+    }
+
+    DspService* svc = daemon_->dsp_service();
+    if (!svc || !svc->is_running()) {
+        response->set_success(false);
+        response->set_message("DSP offload service unavailable");
+        response->set_error_code(DSP_SVC_ERR_UNAVAILABLE);
+        return grpc::Status::OK;
+    }
+
+    // DspOp is NOT a numeric mirror of HalDspOpType: proto orders RESIZE first
+    // and CONVERT last, HAL puts CONVERT_FORMAT at 0 — explicit switch, no cast.
+    DspJobDesc desc;
+    switch (request->op()) {
+    case aipc::camera::DSP_OP_RESIZE:
+        desc.op = HAL_DSP_OP_RESIZE; break;
+    case aipc::camera::DSP_OP_CROP_AND_RESIZE:
+        desc.op = HAL_DSP_OP_CROP_RESIZE; break;
+    case aipc::camera::DSP_OP_MULTI_CROP_AND_RESIZE:
+        desc.op = HAL_DSP_OP_MULTI_CROP_RESIZE; break;
+    case aipc::camera::DSP_OP_CONVERT_FORMAT:
+        desc.op = HAL_DSP_OP_CONVERT_FORMAT; break;
+    default:
+        response->set_success(false);
+        response->set_message("unknown DspOp " +
+                              std::to_string(static_cast<int>(request->op())));
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return grpc::Status::OK;
+    }
+
+    // Interpolation + scaling mode ARE order-identical 0..3 in proto and HAL.
+    int interp = static_cast<int>(request->interpolation());
+    int scaling = static_cast<int>(request->scaling_mode());
+    if (interp < static_cast<int>(aipc::camera::DSP_INTERP_NEAREST) ||
+        interp > static_cast<int>(aipc::camera::DSP_INTERP_BICUBIC) ||
+        scaling < static_cast<int>(aipc::camera::DSP_SCALING_STRETCH) ||
+        scaling > static_cast<int>(aipc::camera::DSP_SCALING_SCALE_AND_CROP)) {
+        response->set_success(false);
+        response->set_message("DspInterpolation/DspScalingMode out of range");
+        response->set_error_code(DSP_SVC_ERR_INVALID);
+        return grpc::Status::OK;
+    }
+    desc.interpolation = static_cast<HalDspInterpolation>(interp);
+    desc.scaling_mode = static_cast<HalDspScalingMode>(scaling);
+
+    desc.src_id = request->src_buffer_id();
+    for (uint64_t id : request->dst_buffer_ids()) {
+        desc.dst_ids.push_back(id);
+    }
+    for (const auto& r : request->rects()) {
+        DspRect dr;
+        dr.x = r.x();
+        dr.y = r.y();
+        dr.width = r.width();
+        dr.height = r.height();
+        dr.dst_width = r.dst_width();
+        dr.dst_height = r.dst_height();
+        desc.rects.push_back(dr);
+    }
+    desc.priority = (request->priority() == aipc::camera::DSP_PRIORITY_BACKGROUND)
+                        ? DspPriority::Background
+                        : DspPriority::Normal;
+
+    HAL_LOG_INFO("[CameraControl] SubmitDspJob: op=%d src=%lu dsts=%zu rects=%zu",
+                 static_cast<int>(request->op()),
+                 (unsigned long)desc.src_id, desc.dst_ids.size(),
+                 desc.rects.size());
+
+    DspJobResult result = svc->submit_job(desc);
+    bool ok = (result.rc == DSP_SVC_OK);
+    response->set_success(ok);
+    response->set_message(ok && result.message.empty() ? "OK" : result.message);
+    response->set_error_code(result.rc);
+    response->set_elapsed_ms(result.elapsed_ms);
     return grpc::Status::OK;
 }

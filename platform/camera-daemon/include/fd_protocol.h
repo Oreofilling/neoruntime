@@ -16,6 +16,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <string.h>
@@ -26,6 +27,7 @@ extern "C" {
 
 #define FD_PUB_MAX_STREAM_NAME  64
 #define FD_PUB_MAX_FDS          3       /* Max DMA-BUF fds per frame (planes) */
+#define FD_PUB_DSP_MAX_FDS      64      /* Max fds in a DSP alloc response */
 #define FD_PUB_PROTOCOL_VERSION 1
 
 /* ========== Message types ========== */
@@ -36,6 +38,12 @@ typedef enum {
     FD_PUB_MSG_RELEASE      = 4,
     FD_PUB_MSG_OK           = 5,
     FD_PUB_MSG_ERROR        = 6,
+    /* DSP offload buffer plane (PLAT-5): buffers are allocated/freed over
+     * this socket (fds via SCM_RIGHTS) and referenced by id in the
+     * SubmitDspJob gRPC. */
+    FD_PUB_MSG_DSP_ALLOC        = 7,    /* client → server */
+    FD_PUB_MSG_DSP_ALLOC_RESP   = 8,    /* server → client, fds attached */
+    FD_PUB_MSG_DSP_BUF_RELEASE  = 9,    /* client → server */
 } FdPubMsgType;
 
 /* ========== Message header (all messages start with this) ========== */
@@ -78,9 +86,43 @@ typedef struct {
     int32_t code;           /* 0 = success, < 0 = error code */
 } FdPubResponseMsg;
 
-/* ========== Helper: Send message with optional FDs via SCM_RIGHTS ========== */
-static inline int fd_pub_sendmsg(int sock_fd, const void* data, size_t data_len,
-                                  const int* fds, int num_fds) {
+/* ========== Client → Server: DSP buffer allocation request (PLAT-5) ========== */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_ALLOC */
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;        /* HalPixelFormat (NV12=0, RGB24=4, GRAY8=8) */
+    uint32_t count;         /* buffers to allocate; count*num_planes <= 64 */
+} FdPubDspAllocMsg;
+
+/* ========== Server → Client: DSP buffer allocation response ==============
+ * The dma-buf fds are attached via SCM_RIGHTS, buffer-major order
+ * (num_planes fds per buffer, count*num_planes total). Ids are daemon-side
+ * handles passed by value in SubmitDspJob. Strides/sizes are identical for
+ * every buffer in one allocation (same geometry request).
+ * On failure code < 0 and no fds are attached. */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_ALLOC_RESP */
+    int32_t code;           /* 0 = success, < 0 = error code */
+    uint32_t count;         /* number of buffers actually allocated */
+    uint32_t num_planes;
+    uint32_t strides[3];
+    uint32_t sizes[3];
+    uint64_t buffer_ids[FD_PUB_DSP_MAX_FDS];
+} FdPubDspAllocRespMsg;
+
+/* ========== Client → Server: DSP buffer release ========== */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_BUF_RELEASE */
+    uint64_t buffer_id;     /* id from FdPubDspAllocRespMsg */
+} FdPubDspBufReleaseMsg;
+
+/* ========== Helper: Send message with optional FDs via SCM_RIGHTS ==========
+ * General form: the ancillary buffer is sized for `fd_capacity` fds (must
+ * be >= num_fds). Callers passing more than a few fds (e.g. the DSP alloc
+ * response, up to FD_PUB_DSP_MAX_FDS) must heap-allocate via this path. */
+static inline int fd_pub_sendmsg_capped(int sock_fd, const void* data, size_t data_len,
+                                        const int* fds, int num_fds, int fd_capacity) {
     struct msghdr msg;
     struct iovec iov;
     memset(&msg, 0, sizeof(msg));
@@ -90,23 +132,36 @@ static inline int fd_pub_sendmsg(int sock_fd, const void* data, size_t data_len,
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
-    /* Ancillary data for FD passing */
-    char cmsg_buf[CMSG_SPACE(sizeof(int) * FD_PUB_MAX_FDS)];
+    char cmsg_buf_stack[CMSG_SPACE(sizeof(int) * FD_PUB_MAX_FDS)];
+    char* cmsg_buf = cmsg_buf_stack;
+    if (fd_capacity > FD_PUB_MAX_FDS) {
+        cmsg_buf = (char*)calloc(1, CMSG_SPACE(sizeof(int) * (size_t)fd_capacity));
+        if (!cmsg_buf) return -1;
+    }
 
     if (fds && num_fds > 0) {
-        memset(cmsg_buf, 0, sizeof(cmsg_buf));
+        memset(cmsg_buf, 0, CMSG_SPACE(sizeof(int) * (size_t)fd_capacity));
         msg.msg_control = cmsg_buf;
-        msg.msg_controllen = CMSG_SPACE(sizeof(int) * num_fds);
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)num_fds);
 
         struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
-        memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)num_fds);
+        memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * (size_t)num_fds);
     }
 
     ssize_t sent = sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
+    if (cmsg_buf != cmsg_buf_stack) free(cmsg_buf);
     return (sent == (ssize_t)data_len) ? 0 : -1;
+}
+
+/* Original 3-fd form (frames). */
+static inline int fd_pub_sendmsg(int sock_fd, const void* data, size_t data_len,
+                                  const int* fds, int num_fds) {
+    if (num_fds > FD_PUB_MAX_FDS) return -1;
+    return fd_pub_sendmsg_capped(sock_fd, data, data_len, fds, num_fds,
+                                 FD_PUB_MAX_FDS);
 }
 
 /* ========== Helper: Receive message with optional FDs ========== */

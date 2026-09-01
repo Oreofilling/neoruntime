@@ -195,6 +195,7 @@ set(SOURCES
     src/ai_overlay_subscriber.cpp
     src/audio_service.cpp
     src/dpm_worker.cpp
+    src/dsp_service.cpp
     src/autofocus_controller.cpp
     src/illumination_controller.cpp
     src/daynight_policy.cpp

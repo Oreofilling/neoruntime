@@ -25,6 +25,7 @@
 
 struct ManagedFrame;
 class FrameRouter;
+class DspService;
 
 struct FdPublisherConfig {
     std::string sock_path = "/run/aipc/camera.sock";
@@ -65,6 +66,15 @@ public:
     /** Number of FD clients subscribed to a specific stream */
     uint32_t stream_client_count(const std::string& stream_name) const;
 
+    /**
+     * @brief Wire the DSP offload buffer plane into this socket (PLAT-5).
+     *
+     * Must be called before start(). Enables DSP_ALLOC / DSP_BUF_RELEASE
+     * handling on client recv threads and buffer cleanup on disconnect.
+     * The service must outlive this publisher (or be stopped first).
+     */
+    void set_dsp_service(DspService* dsp_service);
+
     struct Stats {
         uint64_t frames_sent = 0;
         uint64_t frames_dropped = 0;     // Client too slow
@@ -89,6 +99,7 @@ private:
 
     FrameRouter*        router_;
     FdPublisherConfig   config_;
+    DspService*         dsp_service_ = nullptr;  // optional; set before start()
 
     // Server
     int                 server_fd_ = -1;
@@ -108,6 +119,10 @@ private:
     void client_recv_loop(ClientState* client);
     void handle_subscribe(ClientState* client, const void* msg_data);
     void handle_release(ClientState* client, const void* msg_data);
+    /* PLAT-5 DSP buffer plane: DSP_ALLOC and DSP_BUF_RELEASE handlers.
+     * Called on the client's recv thread; alloc replies carry fds. */
+    void handle_dsp_alloc(ClientState* client, const void* msg_data);
+    void handle_dsp_buf_release(ClientState* client, const void* msg_data);
     void disconnect_client(int client_fd);
     void release_all_outstanding(ClientState* client);
 
