@@ -1,7 +1,10 @@
 #include "hailo15_dsp_priv.hpp"
 
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 extern "C" {
 
@@ -248,6 +251,13 @@ static int hailo15_dsp_crop_resize_sync(Hailo15DspContext *ctx, const HalDspCrop
 
 static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalDspMultiCropResizeParams *params)
 {
+    /* Reject oversized batches instead of truncating: the vendor header
+     * documents "max 260", but on-device measurement showed larger batches
+     * are silently truncated by the firmware. See HAL_DSP_MULTI_CROP_MAX_OUTPUTS. */
+    if (params->output_count == 0 || params->output_count > HAL_DSP_MULTI_CROP_MAX_OUTPUTS) {
+        return HAL_ERR_INVALID_ARG;
+    }
+
     dsp_multi_crop_resize_params_t m{};
     dsp_image_properties_t src_image{};
     dsp_data_plane_t src_planes[HAL_MAX_PLANES]{};
@@ -256,16 +266,21 @@ static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalD
     m.crop_resize_params_count = params->output_count;
     m.interpolation = hal_interp_to_dsp(params->interpolation);
 
-    dsp_crop_resize_params_t crop_params_storage[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
-    m.crop_resize_params = crop_params_storage;
+    /* Dynamically sized per call: a fixed [DSP_MULTI_RESIZE_OUTPUTS_COUNT]
+     * stack array (7) with an unclamped count made the vendor lib read past
+     * the storage for batches above 7 outputs. */
+    std::vector<dsp_crop_resize_params_t> crop_params(params->output_count);
+    std::vector<dsp_image_properties_t> dst_images(params->output_count);
+    std::vector<dsp_data_plane_t> dst_planes((size_t)params->output_count * HAL_MAX_PLANES);
+    std::vector<dsp_roi_t> crops(params->output_count);
+    m.crop_resize_params = crop_params.data();
 
-    dsp_image_properties_t dst_images[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
-    dsp_data_plane_t dst_planes[DSP_MULTI_RESIZE_OUTPUTS_COUNT][HAL_MAX_PLANES]{};
-    dsp_roi_t crops[DSP_MULTI_RESIZE_OUTPUTS_COUNT]{};
-
-    for (uint32_t i = 0; i < params->output_count && i < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++i) {
+    for (uint32_t i = 0; i < params->output_count; ++i) {
         const HalDspMultiCropOutput *out = &params->outputs[i];
-        dsp_crop_resize_params_t *cp = &crop_params_storage[i];
+        if (!out->dst) {
+            return HAL_ERR_INVALID_ARG;
+        }
+        dsp_crop_resize_params_t *cp = &crop_params[i];
 
         crops[i].start_x = out->crop.start_x;
         crops[i].start_y = out->crop.start_y;
@@ -273,10 +288,9 @@ static int hailo15_dsp_multi_crop_resize_sync(Hailo15DspContext *ctx, const HalD
         crops[i].end_y   = out->crop.end_y;
         cp->crop = &crops[i];
 
-        for (uint32_t j = 0; j < DSP_MULTI_RESIZE_OUTPUTS_COUNT; ++j) {
-            cp->dst[j] = nullptr;
-        }
-        hal_frame_to_dsp_image(out->dst, &dst_images[i], dst_planes[i], HAL_MAX_PLANES);
+        /* cp->dst[] beyond slot 0 stays NULL: the vectors are value-initialized. */
+        hal_frame_to_dsp_image(out->dst, &dst_images[i],
+                               &dst_planes[(size_t)i * HAL_MAX_PLANES], HAL_MAX_PLANES);
         cp->dst[0] = &dst_images[i];
 
         dsp_scaling_properties_t scaling{};
@@ -296,18 +310,24 @@ static int hailo15_dsp_blend_sync(Hailo15DspContext *ctx, const HalDspBlendParam
     dsp_data_plane_t base_planes[HAL_MAX_PLANES]{};
     hal_frame_to_dsp_image(params->base, &base_image, base_planes, HAL_MAX_PLANES);
 
-    static dsp_overlay_properties_t overlays_storage[50];
-    dsp_data_plane_t overlays_planes[50][HAL_MAX_PLANES]{};
-    size_t count = (params->overlay_count > 50) ? 50 : params->overlay_count;
-    for (size_t i = 0; i < count; ++i) {
+    /* Per-call storage: the old static overlays_storage[50] was shared
+     * between the sync entry point and the async worker thread, and silently
+     * clamped overlay_count to 50. */
+    std::vector<dsp_overlay_properties_t> overlays(params->overlay_count);
+    std::vector<dsp_data_plane_t> overlays_planes((size_t)params->overlay_count * HAL_MAX_PLANES);
+    for (uint32_t i = 0; i < params->overlay_count; ++i) {
         HalDspOverlay *src_ov = &params->overlays[i];
-        dsp_overlay_properties_t *dst_ov = &overlays_storage[i];
-        hal_frame_to_dsp_image(src_ov->overlay, &dst_ov->overlay, overlays_planes[i], HAL_MAX_PLANES);
+        if (!src_ov->overlay) {
+            return HAL_ERR_INVALID_ARG;
+        }
+        dsp_overlay_properties_t *dst_ov = &overlays[i];
+        hal_frame_to_dsp_image(src_ov->overlay, &dst_ov->overlay,
+                               &overlays_planes[(size_t)i * HAL_MAX_PLANES], HAL_MAX_PLANES);
         dst_ov->x_offset = src_ov->x_offset;
         dst_ov->y_offset = src_ov->y_offset;
     }
 
-    dsp_status st = dsp_blend(ctx->device, &base_image, overlays_storage, count);
+    dsp_status st = dsp_blend(ctx->device, &base_image, overlays.data(), params->overlay_count);
     return dsp_status_to_hal(st);
 }
 
@@ -499,7 +519,8 @@ static int hailo15_dsp_multi_crop_and_resize(void *dsp_ctx, const HalDspMultiCro
 
 static int hailo15_dsp_blend(void *dsp_ctx, const HalDspBlendParams *params)
 {
-    if (!dsp_ctx || !params || !params->base) {
+    if (!dsp_ctx || !params || !params->base ||
+        (params->overlay_count > 0 && !params->overlays)) {
         return HAL_ERR_INVALID_ARG;
     }
     return hailo15_dsp_blend_sync(static_cast<Hailo15DspContext *>(dsp_ctx), params);
