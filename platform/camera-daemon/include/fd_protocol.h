@@ -44,6 +44,13 @@ typedef enum {
     FD_PUB_MSG_DSP_ALLOC        = 7,    /* client → server */
     FD_PUB_MSG_DSP_ALLOC_RESP   = 8,    /* server → client, fds attached */
     FD_PUB_MSG_DSP_BUF_RELEASE  = 9,    /* client → server */
+    /* Zero-copy source import: the client already holds dma-buf fds (e.g. a
+     * subscribed frame kept alive via FD_PUB_MSG_RELEASE deferral) and hands
+     * them to the daemon instead of copying pixels into a DSP pool buffer.
+     * An import occupies the same id namespace as pool buffers, so the id is
+     * usable as SubmitDspJob src_buffer_id and freed with DSP_BUF_RELEASE. */
+    FD_PUB_MSG_DSP_IMPORT       = 10,   /* client → server, fds attached */
+    FD_PUB_MSG_DSP_IMPORT_RESP  = 11,   /* server → client */
 } FdPubMsgType;
 
 /* ========== Message header (all messages start with this) ========== */
@@ -114,8 +121,31 @@ typedef struct {
 /* ========== Client → Server: DSP buffer release ========== */
 typedef struct {
     FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_BUF_RELEASE */
-    uint64_t buffer_id;     /* id from FdPubDspAllocRespMsg */
+    uint64_t buffer_id;     /* id from FdPubDspAllocRespMsg or IMPORT_RESP */
 } FdPubDspBufReleaseMsg;
+
+/* ========== Client → Server: zero-copy source import ==============
+ * The num_planes dma-buf fds are attached via SCM_RIGHTS. The daemon does
+ * NOT take ownership of the client's fds: it dups them, so the client may
+ * close its copies whenever it likes (the import stays valid on its own
+ * dup). Geometry must describe the actual buffer layout; the daemon only
+ * sanity-checks ranges, not the underlying allocation. */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_IMPORT */
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;        /* HalPixelFormat (NV12=0, RGB24=4, GRAY8=8) */
+    uint32_t num_planes;    /* fds attached; 1..3 */
+    uint32_t strides[3];
+    uint32_t sizes[3];
+} FdPubDspImportMsg;
+
+/* ========== Server → Client: import response ========== */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_IMPORT_RESP */
+    int32_t code;           /* 0 = success, < 0 = error code */
+    uint64_t import_id;     /* valid iff code == 0 */
+} FdPubDspImportRespMsg;
 
 /* ========== Helper: Send message with optional FDs via SCM_RIGHTS ==========
  * General form: the ancillary buffer is sized for `fd_capacity` fds (must

@@ -71,6 +71,10 @@ struct DspServiceConfig {
     /* Registry caps per owning UDS client. 16 MPix ≈ 24 MB NV12. */
     uint32_t max_buffers_per_client = 128;
     uint64_t max_client_pixels = 16777216; /* 16 MPix outstanding */
+    /* Zero-copy source imports (DSP_IMPORT) per client. Imports hold no
+     * daemon pixel budget — the memory is the client's own — but each one
+     * pins a descriptor and dup'd fds, so cap them separately. */
+    uint32_t max_imports_per_client = 64;
 };
 
 /** Job priority. P0 has two levels; platform (daemon-internal) jobs are
@@ -143,6 +147,21 @@ public:
     AllocResult alloc_buffers(int client_fd, uint32_t width, uint32_t height,
                               HalPixelFormat format, uint32_t count);
 
+    struct ImportResult {
+        int rc = DSP_SVC_OK;
+        std::string message;
+        uint64_t id = 0;
+    };
+
+    /** Zero-copy source: register client-supplied dma-buf fds as a job-usable
+     *  buffer. The fds are dup'd (caller keeps ownership of its copies); the
+     *  returned id lives in the same namespace as alloc ids — passable as
+     *  src_buffer_id, freed via release_buffer / release_client_buffers. */
+    ImportResult import_buffer(int client_fd, uint32_t width, uint32_t height,
+                               HalPixelFormat format, uint32_t num_planes,
+                               const uint32_t* strides, const uint32_t* sizes,
+                               const int* fds);
+
     /** Detach one buffer id; HAL buffer freed when the last pin drops. */
     int release_buffer(int client_fd, uint64_t buffer_id);
 
@@ -167,6 +186,7 @@ private:
         HalFrameBuffer* fb = nullptr;
         uint32_t pins = 0;      /* held by queued/running jobs            */
         bool detached = false;  /* removed from registry, pending free    */
+        bool imported = false;  /* DSP_IMPORT descriptor, not a HAL pool buffer */
     };
 
     struct JobItem {
@@ -238,6 +258,7 @@ private:
     std::unordered_map<uint64_t, BufferEntry*> buffers_;
     std::unordered_map<int, uint32_t> client_buffer_count_;
     std::unordered_map<int, uint64_t> client_pixels_;
+    std::unordered_map<int, uint32_t> client_import_count_;
     uint64_t next_buffer_id_ = 1; /* starts at 1; 0 is never a valid id */
 
     // Per-owner token buckets.

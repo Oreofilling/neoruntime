@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <memory>
 #include <utility>
+#include <unistd.h> /* dup, close */
 
 #include "common/hal_log.h"
 
@@ -46,6 +47,28 @@ bool format_supported(HalPixelFormat f) {
  * which lives in hal_v2/common/hal_buffer.c — not linked into the daemon). */
 uint32_t plane_count_of(HalPixelFormat f) {
     return (f == HAL_PIX_FMT_NV12) ? 2 : 1;
+}
+
+/* Minimum sane stride for plane p of a w*h `format` buffer (no padding). */
+uint32_t min_stride_of(HalPixelFormat f, uint32_t w) {
+    if (f == HAL_PIX_FMT_RGB24) return w * 3;
+    return w; /* NV12: Y row and interleaved-UV row are both w bytes */
+}
+
+/* Rows in plane p (NV12 chroma is half height). */
+uint32_t plane_rows_of(HalPixelFormat f, uint32_t h, uint32_t plane) {
+    if (f == HAL_PIX_FMT_NV12 && plane == 1) return h / 2;
+    return h;
+}
+
+/* Imported descriptors are plain daemon-owned allocations, not HAL pool
+ * buffers: releasing one is close(dup'd fds) + delete. They must never
+ * reach fb_ops_->release_frame_buffer. */
+void free_imported_fb(HalFrameBuffer* fb) {
+    if (!fb) return;
+    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p)
+        if (fb->dma_fds[p] >= 0) close(fb->dma_fds[p]);
+    delete fb;
 }
 
 } // namespace
@@ -120,18 +143,22 @@ void DspService::stop() {
     // Free every remaining registered buffer (no pins can exist now).
     {
         std::vector<HalFrameBuffer*> to_free;
+        std::vector<HalFrameBuffer*> imported;
         {
             std::lock_guard<std::mutex> lk(buffers_mu_);
             to_free.reserve(buffers_.size());
             for (auto& kv : buffers_) {
-                to_free.push_back(kv.second->fb);
+                if (kv.second->imported) imported.push_back(kv.second->fb);
+                else to_free.push_back(kv.second->fb);
                 delete kv.second;
             }
             buffers_.clear();
             client_buffer_count_.clear();
             client_pixels_.clear();
+            client_import_count_.clear();
         }
         for (HalFrameBuffer* fb : to_free) fb_ops_->release_frame_buffer(fb);
+        for (HalFrameBuffer* fb : imported) free_imported_fb(fb);
     }
 
     if (dsp_ctx_) {
@@ -279,11 +306,131 @@ DspService::AllocResult DspService::alloc_buffers(int client_fd, uint32_t width,
     return out;
 }
 
+DspService::ImportResult DspService::import_buffer(
+    int client_fd, uint32_t width, uint32_t height, HalPixelFormat format,
+    uint32_t num_planes, const uint32_t* strides, const uint32_t* sizes,
+    const int* fds) {
+    ImportResult out;
+    if (!running_.load() || !fb_ops_) {
+        out.rc = DSP_SVC_ERR_UNAVAILABLE;
+        out.message = "service not running";
+        return out;
+    }
+    if (width < kMinDim || height < kMinDim || width > kMaxDim ||
+        height > kMaxDim) {
+        out.rc = DSP_SVC_ERR_INVALID;
+        out.message = "width/height out of range [16, 8192]";
+        return out;
+    }
+    if (!format_supported(format)) {
+        out.rc = DSP_SVC_ERR_INVALID;
+        out.message = "unsupported format (NV12/RGB24/GRAY8 in P0)";
+        return out;
+    }
+    if (pixels_of(width, height) > cfg_.max_pixels_per_op) {
+        out.rc = DSP_SVC_ERR_INVALID;
+        out.message = "buffer exceeds max_pixels_per_op";
+        return out;
+    }
+    const uint32_t planes = plane_count_of(format);
+    if (num_planes != planes) {
+        out.rc = DSP_SVC_ERR_INVALID;
+        char msg[96];
+        std::snprintf(msg, sizeof(msg),
+                      "num_planes %u does not match format (%u expected)",
+                      num_planes, planes);
+        out.message = msg;
+        return out;
+    }
+    for (uint32_t p = 0; p < planes; ++p) {
+        const uint32_t rows = plane_rows_of(format, height, p);
+        if (strides[p] < min_stride_of(format, width) ||
+            sizes[p] < static_cast<uint64_t>(strides[p]) * rows) {
+            out.rc = DSP_SVC_ERR_INVALID;
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "plane %u geometry implausible (stride %u, size %u)",
+                          p, strides[p], sizes[p]);
+            out.message = msg;
+            return out;
+        }
+    }
+
+    // Dup outside the registry lock (syscalls). The daemon keeps its own fd
+    // copies, so the client may close theirs immediately if it wants.
+    int dup_fds[HAL_MAX_PLANES] = {-1, -1, -1};
+    for (uint32_t p = 0; p < planes; ++p) {
+        dup_fds[p] = dup(fds[p]);
+        if (dup_fds[p] < 0) {
+            for (uint32_t q = 0; q < p; ++q) close(dup_fds[q]);
+            out.rc = DSP_SVC_ERR_NO_MEM;
+            out.message = "dup of client dma-buf fd failed";
+            return out;
+        }
+    }
+
+    // A plain descriptor the DSP HAL reads like any pool buffer: geometry +
+    // fds + strides. hal_frame_to_dsp_image() only consumes these fields
+    // (hailo15_dsp_impl.cpp) — refcounts/priv belong to HAL pool buffers and
+    // are deliberately left zero.
+    HalFrameBuffer* fb = new HalFrameBuffer();
+    fb->width = width;
+    fb->height = height;
+    fb->format = format;
+    fb->mem_type = HAL_MEM_DMABUF;
+    fb->num_planes = planes;
+    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) {
+        fb->dma_fds[p] = (p < planes) ? dup_fds[p] : -1;
+        fb->strides[p] = (p < planes) ? strides[p] : 0;
+        fb->sizes[p] = (p < planes) ? sizes[p] : 0;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(buffers_mu_);
+        uint32_t have = client_import_count_[client_fd];
+        if (have + 1 > cfg_.max_imports_per_client) {
+            free_imported_fb(fb);
+            out.rc = DSP_SVC_ERR_LIMIT;
+            out.message = "per-client import cap exceeded";
+            return out;
+        }
+        client_import_count_[client_fd] = have + 1;
+        auto* e = new BufferEntry();
+        e->id = next_buffer_id_++;
+        e->client_fd = client_fd;
+        e->fb = fb;
+        e->imported = true;
+        buffers_[e->id] = e;
+        out.id = e->id;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(stats_mu_);
+        stats_.buffers_allocated++;
+        stats_.buffers_in_registry++;
+    }
+    return out;
+}
+
 void DspService::detach_entry_locked(BufferEntry* entry,
                                      std::vector<HalFrameBuffer*>& to_free) {
     if (entry->detached) return;
     entry->detached = true;
     buffers_.erase(entry->id);
+    if (entry->imported) {
+        uint32_t n = client_import_count_[entry->client_fd];
+        client_import_count_[entry->client_fd] = (n > 0) ? n - 1 : 0;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            stats_.buffers_released++;
+            if (stats_.buffers_in_registry > 0) stats_.buffers_in_registry--;
+        }
+        if (entry->pins == 0) {
+            free_imported_fb(entry->fb);
+            delete entry;
+        }
+        return;
+    }
     uint32_t n = client_buffer_count_[entry->client_fd];
     client_buffer_count_[entry->client_fd] = (n > 0) ? n - 1 : 0;
     const uint64_t px = client_pixels_[entry->client_fd];
@@ -328,6 +475,7 @@ void DspService::release_client_buffers(int client_fd) {
         }
         client_buffer_count_.erase(client_fd);
         client_pixels_.erase(client_fd);
+        client_import_count_.erase(client_fd);
     }
     for (HalFrameBuffer* fb : to_free) fb_ops_->release_frame_buffer(fb);
     if (!to_free.empty())
@@ -359,7 +507,8 @@ void DspService::unpin_entries(const std::vector<BufferEntry*>& entries) {
         for (BufferEntry* e : entries) {
             if (e->pins > 0) e->pins--;
             if (e->detached && e->pins == 0) {
-                to_free.push_back(e->fb);
+                if (e->imported) free_imported_fb(e->fb);
+                else to_free.push_back(e->fb);
                 delete e;
             }
         }
@@ -444,6 +593,11 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
                 job->pinned.push_back(dst);
                 const HalFrameBuffer* dfb = dst->fb;
 
+                if (dst->imported) {
+                    vrc = DSP_SVC_ERR_INVALID;
+                    why = "imported buffers are source-only (P0)";
+                    break;
+                }
                 if (dfb->format != sfb->format &&
                     job->desc.op != HAL_DSP_OP_CONVERT_FORMAT) {
                     vrc = DSP_SVC_ERR_INVALID;

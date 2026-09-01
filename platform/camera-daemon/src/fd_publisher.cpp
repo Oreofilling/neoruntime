@@ -281,19 +281,47 @@ void FdPublisher::accept_loop() {
 
 void FdPublisher::client_recv_loop(ClientState* client) {
     while (running_.load()) {
-        // Read message header first
+        /* Read message header first — with recvmsg, never plain recv. On a
+         * stream socket SCM_RIGHTS rides with the FIRST byte of the sender's
+         * sendmsg, which is the header: a plain recv consuming that byte
+         * silently drops the ancillary record (the peer's DSP_IMPORT arrives
+         * with fds=0 and the fds leak kernel-side). Every loop iteration
+         * owns whatever lands here — only handle_dsp_import consumes (it
+         * closes them itself); everything else is closed after the switch. */
         FdPubMsgHeader hdr;
-        ssize_t n = recv(client->fd, &hdr, sizeof(hdr), MSG_WAITALL);
-        if (n <= 0) {
+        int msg_fds[FD_PUB_MAX_FDS];
+        int num_msg_fds = 0;
+        size_t hdr_got = 0;
+        bool disconnected = false;
+        while (hdr_got < sizeof(hdr)) {
+            int chunk_fds[FD_PUB_MAX_FDS];
+            int n_chunk_fds = 0;
+            ssize_t n = fd_pub_recvmsg(client->fd, (char*)&hdr + hdr_got,
+                                       sizeof(hdr) - hdr_got, chunk_fds,
+                                       &n_chunk_fds, FD_PUB_MAX_FDS);
+            if (n <= 0) {
+                /* disconnect — we still own fds captured by earlier chunks */
+                for (int i = 0; i < num_msg_fds; ++i) close(msg_fds[i]);
+                num_msg_fds = 0;
+                disconnected = true;
+                break;
+            }
+            for (int i = 0; i < n_chunk_fds; ++i) {
+                if (num_msg_fds < FD_PUB_MAX_FDS) {
+                    msg_fds[num_msg_fds++] = chunk_fds[i];
+                } else {
+                    close(chunk_fds[i]); /* over the wire cap — don't leak */
+                }
+            }
+            hdr_got += (size_t)n;
+        }
+        if (disconnected) {
             // Client disconnected
             break;
         }
 
-        if (n != sizeof(hdr)) {
-            HAL_LOG_WARNING("FdPublisher: Partial header from client fd=%d",
-                           client->fd);
-            break;
-        }
+        bool fds_consumed = false;
+        ssize_t n = 0; /* payload read length for the switch below */
 
         // Read remaining payload
         size_t payload_size = hdr.size - sizeof(hdr);
@@ -351,6 +379,27 @@ void FdPublisher::client_recv_loop(ClientState* client) {
             break;
         }
 
+        case FD_PUB_MSG_DSP_IMPORT: {
+            if (payload_size != sizeof(FdPubDspImportMsg) - sizeof(hdr)) {
+                break; /* fds (if any) are closed after the switch */
+            }
+            /* The dma-buf fds crossed the stream boundary with the header
+             * (captured in msg_fds above); the payload itself carries no
+             * ancillary data — a plain blocking read is enough. */
+            char buf[sizeof(FdPubDspImportMsg)];
+            memcpy(buf, &hdr, sizeof(hdr));
+            n = recv(client->fd, buf + sizeof(hdr), payload_size, MSG_WAITALL);
+            if (n != (ssize_t)payload_size) {
+                HAL_LOG_WARNING("FdPublisher: short DSP IMPORT read from fd=%d",
+                                client->fd);
+                break;
+            }
+
+            handle_dsp_import(client, buf, msg_fds, num_msg_fds);
+            fds_consumed = true; /* handler closes every fd it was given */
+            break;
+        }
+
         case FD_PUB_MSG_UNSUBSCRIBE: {
             // subscribed/stream_name are read on the dispatch thread under
             // clients_mu_ — flip the flag under the same lock.
@@ -378,6 +427,20 @@ void FdPublisher::client_recv_loop(ClientState* client) {
                 recv(client->fd, drain, payload_size, MSG_WAITALL);
             }
             break;
+        }
+
+        /* Ownership fence: fds that arrived with this message but were not
+         * handed to handle_dsp_import (any non-IMPORT message, or an IMPORT
+         * rejected on payload size) are closed here — a received fd belongs
+         * to this process from recvmsg onward, no path may leak it. */
+        if (!fds_consumed) {
+            for (int i = 0; i < num_msg_fds; ++i) close(msg_fds[i]);
+            if (num_msg_fds > 0) {
+                HAL_LOG_WARNING(
+                    "FdPublisher: closed %d unexpected fd(s) on msg type=%u "
+                    "from fd=%d",
+                    num_msg_fds, hdr.type, client->fd);
+            }
         }
     }
 
@@ -498,6 +561,55 @@ void FdPublisher::handle_dsp_buf_release(ClientState* client,
         HAL_LOG_WARNING("FdPublisher: DSP buf release id=%lu from fd=%d rc=%d",
                         (unsigned long)msg->buffer_id, client->fd, rc);
     }
+}
+
+void FdPublisher::handle_dsp_import(ClientState* client, const void* msg_data,
+                                    const int* fds, int num_fds) {
+    auto* msg = static_cast<const FdPubDspImportMsg*>(msg_data);
+
+    FdPubDspImportRespMsg resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = FD_PUB_MSG_DSP_IMPORT_RESP;
+    resp.hdr.size = sizeof(resp);
+
+    /* The received fds are ours the moment recvmsg returned them — every
+     * path below must close them all. import_buffer() dups what it keeps. */
+    auto close_received = [&]() {
+        for (int i = 0; i < num_fds; ++i) close(fds[i]);
+    };
+
+    if (!dsp_service_) {
+        resp.code = DSP_SVC_ERR_UNAVAILABLE;
+        close_received();
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+    if (msg->num_planes == 0 || msg->num_planes > FD_PUB_MAX_FDS ||
+        num_fds != (int)msg->num_planes) {
+        resp.code = DSP_SVC_ERR_INVALID;
+        HAL_LOG_WARNING("FdPublisher: DSP IMPORT fd=%d plane/fd mismatch "
+                        "(planes=%u fds=%d)", client->fd, msg->num_planes,
+                        num_fds);
+        close_received();
+        send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+        return;
+    }
+
+    DspService::ImportResult r = dsp_service_->import_buffer(
+        client->fd, msg->width, msg->height,
+        static_cast<HalPixelFormat>(msg->format), msg->num_planes,
+        msg->strides, msg->sizes, fds);
+    close_received();
+
+    resp.code = r.rc;
+    if (r.rc != DSP_SVC_OK) {
+        HAL_LOG_WARNING("FdPublisher: DSP IMPORT fd=%d %ux%u fmt=%u failed: "
+                        "rc=%d (%s)", client->fd, msg->width, msg->height,
+                        msg->format, r.rc, r.message.c_str());
+    } else {
+        resp.import_id = r.id;
+    }
+    send(client->fd, &resp, sizeof(resp), MSG_NOSIGNAL);
 }
 
 void FdPublisher::disconnect_client(int client_fd) {

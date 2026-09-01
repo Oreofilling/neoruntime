@@ -129,6 +129,10 @@ private:
      * Called on the client's recv thread; alloc replies carry fds. */
     void handle_dsp_alloc(ClientState* client, const void* msg_data);
     void handle_dsp_buf_release(ClientState* client, const void* msg_data);
+    /* Zero-copy source import. fds arrived via SCM_RIGHTS; the handler
+     * closes every received fd (import_buffer dups what it keeps). */
+    void handle_dsp_import(ClientState* client, const void* msg_data,
+                           const int* fds, int num_fds);
     void disconnect_client(int client_fd);
     void release_all_outstanding(ClientState* client);
     /** Remove one outstanding entry (used to undo a tracked-but-unsent frame). */
