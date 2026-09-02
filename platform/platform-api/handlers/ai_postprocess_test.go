@@ -289,6 +289,21 @@ func TestZeroInputTensor(t *testing.T) {
 		t.Fatalf("tensor spec not mirrored: %+v", tensor)
 	}
 
+	// NV12 inputs report an RGB-like shape (features=3) whose product is not
+	// the host frame size — the runtime's byte_size is authoritative there.
+	nv12 := &inferencepb.TensorSpec{
+		Shape:     []int32{1, 384, 640, 3},
+		Dtype:     inferencepb.DataType_UINT8,
+		ByteSize:  384 * 640 * 3 / 2,
+	}
+	tensor, err = zeroInputTensor(nv12)
+	if err != nil {
+		t.Fatalf("zeroInputTensor nv12: %v", err)
+	}
+	if want := 384 * 640 * 3 / 2; len(tensor.Data) != want {
+		t.Fatalf("nv12 data len = %d, want byte_size %d", len(tensor.Data), want)
+	}
+
 	floatSpec := &inferencepb.TensorSpec{Shape: []int32{1, 10}, Dtype: inferencepb.DataType_FLOAT32}
 	tensor, err = zeroInputTensor(floatSpec)
 	if err != nil {

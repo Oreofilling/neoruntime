@@ -184,20 +184,24 @@ func dtypeSize(dt inferencepb.DataType) int {
 	}
 }
 
-// zeroInputTensor mirrors an input TensorSpec into a zero-filled Tensor sized
-// from the spec's own shape and dtype (input layouts vary — NV12 inputs are
-// H*W*1.5 bytes — so the size is derived, never assumed).
+// zeroInputTensor mirrors an input TensorSpec into a zero-filled Tensor. The
+// size comes from the spec's byte_size when the runtime provides it — NV12
+// inputs report an RGB-like shape whose product is not the host frame size
+// (W*H*3/2 is) — falling back to shape × dtype for specs without one.
 func zeroInputTensor(spec *inferencepb.TensorSpec) (*inferencepb.Tensor, error) {
-	elem := dtypeSize(spec.GetDtype())
-	if elem == 0 {
-		return nil, fmt.Errorf("unsupported input dtype %v", spec.GetDtype())
-	}
-	total := elem
-	for _, d := range spec.GetShape() {
-		if d <= 0 {
-			return nil, fmt.Errorf("invalid input shape %v", spec.GetShape())
+	total := int(spec.GetByteSize())
+	if total == 0 {
+		elem := dtypeSize(spec.GetDtype())
+		if elem == 0 {
+			return nil, fmt.Errorf("unsupported input dtype %v", spec.GetDtype())
 		}
-		total *= int(d)
+		total = elem
+		for _, d := range spec.GetShape() {
+			if d <= 0 {
+				return nil, fmt.Errorf("invalid input shape %v", spec.GetShape())
+			}
+			total *= int(d)
+		}
 	}
 	return &inferencepb.Tensor{
 		Shape: spec.GetShape(),
