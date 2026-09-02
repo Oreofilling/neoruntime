@@ -162,18 +162,7 @@ func (h *APIHandlers) ListModels(c *gin.Context) {
 	defer cancel()
 
 	// Collect ai-runtime models (loaded on NPU)
-	runtimeMap := map[string]*inferencepb.ModelInfo{}
-	runtimeOK := false
-	if h.grpcClients.AIRuntime != nil {
-		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
-		resp, err := client.ListModels(ctx, &inferencepb.Empty{})
-		if err == nil {
-			runtimeOK = true
-			for _, m := range resp.Models {
-				runtimeMap[m.ModelId] = m
-			}
-		}
-	}
+	runtimeMap, runtimeOK := h.listRuntimeModels(ctx)
 
 	// Upsert runtime models into DB so platform-api is the single source of truth
 	h.syncRuntimeModelsToDB(ctx, runtimeMap, runtimeOK)
@@ -504,6 +493,16 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 		req.ModelType = resolved
 	}
 
+	// Same custom-variant guardrail as UpdateModel: a stored blob that the
+	// plugin will reject makes the model unloadable from the moment it is
+	// registered, so validate at entry.
+	if model.ResolveModelType(req.ModelType) == "detection" {
+		if err := validateDetectionVariant(req.Variant); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
+			return
+		}
+	}
+
 	if h.aiModelRepo != nil {
 		if existing, _ := h.aiModelRepo.GetByModelID(req.ModelID); existing != nil {
 			Resp(c).FailMsg(CodeInvalidRequest, "Model ID already exists: "+req.ModelID+" (use update instead)")
@@ -622,6 +621,16 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		newModelType = resolved
 	}
 
+	// Custom `{…}` variant JSON is the advanced escape hatch into the vendor
+	// plugin's schema — reject incomplete or unsupported blobs here rather
+	// than at load time, where the plugin answers with a bare "required".
+	if req.Variant != nil && model.ResolveModelType(newModelType) == "detection" {
+		if err := validateDetectionVariant(*req.Variant); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
+			return
+		}
+	}
+
 	// Optional file swap: an empty file_hash is a metadata-only update.
 	newPath, newHash := dbModel.FilePath, dbModel.FileHash
 	fileChanged := false
@@ -639,8 +648,71 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		fileChanged = req.FileHash != dbModel.FileHash
 		newHash = req.FileHash
 	}
+	// Stage the post-update row before deciding on a reload. Detection
+	// tuning (threshold / max_detections / nms_threshold /
+	// postprocess_profile) lives in the merged config and feeds the
+	// composed runtime variant, so config-only edits on a loaded model must
+	// reload too — a bare row update used to leave the NPU serving the old
+	// threshold until someone unloaded by hand.
+	staged := *dbModel
+	staged.FilePath = newPath
+	staged.FileHash = newHash
+	staged.ModelType = newModelType
+	if req.Variant != nil {
+		staged.Variant = *req.Variant
+	}
+	if req.FileSize != nil {
+		staged.FileSize = *req.FileSize
+	}
+	if req.NetworkName != nil {
+		staged.NetworkName = *req.NetworkName
+	}
+	if req.VStreamInfo != nil {
+		staged.VStreamInfo = *req.VStreamInfo
+	}
+	if req.InputWidth != nil {
+		staged.InputWidth = *req.InputWidth
+	}
+	if req.InputHeight != nil {
+		staged.InputHeight = *req.InputHeight
+	}
+	if req.Config != nil {
+		merged := make(map[string]interface{})
+		for k, v := range model.GetFieldDefaults(newModelType) {
+			merged[k] = v
+		}
+		for k, v := range req.Config {
+			merged[k] = v
+		}
+		configJSON, _ := json.Marshal(merged)
+		staged.Config = string(configJSON)
+
+		var threshold float32
+		if v, ok := merged["threshold"].(float64); ok {
+			threshold = float32(v)
+		}
+		var maxDet int
+		if v, ok := merged["max_detections"].(float64); ok {
+			maxDet = int(v)
+		}
+		staged.Threshold = threshold
+		staged.MaxDetections = maxDet
+	}
+
+	// Reload when anything the runtime consumes changes: the file, the
+	// type, or the variant the runtime would receive. detectionVariantJSON
+	// is side-effect-free (the materialized runtime path is only touched on
+	// an actual reload), so comparing it here cannot leave stray runtime/
+	// copies behind for models that stay put. Advanced `{…}` variants pass
+	// through verbatim, so for those the config-vs-JSON split is explicit:
+	// no variant change, no reload.
+	oldVariant, newVariant := dbModel.Variant, staged.Variant
+	if model.ResolveModelType(newModelType) == "detection" {
+		oldVariant = detectionVariantJSON(dbModel)
+		newVariant = detectionVariantJSON(&staged)
+	}
 	needsReload := fileChanged || newModelType != dbModel.ModelType ||
-		(req.Variant != nil && *req.Variant != dbModel.Variant)
+		newVariant != oldVariant
 	wasLoaded := dbModel.Status == "loaded"
 
 	// A loaded model whose runtime view changes must be unloaded first so
@@ -655,49 +727,9 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		}
 	}
 
-	dbModel.FilePath = newPath
-	dbModel.FileHash = newHash
-	dbModel.ModelType = newModelType
-	if req.Variant != nil {
-		dbModel.Variant = *req.Variant
-	}
-	if req.FileSize != nil {
-		dbModel.FileSize = *req.FileSize
-	}
-	if req.NetworkName != nil {
-		dbModel.NetworkName = *req.NetworkName
-	}
-	if req.VStreamInfo != nil {
-		dbModel.VStreamInfo = *req.VStreamInfo
-	}
-	if req.InputWidth != nil {
-		dbModel.InputWidth = *req.InputWidth
-	}
-	if req.InputHeight != nil {
-		dbModel.InputHeight = *req.InputHeight
-	}
-	if req.Config != nil {
-		merged := make(map[string]interface{})
-		for k, v := range model.GetFieldDefaults(newModelType) {
-			merged[k] = v
-		}
-		for k, v := range req.Config {
-			merged[k] = v
-		}
-		configJSON, _ := json.Marshal(merged)
-		dbModel.Config = string(configJSON)
-
-		var threshold float32
-		if v, ok := merged["threshold"].(float64); ok {
-			threshold = float32(v)
-		}
-		var maxDet int
-		if v, ok := merged["max_detections"].(float64); ok {
-			maxDet = int(v)
-		}
-		dbModel.Threshold = threshold
-		dbModel.MaxDetections = maxDet
-	}
+	// Commit the staged row — fields were staged above so the reload
+	// decision could compare against the post-update view.
+	*dbModel = staged
 
 	if wasLoaded && needsReload {
 		dbModel.Status = "uploaded"
@@ -713,14 +745,36 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		resp, loadErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-			ModelPath:    dbModel.FilePath,
-			ModelId:      dbModel.ModelID,
-			ModelType:    dbModel.ModelType,
-			ModelVariant: dbModel.Variant,
-		})
-		if loadErr == nil && resp.Status != nil && !resp.Status.Success {
-			loadErr = fmt.Errorf("%s", resp.Status.Message)
+		runtimePath, runtimeVariant, pathErr := runtimeRegistration(dbModel)
+		var loadErr error
+		if pathErr != nil {
+			loadErr = pathErr
+		} else {
+			resp, regErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+				ModelPath:    runtimePath,
+				ModelId:      dbModel.ModelID,
+				ModelType:    dbModel.ModelType,
+				ModelVariant: runtimeVariant,
+			})
+			loadErr = regErr
+			if loadErr == nil && resp.Status != nil && !resp.Status.Success {
+				loadErr = fmt.Errorf("%s", resp.Status.Message)
+			}
+			if loadErr == nil && model.ResolveModelType(dbModel.ModelType) == "detection" {
+				// Same load-time probe as LoadModel: catch broken postprocess
+				// before the swapped model enters service.
+				info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID})
+				if infoErr != nil {
+					info = nil
+				}
+				if smokeErr := runLoadSmokeTest(ctx, client, dbModel.ModelID, info); smokeErr != nil {
+					loadErr = smokeErr
+					// Roll back so runtime and DB agree on "not loaded".
+					if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
+						logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
+					}
+				}
+			}
 		}
 		if loadErr != nil {
 			// The row already reflects the new file as uploaded — report the
@@ -896,6 +950,65 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 	}
 }
 
+// runtimeHasModel reports whether the runtime currently serves modelID.
+// checked is false when the runtime was unreachable — callers must keep
+// their unreachable-path behavior instead of guessing from a missing entry.
+func runtimeHasModel(ctx context.Context, client inferencepb.InferenceServiceClient, modelID string) (present, checked bool) {
+	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+	if err != nil {
+		return false, false
+	}
+	for _, m := range resp.Models {
+		if m.ModelId == modelID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// listRuntimeModels snapshots the runtime's model table. ok is false when
+// the runtime is unreachable, so reconciliation passes can distinguish
+// "empty" from "unknown".
+func (h *APIHandlers) listRuntimeModels(ctx context.Context) (map[string]*inferencepb.ModelInfo, bool) {
+	if h.grpcClients.AIRuntime == nil {
+		return nil, false
+	}
+	client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
+	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+	if err != nil {
+		return nil, false
+	}
+	models := make(map[string]*inferencepb.ModelInfo, len(resp.Models))
+	for _, m := range resp.Models {
+		models[m.ModelId] = m
+	}
+	return models, true
+}
+
+// ReconcileRuntimeModels syncs DB model rows with the live runtime state.
+// Exported for server bootstrap: one pass at startup (retrying briefly
+// while ai-runtime may still be coming up) heals rows left stale by a solo
+// ai-runtime restart, without waiting for someone to open the models page.
+func (h *APIHandlers) ReconcileRuntimeModels() {
+	if h.grpcClients.AIRuntime == nil || h.aiModelRepo == nil {
+		return
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		runtimeMap, ok := h.listRuntimeModels(ctx)
+		cancel()
+		if !ok {
+			continue
+		}
+		h.syncRuntimeModelsToDB(context.Background(), runtimeMap, true)
+		return
+	}
+	logger.Warn("ReconcileRuntimeModels: ai-runtime unreachable, skipping startup reconciliation")
+}
+
 // LoadModel loads an uploaded model to NPU via ai-runtime.
 func (h *APIHandlers) LoadModel(c *gin.Context) {
 	if h.grpcClients.AIRuntime == nil {
@@ -920,20 +1033,58 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 		return
 	}
 
-	if dbModel.Status == "loaded" {
-		Resp(c).FailMsg(CodeInvalidRequest, "Model is already loaded")
-		return
-	}
-
 	client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Trust the runtime, not the DB row: after a solo ai-runtime restart
+	// the row can still read "loaded" while the NPU no longer holds the
+	// model. Rejecting on the stale row would deadlock it — UnloadModel
+	// refuses the same row because it checks the runtime first.
+	inRuntime, runtimeChecked := runtimeHasModel(ctx, client, modelID)
+	if inRuntime {
+		if dbModel.Status != "loaded" {
+			dbModel.Status = "loaded"
+			dbModel.DesiredState = "loaded"
+			if err := h.aiModelRepo.Update(dbModel); err != nil {
+				logger.Warn("Failed to heal status of runtime-loaded model %s: %v", modelID, err)
+			}
+		}
+		Resp(c).FailMsg(CodeInvalidRequest, "Model is already loaded")
+		return
+	}
+	if dbModel.Status == "loaded" {
+		if !runtimeChecked {
+			// Runtime unreachable — keep the old DB-only rejection rather
+			// than healing against a guess.
+			Resp(c).FailMsg(CodeInvalidRequest, "Model is already loaded")
+			return
+		}
+		// Stale "loaded": the runtime lost the model. Heal the row so the
+		// registration below can proceed instead of deadlocking.
+		dbModel.Status = "uploaded"
+		if err := h.aiModelRepo.Update(dbModel); err != nil {
+			logger.Warn("Failed to heal stale loaded status for %s: %v", modelID, err)
+		} else {
+			logger.Info("Healed stale loaded status for %s (model missing from runtime), reloading", modelID)
+		}
+	}
+
+	// Wizard-imported detection models live under sha256 blob names the
+	// postprocess plugin cannot match; runtimeRegistration materializes them
+	// under a recognized basename and composes a schema-valid variant that
+	// carries the stored threshold / max_detections to the runtime.
+	runtimePath, runtimeVariant, pathErr := runtimeRegistration(dbModel)
+	if pathErr != nil {
+		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to prepare model for runtime: "+pathErr.Error())
+		return
+	}
+
 	resp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-		ModelPath:    dbModel.FilePath,
+		ModelPath:    runtimePath,
 		ModelId:      dbModel.ModelID,
 		ModelType:    dbModel.ModelType,
-		ModelVariant: dbModel.Variant,
+		ModelVariant: runtimeVariant,
 	})
 	if err != nil {
 		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to load model on NPU: "+err.Error())
@@ -946,30 +1097,49 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 	}
 
 	// Update input dimensions from live model info
-	if resp.ModelId != "" {
-		modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
-			ModelId: resp.ModelId,
-		})
-		if infoErr == nil && modelInfo != nil && len(modelInfo.Inputs) > 0 {
-			input := modelInfo.Inputs[0]
-			layout := input.GetLayout()
-			switch layout {
-			case "NHWC":
-				if len(input.Shape) >= 4 {
-					dbModel.InputHeight = int(input.Shape[1])
-					dbModel.InputWidth = int(input.Shape[2])
-				}
-			case "NCHW":
-				if len(input.Shape) >= 4 {
-					dbModel.InputHeight = int(input.Shape[2])
-					dbModel.InputWidth = int(input.Shape[3])
-				}
-			default:
-				if len(input.Shape) >= 3 {
-					dbModel.InputHeight = int(input.Shape[0])
-					dbModel.InputWidth = int(input.Shape[1])
-				}
+	var modelInfo *inferencepb.ModelInfo
+	infoModelID := resp.ModelId
+	if infoModelID == "" {
+		infoModelID = dbModel.ModelID
+	}
+	modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
+		ModelId: infoModelID,
+	})
+	if infoErr != nil {
+		modelInfo = nil
+	}
+	if modelInfo != nil && len(modelInfo.Inputs) > 0 {
+		input := modelInfo.Inputs[0]
+		layout := input.GetLayout()
+		switch layout {
+		case "NHWC":
+			if len(input.Shape) >= 4 {
+				dbModel.InputHeight = int(input.Shape[1])
+				dbModel.InputWidth = int(input.Shape[2])
 			}
+		case "NCHW":
+			if len(input.Shape) >= 4 {
+				dbModel.InputHeight = int(input.Shape[2])
+				dbModel.InputWidth = int(input.Shape[3])
+			}
+		default:
+			if len(input.Shape) >= 3 {
+				dbModel.InputHeight = int(input.Shape[0])
+				dbModel.InputWidth = int(input.Shape[1])
+			}
+		}
+	}
+
+	// Postprocess failures only surface at infer time — probe the freshly
+	// loaded model once so a broken registration can be rolled back here
+	// instead of failing on every frame later.
+	if model.ResolveModelType(dbModel.ModelType) == "detection" {
+		if smokeErr := runLoadSmokeTest(ctx, client, dbModel.ModelID, modelInfo); smokeErr != nil {
+			if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
+				logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
+			}
+			Resp(c).FailMsg(CodeModelLoadFailed, "postprocess smoke test failed: "+smokeErr.Error())
+			return
 		}
 	}
 
@@ -1022,17 +1192,22 @@ func (h *APIHandlers) UnloadModel(c *gin.Context) {
 	// Check if model is actually loaded on NPU — use runtime state, not DB.
 	// DB status may be stale (e.g. model re-registered by app after eviction).
 	client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
-	isLoadedOnNPU := false
-	listResp, listErr := client.ListModels(ctx, &inferencepb.Empty{})
-	if listErr == nil {
-		for _, m := range listResp.Models {
-			if m.ModelId == modelID {
-				isLoadedOnNPU = true
-				break
+	isLoadedOnNPU, runtimeChecked := runtimeHasModel(ctx, client, modelID)
+	if !isLoadedOnNPU {
+		// Heal a stale row on the way out: DB "loaded" + runtime missing is
+		// the deadlock twin of LoadModel's stale rejection. The response is
+		// unchanged (idempotent unload semantics), and healing only runs
+		// when the runtime was actually reachable so a transient gRPC
+		// outage cannot demote a model that is still serving.
+		if runtimeChecked && dbModel != nil && dbModel.Status == "loaded" {
+			dbModel.Status = "uploaded"
+			dbModel.DesiredState = "unloaded"
+			if err := h.aiModelRepo.Update(dbModel); err != nil {
+				logger.Warn("Failed to heal stale loaded status for %s: %v", modelID, err)
+			} else {
+				logger.Info("Healed stale loaded status for %s (model missing from runtime)", modelID)
 			}
 		}
-	}
-	if !isLoadedOnNPU {
 		Resp(c).FailMsg(CodeInvalidRequest, "Model is not loaded")
 		return
 	}
@@ -1053,16 +1228,7 @@ func (h *APIHandlers) UnloadModel(c *gin.Context) {
 	// If gRPC call failed or returned failure, check if model is actually
 	// still in runtime memory — it may have been lost after a restart.
 	if err != nil || (resp != nil && !resp.Success) {
-		stillLoaded := false
-		listResp, listErr := client.ListModels(ctx, &inferencepb.Empty{})
-		if listErr == nil {
-			for _, m := range listResp.Models {
-				if m.ModelId == modelID {
-					stillLoaded = true
-					break
-				}
-			}
-		}
+		stillLoaded, _ := runtimeHasModel(ctx, client, modelID)
 		if stillLoaded {
 			msg := "Failed to unload model from runtime"
 			if resp != nil {
@@ -1120,6 +1286,9 @@ func (h *APIHandlers) UnregisterModel(c *gin.Context) {
 			}
 			// Delete DB record first so ref-count excludes this entry
 			h.aiModelRepo.DeleteByModelID(modelID)
+			// Drop the materialized runtime copy, if this model had one
+			// (blob ref-count below is unaffected — hardlinks share the inode).
+			removeRuntimeCopy(modelID)
 
 			// Only delete the blob file when no other model references the same hash
 			if dbModel.FileHash != "" && h.modelStore != nil {

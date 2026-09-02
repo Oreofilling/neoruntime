@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check } from 'lucide-react';
+import type { TFunction } from 'i18next';
+import {
+  Check,
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  Info,
+  Settings2,
+} from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import {
   useCapabilities,
@@ -23,6 +31,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
+import { Textarea } from '@/components/ui/textarea';
 import FileUpload from '@/components/file-upload';
 import {
   Dialog,
@@ -93,6 +102,86 @@ function sanitizeModelId(name: string): string {
     .replace(/^_|_$/g, '');
 }
 
+/** Plugin schema keys a custom `{…}` variant must carry — mirrors the
+ *  backend guard so a broken blob is caught before the request leaves. */
+const CUSTOM_VARIANT_KEYS = [
+  'backend_function',
+  'iou_threshold',
+  'detection_threshold',
+  'output_activation',
+  'label_offset',
+  'max_boxes',
+  'labels',
+];
+
+/** Verified postprocess functions. Generic single-argument ones hardcode a
+ *  0.4 threshold and COCO labels, so the UI steers users away from them. */
+const SUPPORTED_BACKEND_FUNCTIONS = [
+  'hailo_yolov8n',
+  'hailo_yolov8s',
+  'hailo_yolov8m',
+];
+
+type VariantIssue =
+  | { kind: 'invalid-json' }
+  | { kind: 'missing-keys'; keys: string[] }
+  | { kind: 'unsupported-function'; fn: string };
+
+/** Validate a custom variant blob client-side. Plain (non-JSON) variants
+ *  keep their existing passthrough handling and always return null. */
+function checkCustomVariant(variant: string): VariantIssue | null {
+  const trimmed = variant.trim();
+  if (!trimmed.startsWith('{')) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return { kind: 'invalid-json' };
+  }
+  const missing = CUSTOM_VARIANT_KEYS.filter(k => !(k in parsed));
+  if (missing.length > 0) {
+    return { kind: 'missing-keys', keys: missing };
+  }
+  const fn = parsed.backend_function;
+  if (
+    typeof fn !== 'string'
+    || !SUPPORTED_BACKEND_FUNCTIONS.includes(fn)
+  ) {
+    return { kind: 'unsupported-function', fn: typeof fn === 'string' ? fn : String(fn) };
+  }
+  return null;
+}
+
+/** Postprocess profile basename → plugin backend function. */
+function backendFunctionForProfile(profile: string): string {
+  if (profile.includes('yolov8s')) return 'hailo_yolov8s';
+  if (profile.includes('yolov8m')) return 'hailo_yolov8m';
+  return 'hailo_yolov8n';
+}
+
+/** Map a variant check to user-facing text — shared by the live error display
+ *  below the textarea and the submit-time validation. */
+function variantIssueText(issue: VariantIssue, t: TFunction): string {
+  switch (issue.kind) {
+    case 'invalid-json':
+      return t('sys.ai_models.form.variant_invalid_json', 'Variant is not valid JSON');
+    case 'missing-keys':
+      return t(
+        'sys.ai_models.form.variant_missing_keys',
+        'Variant JSON is missing required key(s): {{keys}}',
+        { keys: issue.keys.join(', ') }
+      );
+    case 'unsupported-function':
+      return t(
+        'sys.ai_models.form.variant_function_unsupported',
+        'backend_function must be one of: {{fns}}',
+        { fns: SUPPORTED_BACKEND_FUNCTIONS.join(', ') }
+      );
+    default:
+      return '';
+  }
+}
+
 function fieldDefaultToState(fields: ModelFieldDef[]): Record<string, unknown> {
   const config: Record<string, unknown> = {};
   for (const f of fields) {
@@ -124,6 +213,14 @@ export default function ImportModelDialog({
   const [form, setForm] = useState<FormState>(initialFormState);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [touched, setTouched] = useState<Record<string, boolean>>({});
+  // Advanced section (custom variant JSON) — collapsed unless the model
+  // already carries a JSON variant worth editing.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Importing a detection HEF without the NMS output layer requires an
+  // explicit acknowledgement, not just a dismissible warning.
+  const [nmsAck, setNmsAck] = useState(false);
+  // Update mode: profile as loaded, to hint when the selection changes.
+  const initialProfileRef = useRef<string | null>(null);
 
   const { data: capabilities } = useCapabilities();
   const { data: existingModels = [], isSuccess: modelsReady } = useModels();
@@ -215,10 +312,17 @@ export default function ImportModelDialog({
     setParseResult(null);
     setErrors({});
     setTouched({});
+    setNmsAck(false);
+    const prefilledVariant = model.variant ?? '';
+    setAdvancedOpen(prefilledVariant.trim().startsWith('{'));
+    const initialProfile = typeof config.postprocess_profile === 'string'
+      ? config.postprocess_profile
+      : null;
+    initialProfileRef.current = initialProfile;
     setForm({
       modelId: model.model_id,
       modelType: model.model_type ?? '',
-      variant: model.variant ?? '',
+      variant: prefilledVariant,
       config,
     });
   }, [open, isUpdate, model, modelTypeOptions]);
@@ -250,6 +354,7 @@ export default function ImportModelDialog({
           return;
         }
         setParseResult(result);
+        setNmsAck(false);
 
         const suggestedType = result.suggested_type || '';
         const typeOpt = modelTypeOptions.find(o => o.value === suggestedType);
@@ -303,6 +408,19 @@ export default function ImportModelDialog({
       );
     }
     if (!form.modelType) newErrors.modelType = t('sys.ai_models.form.required');
+
+    // Custom variant JSON must clear the same bar the backend enforces.
+    const variantIssue = checkCustomVariant(form.variant);
+    if (variantIssue) newErrors.variant = variantIssueText(variantIssue, t);
+
+    // Importing a detection HEF without the NMS output layer needs explicit
+    // consent — the warning alone is too easy to scroll past.
+    if (nmsIncompatible && !nmsAck) {
+      newErrors.nmsAck = t(
+        'sys.ai_models.wizard.nms_ack_required',
+        'Please confirm the NMS compatibility warning to continue'
+      );
+    }
 
     // Validate dynamic fields
     for (const f of currentFields) {
@@ -393,10 +511,54 @@ export default function ImportModelDialog({
     }
   };
 
+  const toggleNmsAck = (checked: boolean) => {
+    setNmsAck(checked);
+    if (checked && touched.nmsAck) {
+      setErrors(prev => {
+        const next = { ...prev };
+        delete next.nmsAck;
+        return next;
+      });
+    }
+  };
+
+  // Seed the variant textarea with a schema-complete blob composed from the
+  // visible form values, so the escape hatch starts from something the
+  // postprocess plugin actually accepts.
+  const insertVariantTemplate = () => {
+    const profile = typeof form.config.postprocess_profile === 'string'
+      ? form.config.postprocess_profile
+      : 'hailo_yolov8n_384_640';
+    const num = (v: unknown, fallback: number) => (
+      typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback
+    );
+    const rawLabels = typeof form.config.labels === 'string'
+      ? form.config.labels
+      : '';
+    const labels = rawLabels
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => s !== '');
+    const template = {
+      backend_function: backendFunctionForProfile(profile),
+      iou_threshold: num(form.config.nms_threshold, 0.45),
+      detection_threshold: num(form.config.threshold, 0.25),
+      output_activation: 'none',
+      label_offset: 1,
+      max_boxes: num(form.config.max_detections, 64),
+      // Index 0 is a placeholder so labels[N] names class_id N.
+      labels: ['unlabeled', ...labels],
+    };
+    setForm(prev => ({ ...prev, variant: JSON.stringify(template, null, 2) }));
+    setAdvancedOpen(true);
+  };
+
   const handleRegister = () => {
     const newTouched: Record<string, boolean> = {
       modelId: true,
       modelType: true,
+      variant: true,
+      ...(nmsIncompatible ? { nmsAck: true } : {}),
     };
     for (const f of currentFields) {
       newTouched[`config_${f.key}`] = true;
@@ -493,6 +655,9 @@ export default function ImportModelDialog({
     setForm(initialFormState);
     setErrors({});
     setTouched({});
+    setNmsAck(false);
+    setAdvancedOpen(false);
+    initialProfileRef.current = null;
   };
 
   const handleCancel = () => {
@@ -516,6 +681,50 @@ export default function ImportModelDialog({
   const isLoading =    parseMutation.isPending
     || registerMutation.isPending
     || updateMutation.isPending;
+
+  const nmsPresent = !!parseResult
+    && (parseResult.vstream_info || '').includes('yolov8_nms_postprocess');
+
+  // Detection HEFs whose output layers carry no yolov8_nms_postprocess
+  // tensor cannot enter the Hailo yolov8 postprocess pipeline — importing
+  // one anyway requires an explicit acknowledgement (nmsAck).
+  const nmsIncompatible = !!parseResult
+    && (form.modelType === 'detection'
+      || parseResult.suggested_type === 'detection')
+    && !nmsPresent;
+
+  // Client mirror of the backend custom-variant guard, so a broken blob is
+  // rejected before the request leaves the page.
+  const variantErrorText = useMemo(() => {
+    const issue = checkCustomVariant(form.variant);
+    return issue ? variantIssueText(issue, t) : null;
+  }, [form.variant, t]);
+
+  const nmsWarning = nmsIncompatible ? (
+    <div className="flex items-start gap-2 rounded-md border border-yellow-500/60 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-400">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>
+        {t(
+          'sys.ai_models.wizard.nms_warning',
+          'No yolov8_nms_postprocess output layer detected in this HEF; it may be incompatible with the Hailo yolov8 postprocess pipeline'
+        )}
+      </span>
+    </div>
+  ) : null;
+
+  // The inverse cross-check: the HEF ships the NMS output layer but is not
+  // classified as detection — almost certainly miscategorized.
+  const typeMismatch = !!parseResult
+    && parseResult.suggested_type !== 'detection'
+    && form.modelType !== 'detection'
+    && nmsPresent;
+
+  // Update mode: hint that changing the postprocess profile reloads a
+  // loaded model rather than silently keeping the old profile on the NPU.
+  const profileChanged = isUpdate
+    && initialProfileRef.current !== null
+    && form.config.postprocess_profile !== undefined
+    && form.config.postprocess_profile !== initialProfileRef.current;
 
   // Render a dynamic field based on its schema definition
   const renderField = (field: ModelFieldDef) => {
@@ -651,6 +860,11 @@ export default function ImportModelDialog({
                 ))}
               </SelectContent>
             </Select>
+            {t(`sys.ai_models.form.${field.key}_hint`, '') && (
+              <p className="text-xs text-muted-foreground">
+                {t(`sys.ai_models.form.${field.key}_hint`, '')}
+              </p>
+            )}
           </div>
         );
       }
@@ -669,6 +883,28 @@ export default function ImportModelDialog({
             <Label htmlFor={field.key} className="font-normal">
               {t(`sys.ai_models.form.${field.key}`, field.key)}
             </Label>
+          </div>
+        );
+      }
+      case 'text': {
+        const val = String(form.config[field.key] ?? '');
+        const hint = t(`sys.ai_models.form.${field.key}_hint`, '');
+        return (
+          <div className="grid gap-2 sm:col-span-2" key={field.key}>
+            <Label htmlFor={field.key}>
+              {t(`sys.ai_models.form.${field.key}`, field.key)}
+            </Label>
+            <Input
+              id={field.key}
+              type="text"
+              value={val}
+              onChange={e => updateConfig(field.key, e.target.value)}
+              placeholder={ph}
+              disabled={isLoading}
+            />
+            {hint && (
+              <p className="text-xs text-muted-foreground">{hint}</p>
+            )}
           </div>
         );
       }
@@ -810,6 +1046,7 @@ export default function ImportModelDialog({
                     </div>
                   </div>
                 </div>
+                {nmsWarning}
               </div>
             )}
           </div>
@@ -906,21 +1143,71 @@ export default function ImportModelDialog({
                   <p className="text-sm text-destructive">{errors.modelType}</p>
                 )}
               </div>
-
-              {/* Variant */}
-              <div className="grid gap-2">
-                <Label htmlFor="variant">
-                  {t('sys.ai_models.form.variant', 'Variant')}
-                </Label>
-                <Input
-                  id="variant"
-                  value={form.variant}
-                  onChange={e => setForm(prev => ({ ...prev, variant: e.target.value }))}
-                  placeholder={ph}
-                  disabled={isLoading}
-                />
-              </div>
             </div>
+
+            {nmsWarning}
+            {nmsIncompatible && (
+              <div className="grid gap-2">
+                <div className="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    id="nms-ack"
+                    checked={nmsAck}
+                    onChange={e => toggleNmsAck(e.target.checked)}
+                    disabled={isLoading}
+                    className="mt-0.5 h-4 w-4 shrink-0"
+                  />
+                  <Label htmlFor="nms-ack" className="font-normal">
+                    {t(
+                      'sys.ai_models.wizard.nms_confirm',
+                      'I understand this HEF may not work with the Hailo yolov8 postprocess pipeline; import it anyway'
+                    )}
+                  </Label>
+                </div>
+                {touched.nmsAck && errors.nmsAck && (
+                  <p className="text-sm text-destructive">{errors.nmsAck}</p>
+                )}
+              </div>
+            )}
+
+            {typeMismatch && (
+              <div className="flex items-start justify-between gap-2 rounded-md border border-blue-500/60 bg-blue-500/10 p-3 text-sm text-blue-700 dark:text-blue-400">
+                <div className="flex items-start gap-2">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    {t(
+                      'sys.ai_models.wizard.type_mismatch',
+                      'This HEF carries the yolov8_nms_postprocess output layer but the type is not detection — it is likely miscategorized'
+                    )}
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleModelTypeChange('detection')}
+                  disabled={isLoading}
+                  className="shrink-0"
+                >
+                  {t(
+                    'sys.ai_models.wizard.type_mismatch_switch',
+                    'Switch to detection'
+                  )}
+                </Button>
+              </div>
+            )}
+
+            {profileChanged && (
+              <div className="flex items-start gap-2 rounded-md border border-blue-500/40 bg-blue-500/5 p-3 text-xs text-muted-foreground">
+                <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  {t(
+                    'sys.ai_models.wizard.profile_change_hint',
+                    'Changing the postprocess profile reloads the model if it is currently loaded'
+                  )}
+                </span>
+              </div>
+            )}
 
             {/* Dynamic fields from schema */}
             {currentFields.length > 0 && (
@@ -928,6 +1215,77 @@ export default function ImportModelDialog({
                 {currentFields.map(field => renderField(field))}
               </div>
             )}
+
+            {/* Advanced: custom variant JSON (escape hatch into the
+                postprocess plugin's schema) */}
+            <div className="rounded-md border">
+              <button
+                type="button"
+                onClick={() => setAdvancedOpen(prev => !prev)}
+                className="flex w-full items-center gap-2 p-3 text-sm font-medium text-muted-foreground hover:text-foreground"
+              >
+                {advancedOpen
+                  ? <ChevronDown className="h-4 w-4" />
+                  : <ChevronRight className="h-4 w-4" />}
+                <Settings2 className="h-4 w-4" />
+                {t('sys.ai_models.form.advanced', 'Advanced — custom variant JSON')}
+              </button>
+              {advancedOpen && (
+                <div className="grid gap-2 border-t p-3">
+                  <Label htmlFor="variant">
+                    {t('sys.ai_models.form.variant', 'Variant')}
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    {t(
+                      'sys.ai_models.form.variant_hint',
+                      'Overrides the composed postprocess config. A {…} blob must carry the full plugin schema; leave empty to use the profile selection above'
+                    )}
+                  </p>
+                  <Textarea
+                    id="variant"
+                    rows={5}
+                    value={form.variant}
+                    onChange={e => {
+                      const { value } = e.target;
+                      setForm(prev => ({ ...prev, variant: value }));
+                      if (touched.variant) {
+                        setErrors(prev => {
+                          const next = { ...prev };
+                          delete next.variant;
+                          return next;
+                        });
+                      }
+                    }}
+                    placeholder={t(
+                      'sys.ai_models.form.variant_placeholder',
+                      'Empty for defaults, or paste a full custom JSON blob'
+                    )}
+                    className="font-mono text-xs"
+                    disabled={isLoading}
+                  />
+                  {touched.variant && errors.variant && (
+                    <p className="text-sm text-destructive">{errors.variant}</p>
+                  )}
+                  {variantErrorText && (
+                    <p className="text-sm text-destructive">{variantErrorText}</p>
+                  )}
+                  <div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={insertVariantTemplate}
+                      disabled={isLoading}
+                    >
+                      {t(
+                        'sys.ai_models.form.variant_template',
+                        'Insert template from current values'
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -961,7 +1319,7 @@ export default function ImportModelDialog({
               <Button
                 variant="carbon"
                 onClick={handleRegister}
-                disabled={isLoading}
+                disabled={isLoading || (nmsIncompatible && !nmsAck)}
               >
                 {isUpdate && updateMutation.isPending
                   ? t('common.loading', 'Loading...')

@@ -124,7 +124,8 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     }
 
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
-                                        owner_id, req->transient());
+                                        owner_id, req->transient(),
+                                        req->model_variant());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("Failed to register model");
@@ -237,7 +238,14 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
         auto* spec = resp->add_inputs();
         spec->set_name(m.model_info.inputs[i].name);
         spec->set_dtype(hal_dtype_to_proto(m.model_info.inputs[i].dtype));
-        spec->set_layout(hal_layout_to_string(m.model_info.inputs[i].layout));
+        // NV12/NV21/I420 inputs map to the ambiguous NHW layout in HAL; the
+        // pixel format itself lives only in is_nv12. Surface it as "NV12" so
+        // clients can tell image-plane tensors from planar RGB without
+        // inferring from byte_size (W*H*3/2).
+        spec->set_layout(m.model_info.inputs[i].is_nv12 != 0
+                             ? "NV12"
+                             : hal_layout_to_string(m.model_info.inputs[i].layout));
+        spec->set_byte_size(m.model_info.inputs[i].byte_size);
         for (int d = 0; d < m.model_info.inputs[i].ndim; d++) {
             spec->add_shape(m.model_info.inputs[i].shape[d]);
         }
@@ -248,6 +256,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
         spec->set_name(m.model_info.outputs[i].name);
         spec->set_dtype(hal_dtype_to_proto(m.model_info.outputs[i].dtype));
         spec->set_layout(hal_layout_to_string(m.model_info.outputs[i].layout));
+        spec->set_byte_size(m.model_info.outputs[i].byte_size);
         for (int d = 0; d < m.model_info.outputs[i].ndim; d++) {
             spec->add_shape(m.model_info.outputs[i].shape[d]);
         }

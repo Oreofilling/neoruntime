@@ -74,6 +74,69 @@ func selectField(key string, def string, opts []FieldOption) ModelFieldDef {
 	}
 }
 
+func textField(key string, def string) ModelFieldDef {
+	return ModelFieldDef{
+		Key: key, Type: FieldTypeText, Required: false, Default: def,
+	}
+}
+
+// DetectionPostprocessProfile couples a HEF basename the vendor postprocess
+// plugin (libyolo_hailortpp_post.so) recognizes with the backend function it
+// maps to. HAL rewrites the NMS tensor name to <HEF basename>/yolov8_nms_postprocess
+// and the plugin selects its function by that basename, so models stored under
+// any other name (e.g. the sha256 CAS blob name) fail postprocess on every
+// frame and must be re-materialized under one of these names at load time.
+type DetectionPostprocessProfile struct {
+	Basename        string // HEF filename without extension
+	BackendFunction string // plugin backend function for this basename
+	Label           string // human-readable label for the wizard dropdown
+}
+
+// DefaultDetectionProfile is the zero-config profile: the plugin's default
+// postprocess function is bound to this basename.
+const DefaultDetectionProfile = "hailo_yolov8n_384_640"
+
+// DetectionPostprocessProfiles lists the basenames verified against the
+// vendor plugin. Other compiled-in names map to generic single-argument
+// functions with a hardcoded 0.4 threshold and are deliberately excluded.
+var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
+	{Basename: "hailo_yolov8n_384_640", BackendFunction: "hailo_yolov8n", Label: "YOLOv8n 384x640 (default)"},
+	{Basename: "hailo_yolov8s_384_640", BackendFunction: "hailo_yolov8s", Label: "YOLOv8s 384x640"},
+	{Basename: "hailo_yolov8m_384_640", BackendFunction: "hailo_yolov8m", Label: "YOLOv8m 384x640"},
+}
+
+// LookupDetectionProfile returns the profile for a basename; ok is false for
+// names the plugin does not handle usefully.
+func LookupDetectionProfile(basename string) (DetectionPostprocessProfile, bool) {
+	for _, p := range DetectionPostprocessProfiles {
+		if p.Basename == basename {
+			return p, true
+		}
+	}
+	return DetectionPostprocessProfile{}, false
+}
+
+// LookupDetectionBackendFunction returns the profile a postprocess
+// backend_function name belongs to; ok is false for names outside the
+// verified set (including the generic single-argument functions, which
+// hardcode a 0.4 threshold and COCO labels and are not usable).
+func LookupDetectionBackendFunction(fn string) (DetectionPostprocessProfile, bool) {
+	for _, p := range DetectionPostprocessProfiles {
+		if p.BackendFunction == fn {
+			return p, true
+		}
+	}
+	return DetectionPostprocessProfile{}, false
+}
+
+func detectionProfileOptions() []FieldOption {
+	opts := make([]FieldOption, 0, len(DetectionPostprocessProfiles))
+	for _, p := range DetectionPostprocessProfiles {
+		opts = append(opts, FieldOption{Value: p.Basename, Label: p.Label})
+	}
+	return opts
+}
+
 // SupportedModelTypes is the canonical list of model types.
 // Single source of truth for Go layer, derived from HAL HalPostprocessType enum.
 var SupportedModelTypes = []ModelTypeDef{
@@ -84,6 +147,13 @@ var SupportedModelTypes = []ModelTypeDef{
 			reqNumField("threshold", 0.25, 0, 1, 0.01),
 			reqNumField("max_detections", 64, 1, 999, 1),
 			numField("nms_threshold", 0.45, 0, 1, 0.01),
+			// Drives the runtime materialization basename and the composed
+			// variant's backend_function (see handlers/ai_postprocess.go).
+			selectField("postprocess_profile", DefaultDetectionProfile, detectionProfileOptions()),
+			// Metadata only: the plugin's label table is compiled in and cannot
+			// be changed via JSON. Consumers map output class_id N (1-based)
+			// to labels[N-1]; list classes in training order, no background.
+			textField("labels", ""),
 		},
 	},
 	{

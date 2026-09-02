@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
 	"aipc/platform/platform-api/repo"
 	"aipc/platform/platform-api/storage"
@@ -32,16 +34,19 @@ import (
 // tests can assert the unload→reload sequence.
 type fakeAIRuntime struct {
 	inferencepb.UnimplementedInferenceServiceServer
-	mu       sync.Mutex
-	calls    []string
-	regPaths map[string]string
-	loadFail bool
+	mu          sync.Mutex
+	calls       []string
+	regPaths    map[string]string
+	regVariants map[string]string
+	live        map[string]bool
+	loadFail    bool
 }
 
 func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.ModelInfo) (*inferencepb.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "unload:"+in.ModelId)
+	delete(f.live, in.ModelId)
 	return &inferencepb.Status{Success: true}, nil
 }
 
@@ -53,12 +58,51 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 		f.regPaths = map[string]string{}
 	}
 	f.regPaths[in.ModelId] = in.ModelPath
+	if f.regVariants == nil {
+		f.regVariants = map[string]string{}
+	}
+	f.regVariants[in.ModelId] = in.ModelVariant
+	if !f.loadFail {
+		if f.live == nil {
+			f.live = map[string]bool{}
+		}
+		f.live[in.ModelId] = true
+	}
 	if f.loadFail {
 		return &inferencepb.ModelRegisterResponse{
 			Status: &inferencepb.Status{Success: false, Message: "npu rejected"},
 		}, nil
 	}
 	return &inferencepb.ModelRegisterResponse{ModelId: in.ModelId}, nil
+}
+
+func (f *fakeAIRuntime) registeredVariant(modelID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.regVariants[modelID]
+}
+
+// ListModels reports the live set so handlers reconcile against a runtime
+// view that evolves with Register/Unregister calls.
+func (f *fakeAIRuntime) ListModels(_ context.Context, _ *inferencepb.Empty) (*inferencepb.ModelListResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	resp := &inferencepb.ModelListResponse{}
+	for id := range f.live {
+		resp.Models = append(resp.Models, &inferencepb.ModelInfo{ModelId: id})
+	}
+	return resp, nil
+}
+
+// markLive seeds the runtime with a model no RegisterModel call created
+// (e.g. simulating a model registered by another component).
+func (f *fakeAIRuntime) markLive(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = map[string]bool{}
+	}
+	f.live[id] = true
 }
 
 func (f *fakeAIRuntime) snapshot() ([]string, map[string]string) {
@@ -206,6 +250,10 @@ func TestUpdateModelMetadataOnly(t *testing.T) {
 
 func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
+	// Keep materialized runtime copies inside the test sandbox.
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	newBlob := seedBlob(t, store, "h2")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "live_det", Name: "live_det", Status: "loaded", Source: "web",
@@ -220,8 +268,22 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "unload:live_det" || calls[1] != "load:live_det" {
 		t.Fatalf("expected unload→load sequence, got %v", calls)
 	}
-	if regPaths["live_det"] != newBlob {
-		t.Errorf("reload used path %q, want blob path of new hash", regPaths["live_det"])
+	// Detection models reload via the materialized postprocess-profile path —
+	// a basename the vendor plugin recognizes — hardlinked to the new blob.
+	materialized := filepath.Join(constants.ModelsPath(), "runtime", "live_det", "hailo_yolov8n_384_640.hef")
+	if regPaths["live_det"] != materialized {
+		t.Errorf("reload used path %q, want materialized %q", regPaths["live_det"], materialized)
+	}
+	dstStat, err := os.Stat(materialized)
+	if err != nil {
+		t.Fatalf("materialized runtime copy missing: %v", err)
+	}
+	srcStat, err := os.Stat(newBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(dstStat, srcStat) {
+		t.Error("materialized copy is not linked to the swapped blob")
 	}
 	row, err := h.aiModelRepo.GetByModelID("live_det")
 	if err != nil || row == nil {
@@ -230,25 +292,59 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	if row.Status != "loaded" || row.FileHash != "h2" {
 		t.Errorf("row after swap: status=%q hash=%q, want loaded/h2", row.Status, row.FileHash)
 	}
+	if row.FilePath != newBlob {
+		t.Errorf("DB file path must track the swapped blob, got %q want %q", row.FilePath, newBlob)
+	}
 }
 
-func TestUpdateModelLoadedSameHashNoReload(t *testing.T) {
+func TestUpdateModelLoadedSameHashNoOpDoesNotReload(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
 	seedBlob(t, store, "h1")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "stable_det", Name: "stable_det", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
 	})
-	w := putUpdate(t, h, "stable_det", `{"file_hash":"h1","config":{"threshold":0.4}}`)
+	w := putUpdate(t, h, "stable_det", `{"file_hash":"h1"}`)
 	if respCode(t, w) != 0 {
 		t.Fatalf("update failed: %s", w.Body.String())
 	}
 	if calls, _ := fake.snapshot(); len(calls) != 0 {
-		t.Errorf("same-hash update must not reload, got %v", calls)
+		t.Errorf("no-op update must not reload, got %v", calls)
 	}
 	row, _ := h.aiModelRepo.GetByModelID("stable_det")
-	if row.Status != "loaded" || row.Threshold != 0.4 {
-		t.Errorf("row after same-hash update: status=%q threshold=%f", row.Status, row.Threshold)
+	if row.Status != "loaded" {
+		t.Errorf("status = %q, want loaded", row.Status)
+	}
+}
+
+func TestUpdateModelLoadedTuningChangeReloads(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	// Keep materialized runtime copies inside the test sandbox.
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	seedBlob(t, store, "h1")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "tuned_det", Name: "tuned_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	w := putUpdate(t, h, "tuned_det", `{"file_hash":"h1","config":{"threshold":0.5,"max_detections":16}}`)
+	if respCode(t, w) != 0 {
+		t.Fatalf("update failed: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:tuned_det" || calls[1] != "load:tuned_det" {
+		t.Fatalf("tuning change on a loaded model must unload→reload, got %v", calls)
+	}
+	// The reloaded registration must carry the new tuning to the runtime —
+	// a bare row update would leave the NPU serving the old threshold.
+	variant := fake.registeredVariant("tuned_det")
+	if !strings.Contains(variant, `"detection_threshold":0.5`) || !strings.Contains(variant, `"max_boxes":16`) {
+		t.Errorf("reloaded variant must carry new tuning, got %s", variant)
+	}
+	row, _ := h.aiModelRepo.GetByModelID("tuned_det")
+	if row.Status != "loaded" || row.Threshold != 0.5 || row.MaxDetections != 16 {
+		t.Errorf("row after tuning reload: status=%q threshold=%f maxDet=%d", row.Status, row.Threshold, row.MaxDetections)
 	}
 }
 
@@ -291,5 +387,73 @@ func TestRegisterModelDuplicateRejected(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "already exists") {
 		t.Errorf("error must mention duplicate: %s", w.Body.String())
+	}
+}
+
+// A partial custom variant must be rejected at entry with a message naming
+// the missing keys — not stored to fail later at load time.
+func TestUpdateModelRejectsPartialCustomVariant(t *testing.T) {
+	h, fake, _ := newAIUpdateTestEnv(t)
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "partial_det", Name: "partial_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	w := putUpdate(t, h, "partial_det", `{"model_variant":"{\"backend_function\":\"hailo_yolov8n\",\"detection_threshold\":0.5}"}`)
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("partial variant must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "missing required key") {
+		t.Errorf("error must name the missing keys: %s", w.Body.String())
+	}
+	row, _ := h.aiModelRepo.GetByModelID("partial_det")
+	if row.Variant != "" {
+		t.Errorf("rejected variant must not be stored, got %q", row.Variant)
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 0 {
+		t.Errorf("no runtime calls expected, got %v", calls)
+	}
+}
+
+// A schema-complete custom variant is stored verbatim — the escape hatch
+// stays open, only broken blobs are fenced off.
+func TestUpdateModelAcceptsCompleteCustomVariant(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "custom_det", Name: "custom_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	custom := `{"backend_function":"hailo_yolov8s","iou_threshold":0.45,"detection_threshold":0.5,"output_activation":"none","label_offset":1,"max_boxes":32,"labels":["fire","smoke"]}`
+	body := `{"model_variant":` + strconv.Quote(custom) + `}`
+	w := putUpdate(t, h, "custom_det", body)
+	if respCode(t, w) != 0 {
+		t.Fatalf("complete variant must be accepted: %s", w.Body.String())
+	}
+	row, _ := h.aiModelRepo.GetByModelID("custom_det")
+	if row.Variant != custom {
+		t.Errorf("variant must be stored verbatim, got %q", row.Variant)
+	}
+}
+
+// RegisterModel applies the same guardrail: a blob pointing at a generic
+// (hardcoded-threshold) function never reaches the DB.
+func TestRegisterModelRejectsUnsupportedBackendFunction(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := bytes.NewReader([]byte(`{"model_id":"gen_fn","model_path":"/x.hef","model_type":"detection","model_variant":"{\"backend_function\":\"yolov8s\",\"iou_threshold\":0.45,\"detection_threshold\":0.5,\"output_activation\":\"none\",\"label_offset\":1,\"max_boxes\":32,\"labels\":[]}"}`))
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ai/models", body)
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.RegisterModel(c)
+
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("generic function must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not supported") {
+		t.Errorf("error must name the unsupported function: %s", w.Body.String())
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("gen_fn"); row != nil {
+		t.Errorf("rejected model must not be persisted, got %+v", row)
 	}
 }

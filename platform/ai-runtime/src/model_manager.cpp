@@ -7,6 +7,29 @@
 
 namespace aipc::ai_runtime {
 
+namespace {
+
+// Best-effort extraction of "backend_function":"<name>" from a detection
+// variant blob. The blob is machine-composed (platform-api's variant JSON or
+// the default-blob composer in init_post_process), so the canonical quoting is
+// reliable. Returns "" for bare-name (non-JSON) variants or a missing key —
+// both mean "no function to forward".
+std::string variant_backend_function(const std::string& variant) {
+    if (variant.empty() || variant.front() != '{') return "";
+    const std::string key = "\"backend_function\"";
+    const size_t k = variant.find(key);
+    if (k == std::string::npos) return "";
+    const size_t colon = variant.find(':', k + key.size());
+    if (colon == std::string::npos) return "";
+    const size_t q1 = variant.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    const size_t q2 = variant.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return variant.substr(q1 + 1, q2 - q1 - 1);
+}
+
+} // namespace
+
 // ============================================================
 // Constructor / Destructor
 // ============================================================
@@ -74,7 +97,8 @@ bool ModelManager::has_async() const {
 int ModelManager::register_model(const std::string& model_id,
                                  const std::string& model_path,
                                  const std::string& owner_id,
-                                 bool transient) {
+                                 bool transient,
+                                 const std::string& variant) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
@@ -129,8 +153,44 @@ int ModelManager::register_model(const std::string& model_id,
     infer_cfg.timeout_ms = 5000;
     infer_cfg.use_dma = true;
 
-    // Pass scheduler config for shared VDevice + round-robin scheduling
-    if (!hal_platform_config_.empty()) {
+    // Pass scheduler config for shared VDevice + round-robin scheduling.
+    // When the variant names a backend_function, overlay it onto the platform
+    // config JSON: the HAL inference session uses it to name NMS output
+    // tensors after the selected vendor function ("<family>/yolov8_nms_postprocess")
+    // instead of the HEF file basename — app-bundled HEFs live at arbitrary
+    // paths whose basename the vendor plugin would not recognize. The local
+    // string only needs to outlive create(), which copies what it needs.
+    std::string infer_platform_config;
+    {
+        const std::string backend_function = variant_backend_function(variant);
+        if (!backend_function.empty()) {
+            std::string base;
+            if (!hal_platform_config_.empty() && hal_platform_config_.front() == '{') {
+                // Splice: drop the closing brace, append the key, re-close.
+                base = hal_platform_config_;
+                const size_t close = base.rfind('}');
+                if (close != std::string::npos) base.resize(close);
+                while (!base.empty() &&
+                       (base.back() == ' ' || base.back() == '\t' ||
+                        base.back() == '\r' || base.back() == '\n')) {
+                    base.pop_back();
+                }
+                if (!base.empty() && base.back() == ',') base.pop_back();
+            }
+            if (base.size() > 1) {
+                infer_platform_config =
+                    base + ",\"backend_function\":\"" + backend_function + "\"}";
+            } else {
+                infer_platform_config =
+                    "{\"backend_function\":\"" + backend_function + "\"}";
+            }
+            LOG_INFO("Model %s: NMS tensor naming follows backend_function '%s'",
+                     model_id.c_str(), backend_function.c_str());
+        }
+    }
+    if (!infer_platform_config.empty()) {
+        infer_cfg.platform_config = infer_platform_config.c_str();
+    } else if (!hal_platform_config_.empty()) {
         infer_cfg.platform_config = hal_platform_config_.c_str();
     }
 
@@ -273,8 +333,8 @@ int ModelManager::init_post_process(const std::string& model_id,
     // /home/root/apps/shared/resources/configs/yolov8.json). Two accepted
     // shapes for `variant`:
     //   1. Full JSON blob (first char '{') → used verbatim as config_json.
-    //   2. Bare backend_function name → legacy {"backend_function":"<name>"}
-    //      (schema-invalid; kept for backward compat, logs a warning).
+    //   2. Bare backend_function name → a full default blob is composed around
+    //      it (schema-valid; tuning reused from pp_cfg).
     // The local string only needs to outlive the create() call below, which
     // copies what it needs into merged_vendor_json.
     std::string detection_cfg_json;
@@ -282,13 +342,38 @@ int ModelManager::init_post_process(const std::string& model_id,
         if (variant.front() == '{') {
             detection_cfg_json = variant;
         } else {
+            // Compose a FULL schema-valid blob around the bare backend_function
+            // name. The legacy stub {"backend_function":"<name>"} is rejected by
+            // the plugin's schema validation ("Invalid keyword: required") after
+            // HAL strips the backend_* loader keys, silently falling back to the
+            // hailo_yolov8n default. Field set mirrors the device reference
+            // /home/root/apps/shared/resources/configs/yolov8.json; tuning
+            // values reuse the pp_cfg already set for this model. labels is the
+            // plugin's compiled-in table — output class_id semantics (model
+            // class index + 1) are unchanged; consumers map ids themselves.
+            char cfg_buf[512];
+            snprintf(cfg_buf, sizeof(cfg_buf),
+                     "{\"backend_function\":\"%s\","
+                     "\"iou_threshold\":%.4f,"
+                     "\"detection_threshold\":%.4f,"
+                     "\"output_activation\":\"none\","
+                     "\"label_offset\":1,"
+                     "\"max_boxes\":%u,"
+                     "\"labels\":[\"unlabeled\",\"person\",\"vehicle\","
+                     "\"face\",\"license_plate\"]}",
+                     variant.c_str(),
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.max_detections);
+            detection_cfg_json = cfg_buf;
             LOG_WARN("init_post_process: variant='%s' is a bare backend_function "
-                     "name — config_json {\"backend_function\":\"%s\"} is "
-                     "schema-invalid for the YOLO plugin (will fall back to "
-                     "hailo_yolov8n). Pass a full config_json blob instead.",
-                     variant.c_str(), variant.c_str());
-            detection_cfg_json = std::string("{\"backend_function\":\"") +
-                                 variant + "\"}";
+                     "name — injecting a full default config_json around it "
+                     "(detection_threshold=%.2f iou_threshold=%.2f "
+                     "max_boxes=%u).",
+                     variant.c_str(),
+                     pp_cfg.config.detection.confidence_threshold,
+                     pp_cfg.config.detection.nms_threshold,
+                     pp_cfg.config.detection.max_detections);
         }
         pp_cfg.config.detection.config_json = detection_cfg_json.c_str();
     }

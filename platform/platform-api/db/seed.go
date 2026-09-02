@@ -75,8 +75,10 @@ func SeedDiskModels(db *gorm.DB) *ScanResult {
 			continue
 		}
 		catName := entry.Name()
-		// Skip internal CAS directory
-		if catName == "blobs" {
+		// Skip internal directories: the CAS blob store and the runtime
+		// materialization tree (runtime/<model_id>/*.hef — already-registered
+		// hardlinks, must not be picked up as new disk models).
+		if catName == "blobs" || catName == "runtime" {
 			continue
 		}
 		catDir := filepath.Join(modelDir, catName)
