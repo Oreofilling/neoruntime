@@ -63,10 +63,14 @@ public:
     /// Register (load) a model. If owner_id is non-empty, it tracks ownership.
     /// If the model is already loaded by another owner, this just adds co-ownership.
     /// transient marks an app-bundled model (hidden from the model page).
+    /// variant is the model's postprocess variant blob; for detections its
+    /// backend_function is forwarded to the HAL inference session so NMS output
+    /// tensors are named after the selected vendor function, not the file path.
     /// Returns 0 on success, <0 on error.
     int register_model(const std::string& model_id, const std::string& model_path,
                        const std::string& owner_id = "",
-                       bool transient = false);
+                       bool transient = false,
+                       const std::string& variant = "");
 
     /// Unregister (unload) a model. If owner_id is given, only removes that owner.
     /// The model is physically unloaded only when no owners remain AND ref_count == 0.

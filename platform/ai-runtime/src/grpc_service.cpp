@@ -124,7 +124,8 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     }
 
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
-                                        owner_id, req->transient());
+                                        owner_id, req->transient(),
+                                        req->model_variant());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message("Failed to register model");
