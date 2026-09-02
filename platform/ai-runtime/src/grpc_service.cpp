@@ -238,6 +238,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
         spec->set_name(m.model_info.inputs[i].name);
         spec->set_dtype(hal_dtype_to_proto(m.model_info.inputs[i].dtype));
         spec->set_layout(hal_layout_to_string(m.model_info.inputs[i].layout));
+        spec->set_byte_size(m.model_info.inputs[i].byte_size);
         for (int d = 0; d < m.model_info.inputs[i].ndim; d++) {
             spec->add_shape(m.model_info.inputs[i].shape[d]);
         }
@@ -248,6 +249,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
         spec->set_name(m.model_info.outputs[i].name);
         spec->set_dtype(hal_dtype_to_proto(m.model_info.outputs[i].dtype));
         spec->set_layout(hal_layout_to_string(m.model_info.outputs[i].layout));
+        spec->set_byte_size(m.model_info.outputs[i].byte_size);
         for (int d = 0; d < m.model_info.outputs[i].ndim; d++) {
             spec->add_shape(m.model_info.outputs[i].shape[d]);
         }

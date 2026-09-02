@@ -33,6 +33,9 @@ message TensorSpec {
   DataType dtype = 2;
   string name = 3;
   string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", etc.
+  uint32 byte_size = 5;  // Host buffer size from the backend. Authoritative when
+                         // set: NV12-like inputs report an RGB-like shape whose
+                         // product is not the frame size (W*H*3/2 is).
 }
 
 message Tensor {
