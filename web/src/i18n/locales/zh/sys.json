@@ -1523,7 +1523,14 @@
         "postprocess_profile_hailo_yolov8s_384_640": "yolov8s 384x640",
         "postprocess_profile_hailo_yolov8m_384_640": "yolov8m 384x640",
         "labels": "类别标签",
-        "labels_hint": "逗号分隔、按训练顺序排列；检测结果 class_id 从 1 起，对应 labels[N-1]，不含背景类。仅作为元数据保存，运行时标签由模型内置。"
+        "labels_hint": "逗号分隔、按训练顺序排列；检测结果 class_id 从 1 起，对应 labels[N-1]，不含背景类。仅作为元数据保存，运行时标签由模型内置。",
+        "advanced": "高级 — 自定义变体 JSON",
+        "variant_hint": "覆盖由上方配置组合出的后处理参数。{…} 对象必须包含插件 schema 的全部字段；留空则使用上方 Profile 选择。",
+        "variant_placeholder": "留空使用默认值，或粘贴完整的自定义 JSON",
+        "variant_template": "按当前值生成模板",
+        "variant_invalid_json": "变体不是合法的 JSON",
+        "variant_missing_keys": "变体 JSON 缺少必填字段：{{keys}}",
+        "variant_function_unsupported": "backend_function 仅支持：{{fns}}"
       },
       "empty": {
         "templates": "暂无可用的 AI 模型",
@@ -1616,7 +1623,12 @@
         "confirm_register": "注册",
         "confirm_update": "更新",
         "update_file_optional": "可选：上传新的模型文件以替换现有文件；不上传则仅更新配置。",
-        "nms_warning": "该 HEF 输出层未见 yolov8_nms_postprocess，可能与 Hailo yolov8 后处理不兼容"
+        "nms_warning": "该 HEF 输出层未见 yolov8_nms_postprocess，可能与 Hailo yolov8 后处理不兼容",
+        "nms_confirm": "我已了解该 HEF 可能无法进入 Hailo yolov8 后处理管线，仍要导入",
+        "nms_ack_required": "请先勾选确认 NMS 兼容性警示",
+        "type_mismatch": "该 HEF 输出层包含 yolov8_nms_postprocess，但模型类型不是检测——很可能是类型选错了",
+        "type_mismatch_switch": "改为检测",
+        "profile_change_hint": "后处理 Profile 变更后，已加载的模型将被重新加载"
       },
       "type": {
         "landmark": "关键点检测",
