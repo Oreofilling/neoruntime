@@ -33,16 +33,19 @@ import (
 // tests can assert the unload→reload sequence.
 type fakeAIRuntime struct {
 	inferencepb.UnimplementedInferenceServiceServer
-	mu       sync.Mutex
-	calls    []string
-	regPaths map[string]string
-	loadFail bool
+	mu          sync.Mutex
+	calls       []string
+	regPaths    map[string]string
+	regVariants map[string]string
+	live        map[string]bool
+	loadFail    bool
 }
 
 func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.ModelInfo) (*inferencepb.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "unload:"+in.ModelId)
+	delete(f.live, in.ModelId)
 	return &inferencepb.Status{Success: true}, nil
 }
 
@@ -54,12 +57,51 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 		f.regPaths = map[string]string{}
 	}
 	f.regPaths[in.ModelId] = in.ModelPath
+	if f.regVariants == nil {
+		f.regVariants = map[string]string{}
+	}
+	f.regVariants[in.ModelId] = in.ModelVariant
+	if !f.loadFail {
+		if f.live == nil {
+			f.live = map[string]bool{}
+		}
+		f.live[in.ModelId] = true
+	}
 	if f.loadFail {
 		return &inferencepb.ModelRegisterResponse{
 			Status: &inferencepb.Status{Success: false, Message: "npu rejected"},
 		}, nil
 	}
 	return &inferencepb.ModelRegisterResponse{ModelId: in.ModelId}, nil
+}
+
+func (f *fakeAIRuntime) registeredVariant(modelID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.regVariants[modelID]
+}
+
+// ListModels reports the live set so handlers reconcile against a runtime
+// view that evolves with Register/Unregister calls.
+func (f *fakeAIRuntime) ListModels(_ context.Context, _ *inferencepb.Empty) (*inferencepb.ModelListResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	resp := &inferencepb.ModelListResponse{}
+	for id := range f.live {
+		resp.Models = append(resp.Models, &inferencepb.ModelInfo{ModelId: id})
+	}
+	return resp, nil
+}
+
+// markLive seeds the runtime with a model no RegisterModel call created
+// (e.g. simulating a model registered by another component).
+func (f *fakeAIRuntime) markLive(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = map[string]bool{}
+	}
+	f.live[id] = true
 }
 
 func (f *fakeAIRuntime) snapshot() ([]string, map[string]string) {
@@ -254,23 +296,54 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	}
 }
 
-func TestUpdateModelLoadedSameHashNoReload(t *testing.T) {
+func TestUpdateModelLoadedSameHashNoOpDoesNotReload(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
 	seedBlob(t, store, "h1")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "stable_det", Name: "stable_det", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
 	})
-	w := putUpdate(t, h, "stable_det", `{"file_hash":"h1","config":{"threshold":0.4}}`)
+	w := putUpdate(t, h, "stable_det", `{"file_hash":"h1"}`)
 	if respCode(t, w) != 0 {
 		t.Fatalf("update failed: %s", w.Body.String())
 	}
 	if calls, _ := fake.snapshot(); len(calls) != 0 {
-		t.Errorf("same-hash update must not reload, got %v", calls)
+		t.Errorf("no-op update must not reload, got %v", calls)
 	}
 	row, _ := h.aiModelRepo.GetByModelID("stable_det")
-	if row.Status != "loaded" || row.Threshold != 0.4 {
-		t.Errorf("row after same-hash update: status=%q threshold=%f", row.Status, row.Threshold)
+	if row.Status != "loaded" {
+		t.Errorf("status = %q, want loaded", row.Status)
+	}
+}
+
+func TestUpdateModelLoadedTuningChangeReloads(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	// Keep materialized runtime copies inside the test sandbox.
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	seedBlob(t, store, "h1")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "tuned_det", Name: "tuned_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	w := putUpdate(t, h, "tuned_det", `{"file_hash":"h1","config":{"threshold":0.5,"max_detections":16}}`)
+	if respCode(t, w) != 0 {
+		t.Fatalf("update failed: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:tuned_det" || calls[1] != "load:tuned_det" {
+		t.Fatalf("tuning change on a loaded model must unload→reload, got %v", calls)
+	}
+	// The reloaded registration must carry the new tuning to the runtime —
+	// a bare row update would leave the NPU serving the old threshold.
+	variant := fake.registeredVariant("tuned_det")
+	if !strings.Contains(variant, `"detection_threshold":0.5`) || !strings.Contains(variant, `"max_boxes":16`) {
+		t.Errorf("reloaded variant must carry new tuning, got %s", variant)
+	}
+	row, _ := h.aiModelRepo.GetByModelID("tuned_det")
+	if row.Status != "loaded" || row.Threshold != 0.5 || row.MaxDetections != 16 {
+		t.Errorf("row after tuning reload: status=%q threshold=%f maxDet=%d", row.Status, row.Threshold, row.MaxDetections)
 	}
 }
 

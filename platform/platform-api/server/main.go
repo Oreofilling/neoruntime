@@ -437,6 +437,11 @@ func (s *PlatformAPIServer) setupRoutes() {
 	// multi-GB file and must not delay startup.
 	go apiHandlers.BackfillMissingHashes()
 
+	// Heal stale model rows against the runtime (e.g. ai-runtime restarted
+	// alone: DB still claims loaded). The models page reconciles on every
+	// list; this pass covers devices nobody is browsing.
+	go apiHandlers.ReconcileRuntimeModels()
+
 	// Phase 2: reconcile the desired-state store with live config at startup.
 	// Currently scopes the media domain (camera-daemon.yaml): confirms the live
 	// file matches the desired row (in-sync no-op), re-projects the desired
