@@ -32,7 +32,8 @@ message TensorSpec {
   repeated int32 shape = 1;
   DataType dtype = 2;
   string name = 3;
-  string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", etc.
+  string layout = 4;  // "NHWC", "NCHW", "HWC", "CHW", "NC", "HW", or "NV12" for
+                      // image-plane inputs (NV12/NV21/I420; see byte_size).
   uint32 byte_size = 5;  // Host buffer size from the backend. Authoritative when
                          // set: NV12-like inputs report an RGB-like shape whose
                          // product is not the frame size (W*H*3/2 is).

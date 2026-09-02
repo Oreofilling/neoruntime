@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1308,6 +1309,26 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
                  p->plugin_function.c_str(),
                  p->plugin_config_path.c_str(),
                  (!p->temp_config_path.empty() ? " (temp)" : ""));
+    // Generic function guard: the YOLO plugin's generic exports (any name that
+    // is not one of the family functions below) hardcode detection_threshold
+    // 0.4 and the COCO-81 label table and ignore the JSON tuning — output
+    // class ids then follow COCO, not the model the user actually trained.
+    // Known-good family functions (verified on device):
+    if (p->cfg.type == HAL_POST_TYPE_DETECTION && !p->plugin_function.empty())
+    {
+        static const std::set<std::string> kFamilyFunctions = {
+            "hailo_yolov8n", "hailo_yolov8s", "hailo_yolov8m",
+        };
+        if (kFamilyFunctions.find(p->plugin_function) == kFamilyFunctions.end())
+        {
+            HAL_LOG_WARNING("hailo15_postprocess: backend_function \"%s\" is not a "
+                            "known family function (hailo_yolov8n/s/m). Generic "
+                            "functions hardcode detection_threshold=0.4 and "
+                            "COCO-81 labels and ignore JSON tuning — detections "
+                            "will likely be mislabeled; prefer a family function.",
+                            p->plugin_function.c_str());
+        }
+    }
     if (p->ocr_builtin && (p->cfg.type == HAL_POST_TYPE_OCR_DETECTION || p->cfg.type == HAL_POST_TYPE_OCR_RECOGNITION))
         HAL_LOG_INFO("hailo15_postprocess: OCR using built-in Paddle det/rec (set backend_lib_path + backend_function for external .so)");
     if (p->yolov8_pose_builtin && p->cfg.type == HAL_POST_TYPE_KEYPOINT)
