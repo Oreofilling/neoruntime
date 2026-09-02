@@ -316,9 +316,9 @@ func TestZeroInputTensor(t *testing.T) {
 	// NV12 inputs report an RGB-like shape (features=3) whose product is not
 	// the host frame size — the runtime's byte_size is authoritative there.
 	nv12 := &inferencepb.TensorSpec{
-		Shape:     []int32{1, 384, 640, 3},
-		Dtype:     inferencepb.DataType_UINT8,
-		ByteSize:  384 * 640 * 3 / 2,
+		Shape:    []int32{1, 384, 640, 3},
+		Dtype:    inferencepb.DataType_UINT8,
+		ByteSize: 384 * 640 * 3 / 2,
 	}
 	tensor, err = zeroInputTensor(nv12)
 	if err != nil {

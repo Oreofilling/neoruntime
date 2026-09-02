@@ -1099,22 +1099,22 @@ func (h *APIHandlers) UploadPackage(c *gin.Context) {
 	Resp(c).OK(gin.H{
 		// Manifest fields mirror upload-manifest so the wizard hydrates the
 		// same way; image fields mirror upload-image.
-		"path":     manifestPath,
+		"path": manifestPath,
 		"metadata": gin.H{
 			"id":          appManifest.Metadata.ID,
 			"name":        appManifest.Metadata.Name,
 			"version":     appManifest.Metadata.Version,
 			"description": appManifest.Metadata.Description,
 		},
-		"manifest":         appManifest,
-		"multi_container":  appManifest.IsMultiContainer(),
+		"manifest":        appManifest,
+		"multi_container": appManifest.IsMultiContainer(),
 		// Original manifest text so the web YAML editor gets the same
 		// byte-faithful baseline a direct app.yaml upload provides.
-		"manifest_yaml":    string(manifestData),
-		"image":            imageName,
-		"image_path":       imageTarPath,
-		"filename":         filename,
-		"size":             written,
+		"manifest_yaml": string(manifestData),
+		"image":         imageName,
+		"image_path":    imageTarPath,
+		"filename":      filename,
+		"size":          written,
 	})
 }
 
