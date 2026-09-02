@@ -31,6 +31,19 @@ import (
 // the id becomes a path segment here, so anything outside this set is rejected.
 var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// Tuning defaults for rows stored before the columns existed (or zeroed by
+// hand): they mirror the gorm column defaults on AIModel and the NMS default
+// from the reference config the vendor plugin ships.
+const (
+	defaultDetectionThreshold = 0.25
+	defaultNmsThreshold       = 0.45
+	defaultMaxDetections      = 64
+)
+
+// defaultPostprocessLabels mirrors the plugin's compiled-in label table
+// shape: index 0 is a placeholder so labels[N] names class_id N.
+var defaultPostprocessLabels = []string{"unlabeled", "person", "vehicle", "face", "license_plate"}
+
 // detectionPostprocessProfile returns the stored postprocess_profile for a
 // detection model, falling back to the default when Config is missing,
 // unparseable, or holds an unknown profile.
@@ -99,11 +112,14 @@ func detectionRuntimePath(m *model.AIModel) (string, error) {
 // detectionVariantJSON builds the model_variant sent to ai-runtime for
 // detection models. A JSON-object variant is passed through verbatim (advanced
 // escape hatch — its backend_function must match the selected profile);
-// anything else is replaced with a schema-valid blob composed from the
-// selected postprocess profile plus the stored threshold and max detections,
-// which the plugin reads as detection_threshold / max_boxes. Labels are
-// deliberately absent: the plugin's label table is compiled in and ignores
-// JSON labels; consumers map class_id N -> labels[N-1] from stored metadata.
+// anything else is replaced with the plugin's full config blob, composed from
+// the selected postprocess profile plus stored tuning values. The vendor
+// postprocess plugin rejects partial JSON against its schema ("required"
+// fields), so every key must be present — device-verified 2026-09-02. Of
+// those keys the hailo_* functions only read detection_threshold and
+// max_boxes; labels come from a compiled-in table, so the JSON labels
+// (config labels with a leading placeholder, index 0) are advisory only —
+// consumers map class_id N -> labels[N-1] from stored metadata.
 func detectionVariantJSON(m *model.AIModel) string {
 	if model.ResolveModelType(m.ModelType) != "detection" {
 		return m.Variant
@@ -112,14 +128,22 @@ func detectionVariantJSON(m *model.AIModel) string {
 		return m.Variant
 	}
 	profile, _ := model.LookupDetectionProfile(detectionPostprocessProfile(m))
+	threshold := m.Threshold
+	if threshold <= 0 {
+		threshold = defaultDetectionThreshold
+	}
+	maxBoxes := m.MaxDetections
+	if maxBoxes <= 0 {
+		maxBoxes = defaultMaxDetections
+	}
 	cfg := map[string]interface{}{
-		"backend_function": profile.BackendFunction,
-	}
-	if m.Threshold > 0 {
-		cfg["detection_threshold"] = m.Threshold
-	}
-	if m.MaxDetections > 0 {
-		cfg["max_boxes"] = m.MaxDetections
+		"backend_function":    profile.BackendFunction,
+		"iou_threshold":       detectionNmsThreshold(m),
+		"detection_threshold": threshold,
+		"output_activation":   "none",
+		"label_offset":        1,
+		"max_boxes":           maxBoxes,
+		"labels":              detectionLabels(m),
 	}
 	blob, err := json.Marshal(cfg)
 	if err != nil {
@@ -127,6 +151,45 @@ func detectionVariantJSON(m *model.AIModel) string {
 		return m.Variant
 	}
 	return string(blob)
+}
+
+// detectionNmsThreshold reads nms_threshold from the schema-driven Config
+// JSON, falling back to the schema default for rows without one.
+func detectionNmsThreshold(m *model.AIModel) float64 {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if v, ok := cfg["nms_threshold"].(float64); ok && v > 0 {
+				return v
+			}
+		}
+	}
+	return defaultNmsThreshold
+}
+
+// detectionLabels turns the comma-separated labels config into the JSON
+// labels array the plugin schema requires, keeping index 0 a placeholder so
+// labels[N] names class_id N. Without stored labels the reference default
+// table is used.
+func detectionLabels(m *model.AIModel) []string {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if raw, ok := cfg["labels"].(string); ok && strings.TrimSpace(raw) != "" {
+				parts := strings.Split(raw, ",")
+				labels := []string{"unlabeled"}
+				for _, p := range parts {
+					if name := strings.TrimSpace(p); name != "" {
+						labels = append(labels, name)
+					}
+				}
+				if len(labels) > 1 {
+					return labels
+				}
+			}
+		}
+	}
+	return defaultPostprocessLabels
 }
 
 // removeRuntimeCopy deletes the materialized runtime copy of a model, if any.

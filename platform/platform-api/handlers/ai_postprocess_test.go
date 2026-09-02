@@ -55,6 +55,10 @@ func TestDetectionPostprocessProfile(t *testing.T) {
 	}
 }
 
+// defaultVariantLabels mirrors the plugin's compiled-in table shape: index 0
+// is a placeholder so labels[N] names class_id N.
+var defaultVariantLabels = []interface{}{"unlabeled", "person", "vehicle", "face", "license_plate"}
+
 func TestDetectionVariantJSON(t *testing.T) {
 	verbatim := `{"backend_function":"hailo_yolov8s","label_offset":0}`
 	tests := []struct {
@@ -64,26 +68,46 @@ func TestDetectionVariantJSON(t *testing.T) {
 		passthru bool                   // expect exact passthrough of m.Variant
 	}{
 		{
-			name: "default profile composes backend function and tuning",
+			name: "default profile composes full schema-valid blob",
 			m:    &model.AIModel{ModelType: "detection", Threshold: 0.4, MaxDetections: 32},
 			want: map[string]interface{}{
 				"backend_function":    "hailo_yolov8n",
+				"iou_threshold":       0.45,
 				"detection_threshold": 0.4,
+				"output_activation":   "none",
+				"label_offset":        float64(1),
 				"max_boxes":           float64(32),
+				"labels":              defaultVariantLabels,
 			},
 		},
 		{
-			name: "explicit s profile",
+			name: "explicit s profile with labels and nms from config",
 			m: &model.AIModel{
 				ModelType: "detection",
-				Config:    `{"postprocess_profile":"hailo_yolov8s_384_640"}`,
+				Config:    `{"postprocess_profile":"hailo_yolov8s_384_640","labels":"fire,smoke","nms_threshold":0.6}`,
 			},
-			want: map[string]interface{}{"backend_function": "hailo_yolov8s"},
+			want: map[string]interface{}{
+				"backend_function":    "hailo_yolov8s",
+				"iou_threshold":       0.6,
+				"detection_threshold": 0.25,
+				"output_activation":   "none",
+				"label_offset":        float64(1),
+				"max_boxes":           float64(64),
+				"labels":              []interface{}{"unlabeled", "fire", "smoke"},
+			},
 		},
 		{
-			name: "zero tuning values are omitted",
+			name: "zero tuning values fall back to schema defaults",
 			m:    &model.AIModel{ModelType: "detection"},
-			want: map[string]interface{}{"backend_function": "hailo_yolov8n"},
+			want: map[string]interface{}{
+				"backend_function":    "hailo_yolov8n",
+				"iou_threshold":       0.45,
+				"detection_threshold": 0.25,
+				"output_activation":   "none",
+				"label_offset":        float64(1),
+				"max_boxes":           float64(64),
+				"labels":              defaultVariantLabels,
+			},
 		},
 		{
 			name:     "json variant passes through verbatim",
