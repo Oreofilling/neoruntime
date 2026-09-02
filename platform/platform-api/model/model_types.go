@@ -116,6 +116,19 @@ func LookupDetectionProfile(basename string) (DetectionPostprocessProfile, bool)
 	return DetectionPostprocessProfile{}, false
 }
 
+// LookupDetectionBackendFunction returns the profile a postprocess
+// backend_function name belongs to; ok is false for names outside the
+// verified set (including the generic single-argument functions, which
+// hardcode a 0.4 threshold and COCO labels and are not usable).
+func LookupDetectionBackendFunction(fn string) (DetectionPostprocessProfile, bool) {
+	for _, p := range DetectionPostprocessProfiles {
+		if p.BackendFunction == fn {
+			return p, true
+		}
+	}
+	return DetectionPostprocessProfile{}, false
+}
+
 func detectionProfileOptions() []FieldOption {
 	opts := make([]FieldOption, 0, len(DetectionPostprocessProfiles))
 	for _, p := range DetectionPostprocessProfiles {

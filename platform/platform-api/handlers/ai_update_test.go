@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -386,5 +387,73 @@ func TestRegisterModelDuplicateRejected(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "already exists") {
 		t.Errorf("error must mention duplicate: %s", w.Body.String())
+	}
+}
+
+// A partial custom variant must be rejected at entry with a message naming
+// the missing keys — not stored to fail later at load time.
+func TestUpdateModelRejectsPartialCustomVariant(t *testing.T) {
+	h, fake, _ := newAIUpdateTestEnv(t)
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "partial_det", Name: "partial_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	w := putUpdate(t, h, "partial_det", `{"model_variant":"{\"backend_function\":\"hailo_yolov8n\",\"detection_threshold\":0.5}"}`)
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("partial variant must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "missing required key") {
+		t.Errorf("error must name the missing keys: %s", w.Body.String())
+	}
+	row, _ := h.aiModelRepo.GetByModelID("partial_det")
+	if row.Variant != "" {
+		t.Errorf("rejected variant must not be stored, got %q", row.Variant)
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 0 {
+		t.Errorf("no runtime calls expected, got %v", calls)
+	}
+}
+
+// A schema-complete custom variant is stored verbatim — the escape hatch
+// stays open, only broken blobs are fenced off.
+func TestUpdateModelAcceptsCompleteCustomVariant(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "custom_det", Name: "custom_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	custom := `{"backend_function":"hailo_yolov8s","iou_threshold":0.45,"detection_threshold":0.5,"output_activation":"none","label_offset":1,"max_boxes":32,"labels":["fire","smoke"]}`
+	body := `{"model_variant":` + strconv.Quote(custom) + `}`
+	w := putUpdate(t, h, "custom_det", body)
+	if respCode(t, w) != 0 {
+		t.Fatalf("complete variant must be accepted: %s", w.Body.String())
+	}
+	row, _ := h.aiModelRepo.GetByModelID("custom_det")
+	if row.Variant != custom {
+		t.Errorf("variant must be stored verbatim, got %q", row.Variant)
+	}
+}
+
+// RegisterModel applies the same guardrail: a blob pointing at a generic
+// (hardcoded-threshold) function never reaches the DB.
+func TestRegisterModelRejectsUnsupportedBackendFunction(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := bytes.NewReader([]byte(`{"model_id":"gen_fn","model_path":"/x.hef","model_type":"detection","model_variant":"{\"backend_function\":\"yolov8s\",\"iou_threshold\":0.45,\"detection_threshold\":0.5,\"output_activation\":\"none\",\"label_offset\":1,\"max_boxes\":32,\"labels\":[]}"}`))
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ai/models", body)
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.RegisterModel(c)
+
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("generic function must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not supported") {
+		t.Errorf("error must name the unsupported function: %s", w.Body.String())
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("gen_fn"); row != nil {
+		t.Errorf("rejected model must not be persisted, got %+v", row)
 	}
 }

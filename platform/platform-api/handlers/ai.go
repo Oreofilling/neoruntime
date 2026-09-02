@@ -493,6 +493,16 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 		req.ModelType = resolved
 	}
 
+	// Same custom-variant guardrail as UpdateModel: a stored blob that the
+	// plugin will reject makes the model unloadable from the moment it is
+	// registered, so validate at entry.
+	if model.ResolveModelType(req.ModelType) == "detection" {
+		if err := validateDetectionVariant(req.Variant); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
+			return
+		}
+	}
+
 	if h.aiModelRepo != nil {
 		if existing, _ := h.aiModelRepo.GetByModelID(req.ModelID); existing != nil {
 			Resp(c).FailMsg(CodeInvalidRequest, "Model ID already exists: "+req.ModelID+" (use update instead)")
@@ -609,6 +619,16 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 			return
 		}
 		newModelType = resolved
+	}
+
+	// Custom `{…}` variant JSON is the advanced escape hatch into the vendor
+	// plugin's schema — reject incomplete or unsupported blobs here rather
+	// than at load time, where the plugin answers with a bare "required".
+	if req.Variant != nil && model.ResolveModelType(newModelType) == "detection" {
+		if err := validateDetectionVariant(*req.Variant); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_variant: "+err.Error())
+			return
+		}
 	}
 
 	// Optional file swap: an empty file_hash is a metadata-only update.
