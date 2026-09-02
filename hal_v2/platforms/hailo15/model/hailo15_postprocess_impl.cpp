@@ -269,6 +269,36 @@ static void refresh_labels_from_vendor_json(Hailo15PostPriv *p)
 }
 
 /**
+ * Resolve a detection's label text. The vendor JSON labels[] mapping wins
+ * whenever class_id resolves into it: it is user-authored and matches the
+ * classes the model was actually trained on. The plugin's compiled-in label
+ * (baked for the reference 4-class table: person/vehicle/face/license_plate)
+ * is only a fallback for ids outside the mapping or configs without labels.
+ * Convention: labels[N] names class_id N when label_offset shifts the index
+ * (the platform composes arrays with a placeholder at index 0).
+ */
+static void resolve_detection_label(const Hailo15PostPriv *p, const std::string &plugin_label,
+                                    int32_t class_id, char *out, size_t out_size)
+{
+    if (p && !p->labels.empty())
+    {
+        auto in_range = [&](int32_t i) { return i >= 0 && (size_t)i < p->labels.size(); };
+        int32_t li = class_id;
+        if (!in_range(li) && p->label_offset != 0 && in_range(class_id + p->label_offset))
+            li = class_id + p->label_offset;
+        else if (!in_range(li) && p->label_offset != 0 && in_range(class_id - p->label_offset))
+            li = class_id - p->label_offset;
+        if (in_range(li))
+        {
+            std::snprintf(out, out_size, "%s", p->labels[(size_t)li].c_str());
+            return;
+        }
+    }
+    if (!plugin_label.empty())
+        std::snprintf(out, out_size, "%s", plugin_label.c_str());
+}
+
+/**
  * Map merged JSON scalar keys into HalPostprocessConfig for the active session type.
  * Vendor names (e.g. yolov5.json detection_threshold / iou_threshold) align with in-tree analytics configs.
  */
@@ -1448,24 +1478,7 @@ static int run_vendor_plugin(Hailo15PostPriv *p, const HalTensor *outputs, int n
                 d.confidence = det->get_confidence();
                 d.class_id = det->get_class_id();
                 d.track_id = -1;
-                const std::string lbl = det->get_label();
-                if (!lbl.empty())
-                {
-                    std::snprintf(d.label, sizeof(d.label), "%s", lbl.c_str());
-                }
-                else if (p && !p->labels.empty())
-                {
-                    // Fallback: map class_id to vendor JSON labels[] if plugin doesn't provide label text.
-                    const int32_t cid = d.class_id;
-                    auto in_range = [&](int32_t i) { return i >= 0 && (size_t)i < p->labels.size(); };
-                    int32_t li = cid;
-                    if (!in_range(li) && p->label_offset != 0 && in_range(cid + p->label_offset))
-                        li = cid + p->label_offset;
-                    else if (!in_range(li) && p->label_offset != 0 && in_range(cid - p->label_offset))
-                        li = cid - p->label_offset;
-                    if (in_range(li))
-                        std::snprintf(d.label, sizeof(d.label), "%s", p->labels[(size_t)li].c_str());
-                }
+                resolve_detection_label(p, det->get_label(), d.class_id, d.label, sizeof(d.label));
                 out.detections[out.num_detections++] = d;
             }
             return HAL_OK;
@@ -1725,23 +1738,7 @@ static int run_vendor_plugin(Hailo15PostPriv *p, const HalTensor *outputs, int n
                 d.confidence = det->get_confidence();
                 d.class_id = det->get_class_id();
                 d.track_id = -1;
-                const std::string lbl = det->get_label();
-                if (!lbl.empty())
-                {
-                    std::snprintf(d.label, sizeof(d.label), "%s", lbl.c_str());
-                }
-                else if (p && !p->labels.empty())
-                {
-                    const int32_t cid = d.class_id;
-                    auto in_range = [&](int32_t i) { return i >= 0 && (size_t)i < p->labels.size(); };
-                    int32_t li = cid;
-                    if (!in_range(li) && p->label_offset != 0 && in_range(cid + p->label_offset))
-                        li = cid + p->label_offset;
-                    else if (!in_range(li) && p->label_offset != 0 && in_range(cid - p->label_offset))
-                        li = cid - p->label_offset;
-                    if (in_range(li))
-                        std::snprintf(d.label, sizeof(d.label), "%s", p->labels[(size_t)li].c_str());
-                }
+                resolve_detection_label(p, det->get_label(), d.class_id, d.label, sizeof(d.label));
                 if (min_c > 0.f && d.confidence < min_c)
                     continue;
                 out.detections[out.num_detections++] = d;
