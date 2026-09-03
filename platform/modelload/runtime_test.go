@@ -2,6 +2,7 @@ package modelload
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -348,6 +349,94 @@ func TestMaterializeCopyFallback(t *testing.T) {
 	body, err := os.ReadFile(tmp)
 	if err != nil || string(body) != "copy-me" {
 		t.Fatalf("copy mismatch: %q err=%v", body, err)
+	}
+}
+
+// TestMaterializeSurvivesStaleStagedHardlink pins the device incident: an
+// attempt killed between link and rename leaves a staged temp that is itself a
+// hardlink to the stored blob. The next attempt must publish through its own
+// unique temp name and leave the blob's bytes intact — the old pid-only temp
+// name let the retry collide, fall back to the truncating copy, and zero the
+// shared inode (blob, runtime copy and stale temps collapsing to one 0-byte
+// file).
+func TestMaterializeSurvivesStaleStagedHardlink(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "blob.hef")
+	writeHEF(t, src, "blob-bytes")
+	dst := filepath.Join(dir, "runtime.hef")
+
+	// A crashed earlier attempt left this behind: a hardlink to the blob.
+	stale := fmt.Sprintf("%s.tmp-%d", dst, os.Getpid())
+	if err := os.Link(src, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := materialize(src, dst); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	dstBody, err := os.ReadFile(dst)
+	if err != nil || string(dstBody) != "blob-bytes" {
+		t.Fatalf("dst body = %q err=%v, want published blob bytes", dstBody, err)
+	}
+	srcBody, err := os.ReadFile(src)
+	if err != nil || string(srcBody) != "blob-bytes" {
+		t.Fatalf("stored blob destroyed via stale staged hardlink: %q err=%v", srcBody, err)
+	}
+}
+
+// TestMaterializeIdempotentRerunLeavesNoDebris pins the heal-flow shape: load
+// composes the registration twice back-to-back (stale-check plus the real
+// registration), so the second materialize finds dst already hardlinked to the
+// stored blob. Re-staging would hit rename()'s same-inode no-op and strand a
+// temp name per heal; the short-circuit must leave nothing behind.
+func TestMaterializeIdempotentRerunLeavesNoDebris(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "blob.hef")
+	writeHEF(t, src, "blob-bytes")
+	dst := filepath.Join(dir, "runtime.hef")
+
+	for i := 0; i < 2; i++ {
+		if err := materialize(src, dst); err != nil {
+			t.Fatalf("materialize pass %d: %v", i+1, err)
+		}
+	}
+	dstBody, err := os.ReadFile(dst)
+	if err != nil || string(dstBody) != "blob-bytes" {
+		t.Fatalf("dst body = %q err=%v, want published blob bytes", dstBody, err)
+	}
+	srcBody, err := os.ReadFile(src)
+	if err != nil || string(srcBody) != "blob-bytes" {
+		t.Fatalf("stored blob rewritten: %q err=%v", srcBody, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Fatalf("idempotent re-run stranded staging debris: %s", e.Name())
+		}
+	}
+}
+
+// TestCopyIntoRefusesExistingTarget pins the structural guard: copyInto must
+// never open an existing path — O_TRUNC on a target that happens to be a
+// hardlink to the source is exactly the blob-destroying write.
+func TestCopyIntoRefusesExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "blob.hef")
+	writeHEF(t, src, "blob-bytes")
+	existing := filepath.Join(dir, "existing.hef")
+	if err := os.Link(src, existing); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyInto(src, existing); err == nil {
+		t.Fatal("copyInto must refuse to open an existing target")
+	}
+	srcBody, err := os.ReadFile(src)
+	if err != nil || string(srcBody) != "blob-bytes" {
+		t.Fatalf("shared inode truncated through copy target: %q err=%v", srcBody, err)
 	}
 }
 

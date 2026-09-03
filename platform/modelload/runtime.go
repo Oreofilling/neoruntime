@@ -119,13 +119,30 @@ func detectionRuntimePath(m *model.AIModel) (string, error) {
 }
 
 // materialize places the stored HEF at dst, preferring a hardlink and falling
-// back to a copy for foreign filesystems. Both variants stage into a
-// pid-suffixed temp name and rename into place: platform-api loads and
-// app-manager preloads can materialize the same model concurrently, and a
-// plain truncate-write fallback could clobber the shared inode (the CAS blob
-// itself) of a hardlink another process just published.
+// back to a copy for foreign filesystems. Both variants stage into a temp name
+// and rename into place: platform-api loads and app-manager preloads can
+// materialize the same model concurrently, and a plain truncate-write fallback
+// could clobber the shared inode (the CAS blob itself) of a hardlink another
+// process just published.
+//
+// The temp name is pid + nanotime unique, and the copy fallback creates with
+// O_EXCL. A pid-only name is not enough: a staging file left behind by a killed
+// or crashed attempt is itself a hardlink to the blob, so the next same-pid
+// attempt's link() hits EEXIST, falls back to the copy, and its O_TRUNC create
+// zeroes that shared inode — observed on device as a CAS blob, its runtime
+// copy, and two stale temp names all collapsed to one 0-byte inode. With a
+// unique name the stale file is never reused, and O_EXCL makes copyInto
+// structurally incapable of truncating any pre-existing path.
 func materialize(src, dst string) error {
-	tmp := fmt.Sprintf("%s.tmp-%d", dst, os.Getpid())
+	// Already published: dst and src are hardlinks to the same stored bytes.
+	// Short-circuit instead of staging — rename(tmp, dst) between two links of
+	// one inode is a POSIX no-op, so a staged temp published over its own
+	// source would survive as debris (and, before O_EXCL, was the trap that
+	// let the next attempt's copy fallback truncate the blob).
+	if sameFile(src, dst) {
+		return nil
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d-%d", dst, os.Getpid(), time.Now().UnixNano())
 	if err := os.Link(src, tmp); err != nil {
 		if err := copyInto(src, tmp); err != nil {
 			os.Remove(tmp)
@@ -139,15 +156,30 @@ func materialize(src, dst string) error {
 	return nil
 }
 
-// copyInto streams src into a freshly created dst. Callers stage into a temp
-// name first — this truncates on create, so it must never target a live path.
+// sameFile reports whether path and candidate already refer to one inode —
+// missing candidate is simply not-yet-published.
+func sameFile(path, candidate string) bool {
+	pathStat, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	candidateStat, err := os.Stat(candidate)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(pathStat, candidateStat)
+}
+
+// copyInto streams src into a freshly created dst. Creation is O_EXCL: this
+// must never open (let alone truncate) an existing path — a dst that already
+// exists could be a hardlink to the stored blob itself.
 func copyInto(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open stored model: %w", err)
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to create runtime copy: %w", err)
 	}
