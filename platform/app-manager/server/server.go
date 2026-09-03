@@ -595,6 +595,20 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	// won resolution (best-effort, never fails the install).
 	s.checkShadowedModels(ctx, appManifest, resolution.shadowed, nil)
 
+	// Store the manifest under the managed manifests root before
+	// registering, so cleanup can never target a caller-owned parent
+	// directory (CLI tarball unpack dirs, legacy top-level paths).
+	canonicalPath, err := canonicalizeManifest(req.ManifestPath, appManifest.Metadata.ID)
+	if err != nil {
+		return &proto.InstallResponse{
+			Status: &proto.Status{
+				Success: false,
+				Message: fmt.Sprintf("Failed to store manifest: %v", err),
+				Code:    500,
+			},
+		}, nil
+	}
+
 	// Create app info with plugin fields
 	appInfo := &registry.AppInfo{
 		ID:           appManifest.Metadata.ID,
@@ -602,7 +616,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		Version:      appManifest.Metadata.Version,
 		Image:        appManifest.GetNormalizedImage(),
 		State:        registry.AppStateInstalled,
-		ManifestPath: req.ManifestPath,
+		ManifestPath: canonicalPath,
 		InstancePath: fmt.Sprintf("%s/%s", s.config.Apps.InstancesPath, appManifest.Metadata.ID),
 		IsPlugin:     appManifest.IsPlugin(),
 	}
@@ -928,13 +942,23 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 
 	// Phase: registering (80-95%)
 	task.Update("registering", 85, "Registering application...")
+
+	// Store the manifest under the managed manifests root before
+	// registering, so cleanup can never target a caller-owned parent
+	// directory (CLI tarball unpack dirs, legacy top-level paths).
+	canonicalPath, err := canonicalizeManifest(manifestPath, appManifest.Metadata.ID)
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to store manifest: %v", err))
+		return
+	}
+
 	appInfo := &registry.AppInfo{
 		ID:           appManifest.Metadata.ID,
 		Name:         appManifest.Metadata.Name,
 		Version:      appManifest.Metadata.Version,
 		Image:        appManifest.GetNormalizedImage(),
 		State:        registry.AppStateInstalled,
-		ManifestPath: manifestPath,
+		ManifestPath: canonicalPath,
 		InstancePath: fmt.Sprintf("%s/%s", s.config.Apps.InstancesPath, appManifest.Metadata.ID),
 		IsPlugin:     appManifest.IsPlugin(),
 	}
@@ -1573,11 +1597,18 @@ func (s *AppManagerServer) UninstallApp(ctx context.Context, req *proto.Uninstal
 		}
 	}
 
-	// Remove uploaded manifest file and its parent directory
+	// Remove the manifest. The app's own directory under the managed
+	// manifests root is removed with it; a manifest registered from
+	// anywhere else (legacy installs at the install-root top level, CLI
+	// installs from unpacked tarballs) gets only the file removed — never
+	// a parent directory the platform does not own.
 	if appInfo.ManifestPath != "" {
-		manifestDir := filepath.Dir(appInfo.ManifestPath)
-		if err := os.RemoveAll(manifestDir); err != nil {
-			logger.Warn("Failed to remove manifest dir %s: %v", manifestDir, err)
+		if manifestDir, ok := managedManifestDir(appInfo.ManifestPath, appInfo.ID); ok {
+			if err := os.RemoveAll(manifestDir); err != nil {
+				logger.Warn("Failed to remove manifest dir %s: %v", manifestDir, err)
+			}
+		} else if err := os.Remove(appInfo.ManifestPath); err != nil && !os.IsNotExist(err) {
+			logger.Warn("Failed to remove manifest file %s: %v", appInfo.ManifestPath, err)
 		}
 	}
 
