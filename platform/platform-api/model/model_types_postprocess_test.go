@@ -7,6 +7,12 @@ func TestLookupDetectionProfile(t *testing.T) {
 	if !ok || p.BackendFunction != "hailo_yolov8s" {
 		t.Fatalf("lookup s profile = %+v ok=%v", p, ok)
 	}
+	// Device-verified 2026-09-02: the parking-lot model maps 1:1 (its
+	// backend function is the network name itself).
+	p, ok = LookupDetectionProfile("yolov5m_vehicles")
+	if !ok || p.BackendFunction != "yolov5m_vehicles" {
+		t.Fatalf("lookup vehicles profile = %+v ok=%v", p, ok)
+	}
 	if _, ok := LookupDetectionProfile(DefaultDetectionProfile); !ok {
 		t.Fatalf("default profile %q missing from table", DefaultDetectionProfile)
 	}

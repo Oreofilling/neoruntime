@@ -18,10 +18,11 @@ type AIModel struct {
 	FileHash string `gorm:"index" json:"file_hash"` // SHA256 of model binary
 
 	// AI Task metadata
-	ModelType     string  `json:"model_type"`                       // detection, classification, landmarks, segmentation
-	Variant       string  `json:"variant"`                          // yolov8n, yolov8s, yolov5, mediapipe_face, ...
-	Threshold     float32 `gorm:"default:0.25" json:"threshold"`    // confidence threshold
-	MaxDetections int     `gorm:"default:64" json:"max_detections"` // max results per frame
+	ModelType     string  `json:"model_type"`                          // semantic type: detection, classification, landmarks, segmentation
+	Variant       string  `json:"variant"`                             // yolov8n, yolov8s, yolov5, mediapipe_face, ...
+	OutputMode    string  `gorm:"default:platform" json:"output_mode"` // delivery: "platform" (plugin-decoded) or "raw" (bare tensors)
+	Threshold     float32 `gorm:"default:0.25" json:"threshold"`       // confidence threshold
+	MaxDetections int     `gorm:"default:64" json:"max_detections"`    // max results per frame
 
 	// Auto-extracted HEF metadata (JSON)
 	VStreamInfo string `gorm:"type:text" json:"vstream_info"` // JSON: input/output tensor specs from hailortcli parse-hef

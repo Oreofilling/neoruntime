@@ -103,6 +103,14 @@ var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
 	{Basename: "hailo_yolov8n_384_640", BackendFunction: "hailo_yolov8n", Label: "YOLOv8n 384x640 (default)"},
 	{Basename: "hailo_yolov8s_384_640", BackendFunction: "hailo_yolov8s", Label: "YOLOv8s 384x640"},
 	{Basename: "hailo_yolov8m_384_640", BackendFunction: "hailo_yolov8m", Label: "YOLOv8m 384x640"},
+	// Customer-trained parking-lot model: RGB888 1920x1080 in, one class.
+	// Unlike the yolov8 profiles its NMS tensor is named
+	// yolov5m_vehicles/yolov5_nms_postprocess, so only the composed
+	// variant's backend_function routes it — the plugin's default selection
+	// never matches (fire-smoke signature). Device-verified 2026-09-02:
+	// output decodes exactly like the hand-decoded NMS blob, but the label
+	// table is baked ("car") and ignores the JSON labels.
+	{Basename: "yolov5m_vehicles", BackendFunction: "yolov5m_vehicles", Label: "YOLOv5m Vehicles 1920x1080"},
 }
 
 // LookupDetectionProfile returns the profile for a basename; ok is false for
@@ -223,6 +231,59 @@ var SupportedModelTypes = []ModelTypeDef{
 // SupportedFormats lists accepted model file formats for the current platform.
 var SupportedFormats = []FileFormat{
 	{Extension: ".hef", MIMEType: "application/octet-stream", Label: "Hailo HEF"},
+}
+
+// PackageExtension is the import-only single-file container (AMPK layout, see
+// storage/modelpackage.go): platform metadata JSON + the HEF, unpacked and
+// staged as a plain .hef blob at parse time. Deliberately not part of
+// SupportedFormats — it is a transport container, not a model binary.
+const PackageExtension = ".bin"
+
+// Output delivery modes — orthogonal to the semantic model type. The type
+// answers "what do the outputs mean" (UI/metadata); the mode answers "how are
+// they delivered": plugin-decoded structured results, or bare NPU tensors the
+// consumer decodes itself.
+const (
+	OutputModePlatform = "platform" // platform postprocess decodes NMS blobs into structured results
+	OutputModeRaw      = "raw"      // no postprocess session; Infer returns raw output tensors
+)
+
+// ResolveOutputMode normalizes a requested/stored output mode. Empty resolves
+// to platform (rows written before the column existed, requests that omit it).
+// ok is false for values outside the known set — API boundaries should reject
+// those rather than silently coerce.
+func ResolveOutputMode(raw string) (mode string, ok bool) {
+	trimmed := strings.TrimSpace(raw)
+	switch trimmed {
+	case "":
+		return OutputModePlatform, true
+	case OutputModePlatform, OutputModeRaw:
+		return trimmed, true
+	default:
+		return "", false
+	}
+}
+
+// HEF output format classifications, derived from parse-hef vstream info.
+// This — not the semantic model type — decides whether the platform
+// postprocess path is even possible.
+const (
+	OutputFormatNMS        = "nms"         // NMS layer compiled in: fixed-format detections blob
+	OutputFormatFeatureMap = "feature_map" // raw feature maps; only consumable in raw output mode
+)
+
+// ClassifyOutputFormat inspects parse-hef vstream info for an NMS-layer
+// output (tensor names like <basename>/yolov8_nms_postprocess). Empty input
+// returns "" (unknown) so legacy rows without vstream info skip
+// cross-validation instead of failing open or closed.
+func ClassifyOutputFormat(vstreamInfo string) string {
+	if strings.TrimSpace(vstreamInfo) == "" {
+		return ""
+	}
+	if strings.Contains(vstreamInfo, "_nms_postprocess") {
+		return OutputFormatNMS
+	}
+	return OutputFormatFeatureMap
 }
 
 // ResolveModelType normalizes aliases to canonical ID.
