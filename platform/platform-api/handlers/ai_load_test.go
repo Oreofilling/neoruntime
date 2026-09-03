@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,6 +12,8 @@ import (
 
 	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
+
+	inferencepb "aipc/platform/ai-runtime/proto"
 )
 
 // postModelAction drives the load/unload endpoints without a live gin engine.
@@ -122,6 +126,86 @@ func TestUnloadModelLiveRowUnregisters(t *testing.T) {
 	row, _ := h.aiModelRepo.GetByModelID("live_det")
 	if row.Status != "uploaded" || row.DesiredState != "unloaded" {
 		t.Errorf("row after unload: %q/%q, want uploaded/unloaded", row.Status, row.DesiredState)
+	}
+}
+
+// A legacy preload registration handed the runtime the raw CAS blob path
+// with no variant — the silent-degradation live trap this change closes the
+// loop on. Load detects the path cannot be the composed registration (path is
+// the only signal ModelInfo exposes), unregisters, and re-registers under the
+// materialized profile basename with the full-key variant blob.
+func TestLoadModelHealsLegacyBareBlobRegistration(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	oldRoot := constants.RootPath()
+	root := t.TempDir()
+	constants.SetRootPath(root)
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	blob := seedBlob(t, store, "h1")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "legacy_det", Name: "legacy_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1", DesiredState: "loaded",
+	})
+	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "legacy_det", ModelPath: blob})
+
+	w := postModelAction(t, h, "load", "legacy_det")
+	if respCode(t, w) != 0 {
+		t.Fatalf("legacy bare-blob registration must heal via reload, got: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:legacy_det" || calls[1] != "load:legacy_det" {
+		t.Fatalf("expected unload+reload heal, got %v", calls)
+	}
+	wantPath := filepath.Join(root, "models", "runtime", "legacy_det", "hailo_yolov8n_384_640.hef")
+	if got := fake.registeredPath("legacy_det"); got != wantPath {
+		t.Fatalf("re-registered path = %q, want materialized %q", got, wantPath)
+	}
+	variant := fake.registeredVariant("legacy_det")
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(variant), &parsed); err != nil {
+		t.Fatalf("re-registered variant is not JSON: %v (%q)", err, variant)
+	}
+	if parsed["backend_function"] != "hailo_yolov8n" {
+		t.Fatalf("variant backend_function = %v, want hailo_yolov8n", parsed["backend_function"])
+	}
+	if _, ok := parsed["detection_threshold"]; !ok {
+		t.Fatalf("variant must carry the full plugin schema keys, got %v", parsed)
+	}
+}
+
+// App-owned entries are somebody's live registration, not residue: an owner
+// mismatched path must not be healed away.
+func TestLoadModelDoesNotHealAppOwnedRegistration(t *testing.T) {
+	h, fake, _ := newAIUpdateTestEnv(t)
+	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "app_det", ModelPath: "/elsewhere/x.hef", OwnerId: "app-1"})
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "app_det", Name: "app_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+
+	w := postModelAction(t, h, "load", "app_det")
+	if respCode(t, w) != CodeInvalidRequest || !strings.Contains(w.Body.String(), "already loaded") {
+		t.Fatalf("owned registration must stay already-loaded, got: %s", w.Body.String())
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 0 {
+		t.Errorf("no runtime mutation expected, got %v", calls)
+	}
+}
+
+// Transient registrations (bundled models) are equally not heal targets.
+func TestLoadModelDoesNotHealTransientRegistration(t *testing.T) {
+	h, fake, _ := newAIUpdateTestEnv(t)
+	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "tmp_det", ModelPath: "/elsewhere/y.hef", Transient: true})
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "tmp_det", Name: "tmp_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h2.hef", FileHash: "h2",
+	})
+
+	w := postModelAction(t, h, "load", "tmp_det")
+	if respCode(t, w) != CodeInvalidRequest || !strings.Contains(w.Body.String(), "already loaded") {
+		t.Fatalf("transient registration must stay already-loaded, got: %s", w.Body.String())
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 0 {
+		t.Errorf("no runtime mutation expected, got %v", calls)
 	}
 }
 

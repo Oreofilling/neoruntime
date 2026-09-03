@@ -583,6 +583,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	ai.PUT("/models/:model_id", apiHandlers.UpdateModel)
 	ai.DELETE("/models/:model_id", apiHandlers.UnregisterModel)
 	ai.GET("/models/:model_id/apps", apiHandlers.GetModelApps)
+	ai.GET("/models/:model_id/export", apiHandlers.ExportModel)
 	ai.POST("/models/:model_id/load", apiHandlers.LoadModel)
 	ai.POST("/models/:model_id/unload", apiHandlers.UnloadModel)
 	ai.GET("/stats", apiHandlers.GetAIStats)

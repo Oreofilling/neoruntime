@@ -39,6 +39,7 @@ type fakeAIRuntime struct {
 	regPaths    map[string]string
 	regVariants map[string]string
 	live        map[string]bool
+	liveInfos   map[string]*inferencepb.ModelInfo
 	loadFail    bool
 }
 
@@ -47,6 +48,7 @@ func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.Model
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "unload:"+in.ModelId)
 	delete(f.live, in.ModelId)
+	delete(f.liveInfos, in.ModelId)
 	return &inferencepb.Status{Success: true}, nil
 }
 
@@ -67,6 +69,12 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 			f.live = map[string]bool{}
 		}
 		f.live[in.ModelId] = true
+		if f.liveInfos == nil {
+			f.liveInfos = map[string]*inferencepb.ModelInfo{}
+		}
+		f.liveInfos[in.ModelId] = &inferencepb.ModelInfo{
+			ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: in.OwnerId,
+		}
 	}
 	if f.loadFail {
 		return &inferencepb.ModelRegisterResponse{
@@ -82,13 +90,25 @@ func (f *fakeAIRuntime) registeredVariant(modelID string) string {
 	return f.regVariants[modelID]
 }
 
+func (f *fakeAIRuntime) registeredPath(modelID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.regPaths[modelID]
+}
+
 // ListModels reports the live set so handlers reconcile against a runtime
-// view that evolves with Register/Unregister calls.
+// view that evolves with Register/Unregister calls. Entries seeded via
+// markLiveEntry keep their path/owner/transient fields — the heal logic in
+// LoadModel reads exactly those.
 func (f *fakeAIRuntime) ListModels(_ context.Context, _ *inferencepb.Empty) (*inferencepb.ModelListResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	resp := &inferencepb.ModelListResponse{}
 	for id := range f.live {
+		if info := f.liveInfos[id]; info != nil {
+			resp.Models = append(resp.Models, info)
+			continue
+		}
 		resp.Models = append(resp.Models, &inferencepb.ModelInfo{ModelId: id})
 	}
 	return resp, nil
@@ -103,6 +123,21 @@ func (f *fakeAIRuntime) markLive(id string) {
 		f.live = map[string]bool{}
 	}
 	f.live[id] = true
+}
+
+// markLiveEntry seeds a runtime entry with its full registration info —
+// e.g. a legacy preload registration carrying the raw CAS blob path.
+func (f *fakeAIRuntime) markLiveEntry(info *inferencepb.ModelInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.live == nil {
+		f.live = map[string]bool{}
+	}
+	if f.liveInfos == nil {
+		f.liveInfos = map[string]*inferencepb.ModelInfo{}
+	}
+	f.live[info.ModelId] = true
+	f.liveInfos[info.ModelId] = info
 }
 
 func (f *fakeAIRuntime) snapshot() ([]string, map[string]string) {
