@@ -36,21 +36,32 @@ func writeHEF(t *testing.T, path, body string) {
 
 func TestDetectionPostprocessProfile(t *testing.T) {
 	tests := []struct {
-		name string
-		cfg  string
-		want string
+		name    string
+		cfg     string
+		want    string
+		wantErr bool
 	}{
-		{"empty config", "", model.DefaultDetectionProfile},
-		{"valid s profile", `{"postprocess_profile":"hailo_yolov8s_384_640"}`, "hailo_yolov8s_384_640"},
-		{"unknown profile", `{"postprocess_profile":"yolov8x_640_640"}`, model.DefaultDetectionProfile},
-		{"invalid json", "{not json", model.DefaultDetectionProfile},
-		{"wrong value type", `{"postprocess_profile":42}`, model.DefaultDetectionProfile},
+		{"empty config", "", model.DefaultDetectionProfile, false},
+		{"valid s profile", `{"postprocess_profile":"hailo_yolov8s_384_640"}`, "hailo_yolov8s_384_640", false},
+		{"unknown profile", `{"postprocess_profile":"yolov8x_640_640"}`, "", true},
+		{"invalid json", "{not json", model.DefaultDetectionProfile, false},
+		{"wrong value type", `{"postprocess_profile":42}`, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &model.AIModel{Config: tt.cfg}
-			if got := detectionPostprocessProfile(m); got != tt.want {
-				t.Fatalf("detectionPostprocessProfile() = %q, want %q", got, tt.want)
+			got, err := DetectionPostprocessProfile(m)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("DetectionPostprocessProfile() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DetectionPostprocessProfile() unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("DetectionPostprocessProfile() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -123,7 +134,10 @@ func TestDetectionVariantJSON(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := DetectionVariantJSON(tt.m)
+			got, err := DetectionVariantJSON(tt.m)
+			if err != nil {
+				t.Fatalf("DetectionVariantJSON() unexpected error: %v", err)
+			}
 			if tt.passthru {
 				if got != tt.m.Variant {
 					t.Fatalf("DetectionVariantJSON() = %q, want passthrough %q", got, tt.m.Variant)
@@ -235,6 +249,16 @@ func TestRuntimeRegistration(t *testing.T) {
 		}
 		if !strings.HasSuffix(path, "hailo_yolov8s_384_640.hef") {
 			t.Fatalf("path = %q, want hailo_yolov8s_384_640.hef suffix", path)
+		}
+	})
+
+	t.Run("unknown postprocess_profile fails load", func(t *testing.T) {
+		m := &model.AIModel{
+			ModelID: "typo_profile", ModelType: "detection", FilePath: blob,
+			Config: `{"postprocess_profile":"yolov8x_640_640"}`,
+		}
+		if _, _, _, err := RuntimeRegistration(m); err == nil {
+			t.Fatal("RuntimeRegistration: want error for unknown postprocess_profile, got nil")
 		}
 	})
 

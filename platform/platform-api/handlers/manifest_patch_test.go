@@ -193,7 +193,7 @@ func TestPatchManifestSpecModelsMap(t *testing.T) {
 		"manifest_path": `+quoteJSON(path)+`,
 		"fields": {
 			"spec.models": {
-				"detector": {"id": "yolov8s-640", "path": "/opt/models/yolov8s.hef", "type": "detection", "required": true}
+				"detector": {"id": "yolov8s-640", "path": "/opt/models/yolov8s.bin", "required": true}
 			}
 		}
 	}`)
@@ -208,7 +208,6 @@ func TestPatchManifestSpecModelsMap(t *testing.T) {
 					Models map[string]struct {
 						ID       string `json:"id"`
 						Path     string `json:"path"`
-						Type     string `json:"type"`
 						Required bool   `json:"required"`
 					} `json:"models"`
 				} `json:"spec"`
@@ -218,7 +217,7 @@ func TestPatchManifestSpecModelsMap(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode success body: %v", err)
 	}
-	if got := resp.Data.Manifest.Spec.Models["detector"]; got.ID != "yolov8s-640" || got.Path != "/opt/models/yolov8s.hef" || got.Type != "detection" || !got.Required {
+	if got := resp.Data.Manifest.Spec.Models["detector"]; got.ID != "yolov8s-640" || got.Path != "/opt/models/yolov8s.bin" || !got.Required {
 		t.Errorf("response models[detector] = %+v", got)
 	}
 
@@ -229,7 +228,7 @@ func TestPatchManifestSpecModelsMap(t *testing.T) {
 	// jsonToNode deliberately keeps JSON scalar quoting (type fidelity), so
 	// patch-written map keys/values land double-quoted — valid YAML that
 	// round-trips identically.
-	for _, want := range []string{"models:", `"detector":`, `"id": "yolov8s-640"`, `"path": "/opt/models/yolov8s.hef"`, `"type": "detection"`, `"required": true`} {
+	for _, want := range []string{"models:", `"detector":`, `"id": "yolov8s-640"`, `"path": "/opt/models/yolov8s.bin"`, `"required": true`} {
 		if !strings.Contains(string(onDisk), want) {
 			t.Errorf("disk missing %q:\n%s", want, onDisk)
 		}

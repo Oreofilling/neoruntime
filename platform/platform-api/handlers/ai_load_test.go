@@ -32,6 +32,38 @@ func postModelAction(t *testing.T, h *APIHandlers, action, modelID string) *http
 	return w
 }
 
+// Deleting a model whose row is stuck at "uploaded" while the runtime still
+// serves it must evict the runtime entry too — otherwise a zombie keeps
+// serving a model whose blob has just been deleted.
+func TestUnregisterModelEvictsRuntimeEntryDespiteStaleRow(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	blob := seedBlob(t, store, "hz")
+	// Row says uploaded, runtime says serving — the runtime wins.
+	fake.markLive("zombie_det")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "zombie_det", Name: "zombie_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "hz",
+	})
+
+	w := deleteModel(t, h, "zombie_det")
+	if respCode(t, w) != 0 {
+		t.Fatalf("delete failed: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 1 || calls[0] != "unload:zombie_det" {
+		t.Fatalf("delete must evict the live registration, got %v", calls)
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("zombie_det"); row != nil {
+		t.Errorf("row must be gone, got %+v", row)
+	}
+	if store.Exists("hz", ".hef") {
+		t.Error("last-referenced blob must be deleted with the row")
+	}
+}
+
 // A row left "loaded" by a solo ai-runtime restart must not deadlock: load
 // heals the stale status and actually registers the model again.
 func TestLoadModelHealsStaleLoadedRow(t *testing.T) {

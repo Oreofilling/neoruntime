@@ -51,21 +51,42 @@ const (
 // shape: index 0 is a placeholder so labels[N] names class_id N.
 var defaultPostprocessLabels = []string{"unlabeled", "person", "vehicle", "face", "license_plate"}
 
-// detectionPostprocessProfile returns the stored postprocess_profile for a
+// DetectionPostprocessProfile returns the stored postprocess_profile for a
 // detection model, falling back to the default when Config is missing,
-// unparseable, or holds an unknown profile.
-func detectionPostprocessProfile(m *model.AIModel) string {
+// unparseable, or has no postprocess_profile key (legacy rows). A value that
+// is present but names an unknown profile — a typo'd postprocess_profile — is
+// an error rather than a silent fallback: the typo would otherwise mismatch
+// the model to the default profile's materialization basename and backend
+// function at load time with no diagnostic. Exported because app-manager's
+// bundled-package unpacker names the extracted HEF after it (the plugin
+// basename passthrough) and platform-api pins it into exported packages.
+func DetectionPostprocessProfile(m *model.AIModel) (string, error) {
 	if m.Config != "" {
 		var cfg map[string]interface{}
 		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
-			if v, ok := cfg["postprocess_profile"].(string); ok {
-				if _, valid := model.LookupDetectionProfile(v); valid {
-					return v
+			if v, ok := cfg["postprocess_profile"]; ok {
+				name, isStr := v.(string)
+				if !isStr {
+					return "", fmt.Errorf("postprocess_profile must be a string, got %T (supported: %s)", v, supportedProfileBasenames())
 				}
+				if _, valid := model.LookupDetectionProfile(name); !valid {
+					return "", fmt.Errorf("postprocess_profile %q is not supported (supported: %s)", name, supportedProfileBasenames())
+				}
+				return name, nil
 			}
 		}
 	}
-	return model.DefaultDetectionProfile
+	return model.DefaultDetectionProfile, nil
+}
+
+// supportedProfileBasenames lists the verified plugin basenames for error
+// messages, derived from the same table LookupDetectionProfile consults.
+func supportedProfileBasenames() string {
+	names := make([]string, 0, len(model.DetectionPostprocessProfiles))
+	for _, p := range model.DetectionPostprocessProfiles {
+		names = append(names, p.Basename)
+	}
+	return strings.Join(names, ", ")
 }
 
 // RuntimeRegistration returns the model path, variant and semantic model type
@@ -86,7 +107,11 @@ func RuntimeRegistration(m *model.AIModel) (path string, variant string, grpcMod
 	if err != nil {
 		return "", "", "", err
 	}
-	return path, DetectionVariantJSON(m), m.ModelType, nil
+	variant, err = DetectionVariantJSON(m)
+	if err != nil {
+		return "", "", "", err
+	}
+	return path, variant, m.ModelType, nil
 }
 
 // detectionRuntimePath materializes a detection model under a HEF basename the
@@ -102,7 +127,10 @@ func detectionRuntimePath(m *model.AIModel) (string, error) {
 	if !modelIDPattern.MatchString(m.ModelID) {
 		return "", fmt.Errorf("model id %q cannot be used as a runtime directory name (allowed: letters, digits, '.', '_', '-')", m.ModelID)
 	}
-	profile := detectionPostprocessProfile(m)
+	profile, err := DetectionPostprocessProfile(m)
+	if err != nil {
+		return "", err
+	}
 	src := m.FilePath
 	if abs, err := filepath.Abs(src); err == nil {
 		src = abs
@@ -203,15 +231,21 @@ func copyInto(src, dst string) error {
 // consumers map class_id N -> labels[N-1] from stored metadata. Exported
 // because callers also compare variants to decide whether a loaded model
 // needs reloading — this function is side-effect-free (it never touches the
-// materialized runtime path), unlike RuntimeRegistration.
-func DetectionVariantJSON(m *model.AIModel) string {
+// materialized runtime path), unlike RuntimeRegistration. It errors when the
+// stored postprocess_profile names an unknown profile (see
+// DetectionPostprocessProfile); JSON-object variants exit before that check.
+func DetectionVariantJSON(m *model.AIModel) (string, error) {
 	if model.ResolveModelType(m.ModelType) != "detection" {
-		return m.Variant
+		return m.Variant, nil
 	}
 	if strings.HasPrefix(strings.TrimSpace(m.Variant), "{") {
-		return m.Variant
+		return m.Variant, nil
 	}
-	profile, _ := model.LookupDetectionProfile(detectionPostprocessProfile(m))
+	profile, err := DetectionPostprocessProfile(m)
+	if err != nil {
+		return "", err
+	}
+	profileDef, _ := model.LookupDetectionProfile(profile)
 	threshold := m.Threshold
 	if threshold <= 0 {
 		threshold = defaultDetectionThreshold
@@ -221,7 +255,7 @@ func DetectionVariantJSON(m *model.AIModel) string {
 		maxBoxes = defaultMaxDetections
 	}
 	cfg := map[string]interface{}{
-		"backend_function":    profile.BackendFunction,
+		"backend_function":    profileDef.BackendFunction,
 		"iou_threshold":       detectionNmsThreshold(m),
 		"detection_threshold": threshold,
 		"output_activation":   "none",
@@ -232,9 +266,9 @@ func DetectionVariantJSON(m *model.AIModel) string {
 	blob, err := json.Marshal(cfg)
 	if err != nil {
 		// Unreachable for these value types; keep the stored variant if so.
-		return m.Variant
+		return m.Variant, nil
 	}
-	return string(blob)
+	return string(blob), nil
 }
 
 // detectionNmsThreshold reads nms_threshold from the schema-driven Config

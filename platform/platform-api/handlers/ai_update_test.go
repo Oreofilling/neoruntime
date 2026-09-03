@@ -41,6 +41,13 @@ type fakeAIRuntime struct {
 	live        map[string]bool
 	liveInfos   map[string]*inferencepb.ModelInfo
 	loadFail    bool
+	// smokeSpec, when set, is attached as the single input of entries created
+	// by RegisterModel, so a load-time smoke test gets a real tensor spec to
+	// build a zero input from instead of skipping on empty Inputs.
+	smokeSpec *inferencepb.TensorSpec
+	// smokeHang makes Infer block until its ctx dies — the deterministic way
+	// to exhaust a load deadline inside the smoke test stage.
+	smokeHang bool
 }
 
 func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.ModelInfo) (*inferencepb.Status, error) {
@@ -79,9 +86,13 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 			// what a real runtime reports, not the "" the wire request had.
 			owner = systemOwnerID
 		}
-		f.liveInfos[in.ModelId] = &inferencepb.ModelInfo{
+		entry := &inferencepb.ModelInfo{
 			ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: owner,
 		}
+		if f.smokeSpec != nil {
+			entry.Inputs = []*inferencepb.TensorSpec{f.smokeSpec}
+		}
+		f.liveInfos[in.ModelId] = entry
 	}
 	if f.loadFail {
 		return &inferencepb.ModelRegisterResponse{
@@ -119,6 +130,29 @@ func (f *fakeAIRuntime) ListModels(_ context.Context, _ *inferencepb.Empty) (*in
 		resp.Models = append(resp.Models, &inferencepb.ModelInfo{ModelId: id})
 	}
 	return resp, nil
+}
+
+// GetModelInfo serves the stored live entry when present; anything else is
+// genuinely unknown to the fake, so the embedded Unimplemented error stands
+// (production callers treat that as "no info" and skip optional steps).
+func (f *fakeAIRuntime) GetModelInfo(ctx context.Context, in *inferencepb.ModelInfo) (*inferencepb.ModelInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if info := f.liveInfos[in.ModelId]; info != nil {
+		return info, nil
+	}
+	return f.UnimplementedInferenceServiceServer.GetModelInfo(ctx, in)
+}
+
+// Infer is the smoke-test endpoint: by default it succeeds instantly; with
+// smokeHang set it blocks until its ctx is cancelled, which is how tests
+// exhaust a load deadline exactly at the smoke stage.
+func (f *fakeAIRuntime) Infer(ctx context.Context, _ *inferencepb.InferRequest) (*inferencepb.InferResponse, error) {
+	if f.smokeHang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return &inferencepb.InferResponse{}, nil
 }
 
 // markLive seeds the runtime with a model no RegisterModel call created
@@ -174,7 +208,7 @@ func newAIUpdateTestEnv(t *testing.T) (*APIHandlers, *fakeAIRuntime, *storage.Mo
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	store, err := storage.NewModelStorage(filepath.Join(t.TempDir(), "blobs"), 0)
+	store, err := storage.NewModelStorage(filepath.Join(t.TempDir(), "blobs"), 0, 0)
 	if err != nil {
 		t.Fatalf("NewModelStorage: %v", err)
 	}
@@ -297,6 +331,9 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	constants.SetRootPath(t.TempDir())
 	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	newBlob := seedBlob(t, store, "h2")
+	// The row says loaded and the runtime actually serves it — under
+	// trust-the-runtime the swap decision probes presence, not the row.
+	fake.markLive("live_det")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "live_det", Name: "live_det", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
@@ -366,6 +403,7 @@ func TestUpdateModelLoadedTuningChangeReloads(t *testing.T) {
 	constants.SetRootPath(t.TempDir())
 	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	seedBlob(t, store, "h1")
+	fake.markLive("tuned_det")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "tuned_det", Name: "tuned_det", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
@@ -394,6 +432,9 @@ func TestUpdateModelReloadFailureReportsError(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
 	fake.loadFail = true
 	seedBlob(t, store, "h2")
+	// Row loaded + runtime serves it: the pre-update unload targets a real
+	// registration, and the reload failure is the loadFail knob's doing.
+	fake.markLive("brittle")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "brittle", Name: "brittle", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: "/blobs/old.hef", FileHash: "h1",
@@ -409,6 +450,63 @@ func TestUpdateModelReloadFailureReportsError(t *testing.T) {
 	row, _ := h.aiModelRepo.GetByModelID("brittle")
 	if row.Status != "uploaded" || row.FileHash != "h2" {
 		t.Errorf("row after failed reload: status=%q hash=%q, want uploaded/h2", row.Status, row.FileHash)
+	}
+}
+
+// A row stuck at "loaded" after the runtime restarted solo must not veto the
+// update with a phantom unload: the runtime is the authority on "is it
+// serving", so a tuning change just updates the row and leaves the reload to
+// the self-heal loop (desired_state stays loaded).
+func TestUpdateModelStaleLoadedRowSkipsPhantomSwap(t *testing.T) {
+	h, fake, _ := newAIUpdateTestEnv(t)
+	// No markLive: the runtime holds nothing for this id.
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "phantom_det", Name: "phantom_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+		DesiredState: "loaded",
+	})
+	w := putUpdate(t, h, "phantom_det", `{"config":{"threshold":0.6}}`)
+	if respCode(t, w) != 0 {
+		t.Fatalf("update must succeed despite the stale row: %s", w.Body.String())
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 0 {
+		t.Errorf("phantom unload/reload must not happen, got %v", calls)
+	}
+	row, _ := h.aiModelRepo.GetByModelID("phantom_det")
+	if row.Status != "loaded" || row.DesiredState != "loaded" || row.Threshold != 0.6 {
+		t.Errorf("row after update: status=%q desired=%q threshold=%f, want loaded/loaded/0.6",
+			row.Status, row.DesiredState, row.Threshold)
+	}
+}
+
+// The mirror image: a row stuck at "uploaded" (app re-registration race)
+// while the runtime still serves the id must swap through unload→reload —
+// otherwise the NPU keeps serving the old registration forever.
+func TestUpdateModelStaleUploadedRowStillSwaps(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	// The config-only body keeps the row's FilePath, so seed the real CAS
+	// blob path — the reload materializes from FilePath.
+	blob := seedBlob(t, store, "h1")
+	// Row says uploaded, runtime says serving — the runtime wins.
+	fake.markLive("ghost_row")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "ghost_row", Name: "ghost_row", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1",
+	})
+	w := putUpdate(t, h, "ghost_row", `{"config":{"threshold":0.5}}`)
+	if respCode(t, w) != 0 {
+		t.Fatalf("update failed: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:ghost_row" || calls[1] != "load:ghost_row" {
+		t.Fatalf("stale-uploaded row must still swap, got %v", calls)
+	}
+	row, _ := h.aiModelRepo.GetByModelID("ghost_row")
+	if row.Status != "loaded" {
+		t.Errorf("row must end loaded after the swap, got %q", row.Status)
 	}
 }
 
@@ -476,6 +574,29 @@ func TestUpdateModelAcceptsCompleteCustomVariant(t *testing.T) {
 	}
 }
 
+// A typo'd postprocess_profile is rejected at the write boundary on update:
+// config changes feed the composed runtime variant, and silently defaulting
+// the profile would mismatch the model during the next reload.
+func TestUpdateModelRejectsUnknownPostprocessProfile(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "live_det", Name: "live_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+		DesiredState: "loaded",
+	})
+	w := putUpdate(t, h, "live_det", `{"config":{"postprocess_profile":"yolov8x_640_640"}}`)
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("unknown profile must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "postprocess_profile") {
+		t.Errorf("error must name the profile key: %s", w.Body.String())
+	}
+	row, _ := h.aiModelRepo.GetByModelID("live_det")
+	if row == nil || row.Config != "" {
+		t.Errorf("rejected update must leave row untouched, got Config=%q", row.Config)
+	}
+}
+
 // RegisterModel applies the same guardrail: a blob pointing at a generic
 // (hardcoded-threshold) function never reaches the DB.
 func TestRegisterModelRejectsUnsupportedBackendFunction(t *testing.T) {
@@ -497,5 +618,88 @@ func TestRegisterModelRejectsUnsupportedBackendFunction(t *testing.T) {
 	}
 	if row, _ := h.aiModelRepo.GetByModelID("gen_fn"); row != nil {
 		t.Errorf("rejected model must not be persisted, got %+v", row)
+	}
+}
+
+// RegisterModel likewise rejects a typo'd postprocess_profile at entry: the
+// config feeds the load-time materialization basename, and a silent default
+// would mismatch the model to the wrong postprocess function later.
+func TestRegisterModelRejectsUnknownPostprocessProfile(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := bytes.NewReader([]byte(`{"model_id":"typo_profile","model_path":"/x.hef","model_type":"detection","config":{"postprocess_profile":"yolov8x_640_640"}}`))
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ai/models", body)
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.RegisterModel(c)
+
+	if respCode(t, w) != CodeInvalidRequest {
+		t.Fatalf("unknown profile must fail with %d, got %d body=%s", CodeInvalidRequest, respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "postprocess_profile") {
+		t.Errorf("error must name the profile key: %s", w.Body.String())
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("typo_profile"); row != nil {
+		t.Errorf("rejected model must not be persisted, got %+v", row)
+	}
+}
+
+// RegisterModel enforces the runtime-safe model_id charset at entry: ids
+// flow into gRPC registrations and materialized runtime paths.
+func TestRegisterModelInvalidID(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+
+	cases := []struct {
+		name    string
+		modelID string
+	}{
+		{"leading dash", "-det"},
+		{"leading dot", ".det"},
+		{"space", "my model"},
+		{"slash", "../escape"},
+		{"chinese", "检测模型"},
+		{"too long", strings.Repeat("a", 65)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			body := bytes.NewReader([]byte(`{"model_id":` + strconv.Quote(tc.modelID) + `,"model_path":"/x.hef"}`))
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ai/models", body)
+			c.Request.Header.Set("Content-Type", "application/json")
+			h.RegisterModel(c)
+
+			if respCode(t, w) != CodeInvalidRequest {
+				t.Fatalf("invalid id must fail with %d, got %d body=%s",
+					CodeInvalidRequest, respCode(t, w), w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "Invalid model_id") {
+				t.Errorf("error must name the charset rule: %s", w.Body.String())
+			}
+			if row, _ := h.aiModelRepo.GetByModelID(tc.modelID); row != nil {
+				t.Errorf("rejected id must not be persisted, got %+v", row)
+			}
+		})
+	}
+}
+
+// A well-formed id must clear the charset gate and fail later for its own
+// reasons — proving the gate does not over-reject.
+func TestRegisterModelValidIDPassesCharsetGate(t *testing.T) {
+	h, _, _ := newAIUpdateTestEnv(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := bytes.NewReader([]byte(`{"model_id":"yolov8n.det-1","model_path":"/does/not/exist.hef"}`))
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ai/models", body)
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.RegisterModel(c)
+
+	if strings.Contains(w.Body.String(), "Invalid model_id") {
+		t.Fatalf("valid id must not trip the charset gate: %s", w.Body.String())
 	}
 }

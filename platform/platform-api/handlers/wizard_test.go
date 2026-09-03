@@ -128,14 +128,14 @@ func TestGenerateAppYAMLFullRequestRoundTrip(t *testing.T) {
 	}
 }
 
-// The top-level models map lands in spec.models verbatim — path/type/required
+// The top-level models map lands in spec.models verbatim — path/required
 // subfields survive the round-trip — and an empty map leaves no stray key.
 func TestGenerateAppYAMLModelsMapRoundTrip(t *testing.T) {
 	req := &WizardRequest{
 		Metadata: WizardMetadata{ID: "model-app", Name: "Model App", Version: "1.0.0"},
 		Image:    "docker.io/library/alpine:latest",
 		Models: map[string]manifest.ModelMapping{
-			"detector": {ID: "yolov8s-640", Path: "/opt/models/yolov8s.hef", Type: "detection", Required: true},
+			"detector": {ID: "yolov8s-640", Path: "/opt/models/yolov8s.bin", Required: true},
 			"clip":     {ID: "clip_vit_b_32"},
 		},
 	}
@@ -151,7 +151,7 @@ func TestGenerateAppYAMLModelsMapRoundTrip(t *testing.T) {
 		t.Fatalf("models = %+v, want 2 entries\nYAML:\n%s", parsed.Spec.Models, data)
 	}
 	det := parsed.Spec.Models["detector"]
-	if det.ID != "yolov8s-640" || det.Path != "/opt/models/yolov8s.hef" || det.Type != "detection" || !det.Required {
+	if det.ID != "yolov8s-640" || det.Path != "/opt/models/yolov8s.bin" || !det.Required {
 		t.Errorf("models[detector] = %+v\nYAML:\n%s", det, data)
 	}
 	if clip := parsed.Spec.Models["clip"]; clip.ID != "clip_vit_b_32" || clip.Required {

@@ -122,7 +122,7 @@ func registerDiskModel(modelRepo *repo.AIModelRepo, hefPath, category string) er
 	// Extract metadata via hailortcli parse-hef
 	var networkName string
 	var inputWidth, inputHeight int
-	if store, storeErr := storage.NewModelStorage(constants.ModelsPath()+"/blobs", 0); storeErr == nil {
+	if store, storeErr := storage.NewModelStorage(constants.ModelsPath()+"/blobs", 0, 0); storeErr == nil {
 		if info, parseErr := store.ValidateHEF(hefPath); parseErr == nil && info != nil {
 			networkName = info.NetworkName
 			inputWidth = info.InputWidth

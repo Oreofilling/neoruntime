@@ -15,6 +15,7 @@ import (
 
 	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
+	"aipc/platform/platform-api/storage"
 )
 
 // Vstream info snippets as the wizard carries them back — the JSON-serialized
@@ -126,6 +127,9 @@ func TestUpdateModelPlatformToRawReloadsBare(t *testing.T) {
 	constants.SetRootPath(t.TempDir())
 	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	blob := seedBlob(t, store, "h1")
+	// Row loaded and the runtime truly serves it — the mode swap's
+	// unload→reload decision probes runtime presence now.
+	fake.markLive("swap_det")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "swap_det", Name: "swap_det", Status: "loaded", Source: "web",
 		ModelType: "detection", OutputMode: model.OutputModePlatform,
@@ -211,7 +215,11 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	defer f.Close()
 
-	meta, result, err := h.importModelPackage(f)
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, result, err := h.importModelPackage(f, st.Size())
 	if err != nil {
 		t.Fatalf("importModelPackage: %v", err)
 	}
@@ -238,6 +246,69 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if meta.OutputFormat != model.OutputFormatNMS {
 		t.Errorf("meta output_format = %q, want %q", meta.OutputFormat, model.OutputFormatNMS)
+	}
+}
+
+// A detection row whose stored Config predates the profile field must still
+// export with the resolved postprocess_profile pinned: without it the
+// importing side composes the default profile's backend_function instead of
+// the one this row runs.
+func TestExportPinsResolvedPostprocessProfile(t *testing.T) {
+	h, _, store := newAIUpdateTestEnv(t)
+
+	hefBody := []byte("hef-bytes-profile-pin")
+	sum := sha256.Sum256(hefBody)
+	contentHash := hex.EncodeToString(sum[:])
+	hefPath := store.BlobPath(contentHash, ".hef")
+	if err := os.WriteFile(hefPath, hefBody, 0644); err != nil {
+		t.Fatalf("seed hef: %v", err)
+	}
+
+	// Legacy tuning columns but a config that never named a profile.
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "legacy_det", Name: "legacy_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", OutputMode: model.OutputModePlatform,
+		VStreamInfo: nmsVstreamInfo,
+		FilePath:    hefPath, FileHash: contentHash,
+		Threshold: 0.5, MaxDetections: 16,
+		Config: `{"nms_threshold":0.45}`,
+	})
+
+	w := getExport(t, h, "legacy_det")
+	if w.Code != http.StatusOK {
+		t.Fatalf("export status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	pkg, err := os.CreateTemp(t.TempDir(), "legacy_det-*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pkg.Write(w.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pkg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(pkg.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	pr, err := storage.OpenPackage(f)
+	if err != nil {
+		t.Fatalf("OpenPackage: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(pr.Meta().Config, &cfg); err != nil {
+		t.Fatalf("exported config not JSON: %v (%s)", err, pr.Meta().Config)
+	}
+	if cfg["postprocess_profile"] != model.DefaultDetectionProfile {
+		t.Errorf("postprocess_profile = %v, want resolved default %q", cfg["postprocess_profile"], model.DefaultDetectionProfile)
+	}
+	// The pre-existing tuning keys survive alongside the pinned profile.
+	if cfg["nms_threshold"] != 0.45 || cfg["threshold"] != 0.5 || cfg["max_detections"] != float64(16) {
+		t.Errorf("tuning drift in exported config: %v", cfg)
 	}
 }
 
@@ -292,7 +363,7 @@ func TestImportPackageTamperedRejectedNothingStaged(t *testing.T) {
 	}
 	defer f.Close()
 
-	if _, _, err := h.importModelPackage(f); err == nil {
+	if _, _, err := h.importModelPackage(f, int64(len(body))); err == nil {
 		t.Fatal("tampered package must be rejected")
 	}
 	// The pre-existing blob must survive untouched.

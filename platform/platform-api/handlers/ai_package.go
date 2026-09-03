@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"aipc/platform/common/logger"
+	"aipc/platform/modelload"
 	"aipc/platform/platform-api/model"
 	"aipc/platform/platform-api/storage"
 )
@@ -29,7 +30,7 @@ import (
 // two streams the HEF into the blob store. The blob is named by the HEF's
 // own sha256, so package imports dedup with plain .hef imports of the same
 // model bytes.
-func (h *APIHandlers) importModelPackage(file multipart.File) (*storage.PackageMeta, *storage.SaveResult, error) {
+func (h *APIHandlers) importModelPackage(file multipart.File, pkgSize int64) (*storage.PackageMeta, *storage.SaveResult, error) {
 	// Pass 1: full digest check — nothing is staged from an unverified package.
 	pr, err := storage.OpenPackage(file)
 	if err != nil {
@@ -51,7 +52,9 @@ func (h *APIHandlers) importModelPackage(file multipart.File) (*storage.PackageM
 	if err != nil {
 		return nil, nil, err
 	}
-	result, err := h.modelStore.SaveWithHash(pr.HEF(), ".hef")
+	// The size check runs against the outer package length — the most
+	// conservative admission value available; the staged HEF is always smaller.
+	result, err := h.modelStore.SaveWithHash(pr.HEF(), ".hef", pkgSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to stage package HEF: %w", err)
 	}
@@ -70,8 +73,14 @@ func (h *APIHandlers) importModelPackage(file multipart.File) (*storage.PackageM
 // effectiveExportConfig composes the config section for export: the stored
 // schema-driven config, with the authoritative column values winning for
 // detection rows (threshold / max_detections are what the composed runtime
-// variant actually consumes), so the package reproduces runtime behavior.
-func effectiveExportConfig(m *model.AIModel) json.RawMessage {
+// variant actually consumes) and the resolved postprocess profile pinned
+// explicitly — rows whose stored Config predates the profile field would
+// otherwise export without it, and the importing side would compose the
+// default profile's backend_function instead of the one this row runs. A row
+// whose stored postprocess_profile is unknown is an export error rather than a
+// silent pin of the default profile: shipping the typo'd row in a package
+// would re-introduce the silent mismatch on the importing device.
+func effectiveExportConfig(m *model.AIModel) (json.RawMessage, error) {
 	cfg := map[string]interface{}{}
 	if m.Config != "" {
 		_ = json.Unmarshal([]byte(m.Config), &cfg) // stale config falls back to columns
@@ -83,15 +92,20 @@ func effectiveExportConfig(m *model.AIModel) json.RawMessage {
 		if m.MaxDetections > 0 {
 			cfg["max_detections"] = m.MaxDetections
 		}
+		profile, err := modelload.DetectionPostprocessProfile(m)
+		if err != nil {
+			return nil, err
+		}
+		cfg["postprocess_profile"] = profile
 	}
 	if len(cfg) == 0 {
-		return nil
+		return nil, nil
 	}
 	blob, err := json.Marshal(cfg)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to encode export config: %w", err)
 	}
-	return blob
+	return blob, nil
 }
 
 // ExportModel streams a registered device-level model as a single AMPK .bin
@@ -137,12 +151,17 @@ func (h *APIHandlers) ExportModel(c *gin.Context) {
 	}
 
 	outputMode, _ := model.ResolveOutputMode(m.OutputMode)
+	exportCfg, err := effectiveExportConfig(m)
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to export model: "+err.Error())
+		return
+	}
 	meta := &storage.PackageMeta{
 		ModelID:      m.ModelID,
 		Name:         m.Name,
 		ModelType:    m.ModelType,
 		OutputMode:   outputMode,
-		Config:       effectiveExportConfig(m),
+		Config:       exportCfg,
 		HEF:          storage.PackageHEF{Filename: filepath.Base(m.FilePath), SHA256: hex.EncodeToString(hasher.Sum(nil))},
 		Network:      storage.PackageNetwork{Name: m.NetworkName, InputWidth: m.InputWidth, InputHeight: m.InputHeight},
 		OutputFormat: model.ClassifyOutputFormat(m.VStreamInfo),

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	inferencepb "aipc/platform/ai-runtime/proto"
 	apppb "aipc/platform/app-manager/proto"
+	"aipc/platform/common/constants"
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
 	"aipc/platform/modelload"
@@ -25,6 +27,18 @@ import (
 )
 
 // AI Runtime proxy handlers
+
+var (
+	// stagedBlobHashRE matches the hex sha256 the parse pipeline stages blobs
+	// under — anything else is not a hash this server handed out.
+	stagedBlobHashRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+	// modelIDRE bounds device-level model ids to a runtime-safe charset: the
+	// id travels into gRPC registrations and filesystem paths, so spaces,
+	// slashes and non-ASCII must never reach the store. Mirrored in the web
+	// wizard (modelImportFlow.ts).
+	modelIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+)
 
 func (h *APIHandlers) GetCapabilities(c *gin.Context) {
 	Resp(c).OK(gin.H{
@@ -68,6 +82,9 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 	var pkgMeta *storage.PackageMeta
 	// Extension of the staged blob — packages always unpack to a .hef blob.
 	stagedExt := ext
+	// Whether the staged blob predates this request (dedup hit) — a failed
+	// parse must not reclaim a blob another model may reference.
+	var blobExisted bool
 
 	if h.modelStore != nil {
 		src, err := file.Open()
@@ -82,7 +99,7 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 			// unpack and stage the inner HEF (blob name = the HEF's own
 			// sha256, deduping with plain .hef imports), and hand the wizard
 			// a prefill object from the metadata.
-			meta, result, err := h.importModelPackage(src)
+			meta, result, err := h.importModelPackage(src, file.Size)
 			if err != nil {
 				Resp(c).FailMsg(CodeInvalidRequest, "Invalid model package: "+err.Error())
 				return
@@ -92,8 +109,9 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 			fileHash = result.Hash
 			fileSize = result.Size
 			stagedExt = ".hef"
+			blobExisted = result.Existed
 		} else {
-			result, err := h.modelStore.SaveWithHash(src, ext)
+			result, err := h.modelStore.SaveWithHash(src, ext, file.Size)
 			if err != nil {
 				Resp(c).FailMsg(CodeServiceError, "Failed to save model: "+err.Error())
 				return
@@ -101,6 +119,7 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 			modelPath = result.Path
 			fileHash = result.Hash
 			fileSize = result.Size
+			blobExisted = result.Existed
 		}
 	} else {
 		Resp(c).FailMsg(CodeServiceError, "Model storage not available")
@@ -113,9 +132,9 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 	if h.modelStore != nil {
 		jsonStr, hefInfo, err := h.modelStore.ValidateHEFToJSON(modelPath)
 		if err != nil {
-			if fileHash != "" {
-				h.modelStore.Delete(fileHash, stagedExt)
-			}
+			// Reference-count-aware cleanup: a deduped upload must not take
+			// a live model's blob with it.
+			h.cleanupStagedBlob(fileHash, stagedExt, blobExisted)
 			Resp(c).FailMsg(CodeInvalidRequest, "Model validation failed: "+err.Error())
 			return
 		}
@@ -148,6 +167,62 @@ func (h *APIHandlers) ParseModel(c *gin.Context) {
 		resp["package"] = pkgMeta
 	}
 	Resp(c).OK(resp)
+}
+
+// AbandonStagedModel drops a blob staged by ParseModel when the import
+// wizard is cancelled. It deliberately is NOT the generic
+// files/batch-delete: staging is content-addressed, so an identical upload
+// may have deduped onto a blob an existing model already references.
+// UnregisterModel's reference-count rule decides here too, and the only
+// acceptable path is exactly BlobPath(hash, ext) — never an arbitrary
+// filesystem location.
+func (h *APIHandlers) AbandonStagedModel(c *gin.Context) {
+	var req struct {
+		FileHash string `json:"file_hash"`
+		FilePath string `json:"file_path"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid request body: "+err.Error())
+		return
+	}
+	if !stagedBlobHashRE.MatchString(req.FileHash) {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid file_hash: expected the hex sha256 returned by parse")
+		return
+	}
+	if h.modelStore == nil {
+		Resp(c).FailMsg(CodeServiceError, "Model storage not available")
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(req.FilePath))
+	if ext == "" {
+		Resp(c).FailMsg(CodeInvalidRequest, "file_path must carry the staged blob extension")
+		return
+	}
+	// The equality check doubles as the jail: nothing outside the blob
+	// directory — and no path for a different hash — can be removed through
+	// this endpoint.
+	if filepath.Clean(req.FilePath) != h.modelStore.BlobPath(req.FileHash, ext) {
+		Resp(c).FailMsg(CodeInvalidRequest, "file_path does not match the staged blob for file_hash")
+		return
+	}
+	// Fail closed on reference-count errors: a DB hiccup must never turn
+	// into deleting a live model's blob.
+	if h.aiModelRepo != nil {
+		count, err := h.aiModelRepo.CountByFileHash(req.FileHash)
+		if err != nil {
+			Resp(c).FailMsg(CodeServiceError, "Failed to check model references: "+err.Error())
+			return
+		}
+		if count > 0 {
+			Resp(c).OK(gin.H{"file_hash": req.FileHash, "deleted": false, "referenced_by": count})
+			return
+		}
+	}
+	if err := h.modelStore.Delete(req.FileHash, ext); err != nil {
+		Resp(c).FailMsg(CodeOperationFailed, "Failed to remove staged blob: "+err.Error())
+		return
+	}
+	Resp(c).OK(gin.H{"file_hash": req.FileHash, "deleted": true})
 }
 
 func (h *APIHandlers) ScanModels(c *gin.Context) {
@@ -537,6 +612,12 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "model_id is required")
 		return
 	}
+	// The id flows into gRPC registrations and materialized runtime paths;
+	// reject unsafe charsets here rather than letting load time fail opaquely.
+	if !modelIDRE.MatchString(req.ModelID) {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_id: must start with a letter or digit and contain only letters, digits, '.', '_' or '-' (max 64 chars)")
+		return
+	}
 
 	if req.ModelType != "" {
 		resolved := model.ResolveModelType(req.ModelType)
@@ -585,6 +666,10 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 		}
 		for k, v := range req.Config {
 			merged[k] = v
+		}
+		if err := validatePostprocessProfile(req.ModelType, outputMode, merged); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+			return
 		}
 		configJSON, _ := json.Marshal(merged)
 
@@ -774,6 +859,10 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		for k, v := range req.Config {
 			merged[k] = v
 		}
+		if err := validatePostprocessProfile(newModelType, newOutputMode, merged); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+			return
+		}
 		configJSON, _ := json.Marshal(merged)
 		staged.Config = string(configJSON)
 
@@ -800,13 +889,35 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	// verbatim, so for those the config-vs-JSON split is explicit: no
 	// variant change, no reload.
 	oldVariant, newVariant := dbModel.Variant, staged.Variant
-	if newOutputMode == model.OutputModePlatform && model.ResolveModelType(newModelType) == "detection" {
-		oldVariant = modelload.DetectionVariantJSON(dbModel)
-		newVariant = modelload.DetectionVariantJSON(&staged)
-	}
 	needsReload := fileChanged || newModelType != dbModel.ModelType ||
-		newOutputMode != dbModel.OutputMode || newVariant != oldVariant
+		newOutputMode != dbModel.OutputMode
+	if newOutputMode == model.OutputModePlatform && model.ResolveModelType(newModelType) == "detection" {
+		oldVariant, oldErr := modelload.DetectionVariantJSON(dbModel)
+		newVariant, newErr := modelload.DetectionVariantJSON(&staged)
+		// A variant that can no longer be composed (e.g. the row's
+		// postprocess_profile names an unknown profile) forces a reload
+		// instead of being treated as "unchanged": the reload fails fast with
+		// the audit-visible error, or succeeds when this very update repairs
+		// the config. Without this a broken row would keep the NPU serving
+		// the stale registration while the DB diverges from it.
+		needsReload = needsReload || oldErr != nil || newErr != nil || newVariant != oldVariant
+	} else {
+		needsReload = needsReload || newVariant != oldVariant
+	}
 	wasLoaded := dbModel.Status == "loaded"
+	if needsReload && h.grpcClients.AIRuntime != nil {
+		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		// Trust the runtime over the row for "is it serving": a stale "loaded"
+		// (runtime restarted solo) makes the pre-update unload fail and veto
+		// the whole update; a stale "uploaded" skips the reload and leaves the
+		// NPU serving the old registration. An unreachable runtime keeps the
+		// row's word.
+		if rt, checked := runtimeHasModel(ctx, client, modelID); checked {
+			wasLoaded = rt != nil
+		}
+	}
 
 	// A loaded model whose runtime view changes must be unloaded first so
 	// the NPU never serves stale weights under the new row.
@@ -814,6 +925,15 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// Same occupancy guard as UnloadModel: the swap tears the runtime
+		// registration down while apps may be mid-inference, and a failed
+		// reload would leave their model missing entirely.
+		if h.grpcClients.AppManager != nil {
+			if apps, _ := h.getAppsUsingModel(ctx, modelID, true); len(apps) > 0 {
+				Resp(c).FailMsg(CodeOperationFailed, "Model is in use by apps, please stop them first: "+strings.Join(apps, ", "))
+				return
+			}
+		}
 		if _, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID}); err != nil {
 			Resp(c).FailMsg(CodeOperationFailed, "Failed to unload model before update: "+err.Error())
 			return
@@ -862,10 +982,10 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 				}
 				if smokeErr := modelload.RunLoadSmokeTest(ctx, client, dbModel.ModelID, info); smokeErr != nil {
 					loadErr = smokeErr
-					// Roll back so runtime and DB agree on "not loaded".
-					if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
-						logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
-					}
+					// Roll back so runtime and DB agree on "not loaded"; the
+					// helper runs on its own deadline because this reload ctx
+					// is typically exhausted by the time a smoke test fails.
+					rollbackRegistration(client, dbModel.ModelID)
 				}
 			}
 		}
@@ -916,27 +1036,64 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 	if modelID == "" {
 		modelID = strings.TrimSuffix(file.Filename, ext)
 	}
+	// Same charset contract as RegisterModel: the id flows into gRPC
+	// registrations, materialized runtime paths and (in the no-store
+	// fallback below) a file name.
+	if !modelIDRE.MatchString(modelID) {
+		Resp(c).FailMsg(CodeInvalidRequest, "Invalid model_id: must start with a letter or digit and contain only letters, digits, '.', '_' or '-' (max 64 chars)")
+		return
+	}
 
 	modelType := c.PostForm("model_type")
+	if modelType != "" {
+		resolved := model.ResolveModelType(modelType)
+		if resolved == "" {
+			Resp(c).FailMsg(CodeInvalidRequest, "Unsupported model_type: "+modelType)
+			return
+		}
+		modelType = resolved
+	}
 	variant := c.PostForm("variant")
+	if modelType == "detection" {
+		if err := validateDetectionVariant(variant); err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid variant: "+err.Error())
+			return
+		}
+	}
 	thresholdStr := c.PostForm("threshold")
 	threshold := float32(0.25)
 	if thresholdStr != "" {
-		if v, err := strconv.ParseFloat(thresholdStr, 32); err == nil {
-			threshold = float32(v)
+		v, err := strconv.ParseFloat(thresholdStr, 32)
+		if err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid threshold: must be a number, got "+thresholdStr)
+			return
 		}
+		threshold = float32(v)
 	}
 	maxDetStr := c.PostForm("max_detections")
 	maxDetections := 64
 	if maxDetStr != "" {
-		if v, err := strconv.Atoi(maxDetStr); err == nil {
-			maxDetections = v
+		v, err := strconv.Atoi(maxDetStr)
+		if err != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Invalid max_detections: must be an integer, got "+maxDetStr)
+			return
+		}
+		maxDetections = v
+	}
+
+	// Cheap duplicate rejection before any bytes are staged — same contract
+	// as RegisterModel.
+	if h.aiModelRepo != nil {
+		if existing, _ := h.aiModelRepo.GetByModelID(modelID); existing != nil {
+			Resp(c).FailMsg(CodeInvalidRequest, "Model ID already exists: "+modelID+" (use update instead)")
+			return
 		}
 	}
 
 	var modelPath string
 	var fileHash string
 	var fileSize int64
+	var blobExisted bool
 
 	if h.modelStore != nil {
 		src, err := file.Open()
@@ -946,7 +1103,7 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 		}
 		defer src.Close()
 
-		result, err := h.modelStore.SaveWithHash(src, ext)
+		result, err := h.modelStore.SaveWithHash(src, ext, file.Size)
 		if err != nil {
 			Resp(c).FailMsg(CodeServiceError, "Failed to save model: "+err.Error())
 			return
@@ -954,13 +1111,14 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 		modelPath = result.Path
 		fileHash = result.Hash
 		fileSize = result.Size
+		blobExisted = result.Existed
 		if result.Existed {
 			logger.Info("Model blob already exists (dedup): %s", fileHash)
 		}
 	} else {
 		storagePath := h.modelStorage
 		if storagePath == "" {
-			storagePath = h.modelStorage
+			storagePath = constants.ModelsPath()
 		}
 		if err := os.MkdirAll(storagePath, 0755); err != nil {
 			Resp(c).FailMsg(CodeServiceError, "Failed to create model directory: "+err.Error())
@@ -981,9 +1139,9 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 	if h.modelStore != nil {
 		jsonStr, hefInfo, err := h.modelStore.ValidateHEFToJSON(modelPath)
 		if err != nil {
-			if fileHash != "" {
-				h.modelStore.Delete(fileHash, ext)
-			}
+			// Reference-count-aware cleanup: a deduped upload must not take
+			// a live model's blob with it.
+			h.cleanupStagedBlob(fileHash, ext, blobExisted)
 			Resp(c).FailMsg(CodeInvalidRequest, "HEF validation failed: "+err.Error())
 			return
 		}
@@ -1013,8 +1171,16 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 			InputHeight:   inputHeight,
 			Status:        "uploaded",
 		}
+		// Save to DB as "uploaded" — not loaded to NPU yet. A row that
+		// fails to persist is an explicit error, never a silent success
+		// that leaves an unreachable model behind.
 		if err := h.aiModelRepo.Create(dbModel); err != nil {
-			logger.Warn("Failed to persist uploaded model to DB: %v", err)
+			h.cleanupStagedBlob(fileHash, ext, blobExisted)
+			if h.modelStore == nil && modelPath != "" {
+				os.Remove(modelPath)
+			}
+			Resp(c).FailMsg(CodeServiceError, "Failed to save model record: "+err.Error())
+			return
 		}
 	}
 
@@ -1202,85 +1368,12 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 		}
 	}
 
-	// Wizard-imported detection models live under sha256 blob names the
-	// postprocess plugin cannot match; modelload.RuntimeRegistration materializes
-	// them under a recognized basename and composes a schema-valid variant that
-	// carries the stored threshold / max_detections to the runtime. Raw-output
-	// models come back with an empty grpcModelType so the runtime skips the
-	// postprocess session entirely.
-	runtimePath, runtimeVariant, grpcModelType, pathErr := modelload.RuntimeRegistration(dbModel)
-	if pathErr != nil {
-		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to prepare model for runtime: "+pathErr.Error())
+	// Registration, input-dimension capture, postprocess probe with rollback
+	// and status persistence live in loadModelCore, shared with the periodic
+	// self-heal loop so a REST load and a heal reload behave identically.
+	if err := h.loadModelCore(ctx, client, dbModel); err != nil {
+		Resp(c).FailMsg(CodeModelLoadFailed, err.Error())
 		return
-	}
-
-	resp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-		ModelPath:    runtimePath,
-		ModelId:      dbModel.ModelID,
-		ModelType:    grpcModelType,
-		ModelVariant: runtimeVariant,
-	})
-	if err != nil {
-		Resp(c).FailMsg(CodeModelLoadFailed, "Failed to load model on NPU: "+err.Error())
-		return
-	}
-
-	if resp.Status != nil && !resp.Status.Success {
-		Resp(c).FailMsg(CodeModelLoadFailed, resp.Status.Message)
-		return
-	}
-
-	// Update input dimensions from live model info
-	var modelInfo *inferencepb.ModelInfo
-	infoModelID := resp.ModelId
-	if infoModelID == "" {
-		infoModelID = dbModel.ModelID
-	}
-	modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
-		ModelId: infoModelID,
-	})
-	if infoErr != nil {
-		modelInfo = nil
-	}
-	if modelInfo != nil && len(modelInfo.Inputs) > 0 {
-		input := modelInfo.Inputs[0]
-		layout := input.GetLayout()
-		switch layout {
-		case "NHWC":
-			if len(input.Shape) >= 4 {
-				dbModel.InputHeight = int(input.Shape[1])
-				dbModel.InputWidth = int(input.Shape[2])
-			}
-		case "NCHW":
-			if len(input.Shape) >= 4 {
-				dbModel.InputHeight = int(input.Shape[2])
-				dbModel.InputWidth = int(input.Shape[3])
-			}
-		default:
-			if len(input.Shape) >= 3 {
-				dbModel.InputHeight = int(input.Shape[0])
-				dbModel.InputWidth = int(input.Shape[1])
-			}
-		}
-	}
-
-	// Postprocess failures only surface at infer time — probe the freshly
-	// loaded model once so a broken registration can be rolled back here
-	// instead of failing on every frame later.
-	if model.ResolveModelType(dbModel.ModelType) == "detection" {
-		if smokeErr := modelload.RunLoadSmokeTest(ctx, client, dbModel.ModelID, modelInfo); smokeErr != nil {
-			if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID}); unregErr != nil {
-				logger.Warn("Failed to unregister model %s after smoke test failure: %v", dbModel.ModelID, unregErr)
-			}
-			Resp(c).FailMsg(CodeModelLoadFailed, "postprocess smoke test failed: "+smokeErr.Error())
-			return
-		}
-	}
-
-	dbModel.Status = "loaded"
-	dbModel.DesiredState = "loaded"
-	if err := h.aiModelRepo.Update(dbModel); err != nil {
-		logger.Warn("Failed to update model status to loaded: %v", err)
 	}
 
 	if h.eventLogger != nil {
@@ -1408,14 +1501,36 @@ func (h *APIHandlers) UnregisterModel(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Deleting a model an installed app relies on — an explicit models[]
+	// declaration (durable: it breaks the app's next start even when the
+	// app is stopped) or a running owner — must be refused, same as
+	// UnloadModel refuses to evict an in-use model.
+	if h.grpcClients.AppManager != nil {
+		if apps, _ := h.getAppsUsingModel(ctx, modelID, true); len(apps) > 0 {
+			Resp(c).FailMsg(CodeOperationFailed, "Model is in use by apps, please stop them first: "+strings.Join(apps, ", "))
+			return
+		}
+	}
+
 	// If model exists in DB, unload from NPU and delete file
 	if h.aiModelRepo != nil {
 		dbModel, err := h.aiModelRepo.GetByModelID(modelID)
 		if err == nil && dbModel != nil {
-			// Unload from NPU if loaded
-			if dbModel.Status == "loaded" && h.grpcClients.AIRuntime != nil {
+			// Unload from NPU. Trust the runtime over the row's Status: a row
+			// stuck at "uploaded" while the runtime still serves the id would
+			// leave a zombie serving a model whose blob is about to be
+			// deleted; a stale "loaded" on an absent registration makes the
+			// unregister a harmless no-op. An unreachable runtime keeps the
+			// row's word.
+			if h.grpcClients.AIRuntime != nil {
 				client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
-				client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+				unload := dbModel.Status == "loaded"
+				if rt, checked := runtimeHasModel(ctx, client, modelID); checked {
+					unload = rt != nil
+				}
+				if unload {
+					client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+				}
 			}
 			// Delete DB record first so ref-count excludes this entry
 			h.aiModelRepo.DeleteByModelID(modelID)
@@ -1423,14 +1538,11 @@ func (h *APIHandlers) UnregisterModel(c *gin.Context) {
 			// (blob ref-count below is unaffected — hardlinks share the inode).
 			modelload.RemoveRuntimeCopy(modelID)
 
-			// Only delete the blob file when no other model references the same hash
-			if dbModel.FileHash != "" && h.modelStore != nil {
-				if count, err := h.aiModelRepo.CountByFileHash(dbModel.FileHash); err == nil && count == 0 {
-					h.modelStore.Delete(dbModel.FileHash, ".hef")
-				}
-			} else if dbModel.FilePath != "" {
-				os.Remove(dbModel.FilePath)
-			}
+			// Reclaim what the platform owns: the CAS blob under the
+			// reference-count rule, and raw files only inside the platform
+			// model root — an app's bundled HEF or a user-registered
+			// model_path is not ours to delete.
+			h.removeModelFile(dbModel)
 		}
 	} else if h.grpcClients.AIRuntime != nil {
 		// No DB — fallback to direct ai-runtime unregister (system models)
@@ -1480,30 +1592,34 @@ func (h *APIHandlers) getAppsUsingModel(ctx context.Context, modelID string, for
 	seen := map[string]bool{}
 	runningApps := map[string]bool{}
 
-	// Collect running apps
+	// Ask app-manager for every installed app, running or not: an explicit
+	// models[] reference is durable, so a stopped app must still count.
 	if h.grpcClients.AppManager != nil {
 		client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
 		resp, err := client.ListApps(ctx, &emptypb.Empty{})
 		if err == nil {
+			isUnload := len(forUnload) > 0 && forUnload[0]
 			for _, app := range resp.Apps {
-				if app.State != "running" {
+				if app.State == "running" {
+					runningApps[app.Id] = true
+				}
+				if app.ManifestPath == "" {
 					continue
 				}
-				runningApps[app.Id] = true
-				if app.ManifestPath != "" {
-					manifest, err := h.readAppManifest(app.ManifestPath)
-					if err == nil && manifest != nil {
-						for _, m := range manifest.Spec.Permissions.Inference.Models {
-							if m == modelID {
-								seen[app.Id] = true
-								break
-							}
-						}
-						isUnload := len(forUnload) > 0 && forUnload[0]
-						if manifest.Spec.Permissions.Inference.AllowRegisterModel && !isUnload {
-							seen[app.Id] = true
-						}
+				manifest, err := h.readAppManifest(app.ManifestPath)
+				if err != nil || manifest == nil {
+					continue
+				}
+				for _, m := range manifest.Spec.Permissions.Inference.Models {
+					if m == modelID {
+						seen[app.Id] = true
+						break
 					}
+				}
+				// The broad "may register models" grant is a live capability —
+				// it only shields the model while the app is actually running.
+				if runningApps[app.Id] && manifest.Spec.Permissions.Inference.AllowRegisterModel && !isUnload {
+					seen[app.Id] = true
 				}
 			}
 		}
