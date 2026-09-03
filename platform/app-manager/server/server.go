@@ -40,6 +40,8 @@ import (
 	"aipc/platform/common/socket"
 	"aipc/platform/common/utils"
 	eventpb "aipc/platform/event-bus/proto"
+	"aipc/platform/modelload"
+	"aipc/platform/platform-api/model"
 )
 
 type AppManagerServer struct {
@@ -2356,21 +2358,17 @@ func (s *AppManagerServer) repairSnapshotsIfNeeded() {
 
 // ─── Model Preloading Logic ───────────────────────────────────────────────────
 
-// ModelMeta contains model metadata from platform.db
-type ModelMeta struct {
-	FilePath  string
-	ModelType string
-	Variant   string
-}
-
-// getModelMeta retrieves model metadata from platform.db
-func (s *AppManagerServer) getModelMeta(modelID string) *ModelMeta {
+// getModelMeta retrieves the full model row from platform.db: the load-time
+// composition needs output_mode/config/threshold/max_detections beyond the
+// three columns this used to select. Columns missing from an older
+// platform-api schema scan as zero values, which the composition degrades
+// gracefully (e.g. ResolveOutputMode("") → platform mode).
+func (s *AppManagerServer) getModelMeta(modelID string) *model.AIModel {
 	if s.db == nil {
 		return nil
 	}
-	var meta ModelMeta
+	var meta model.AIModel
 	result := s.db.Table("ai_models").
-		Select("file_path, model_type, variant").
 		Where("model_id = ?", modelID).
 		Scan(&meta)
 	if result.Error != nil || meta.FilePath == "" {
@@ -2773,20 +2771,23 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 		}
 	}
 
+	// The runtime's current registrations: a model someone else already
+	// loaded only gains this app as a co-owner here (path and variant stay
+	// as registered), so preexisting entries are neither probed nor rolled
+	// back — only registrations this preload actually creates are ours to
+	// verify.
+	preexisting := make(map[string]bool)
+	if resp, err := client.ListModels(ctx, &inferencepb.Empty{}); err != nil {
+		logger.Warn("Failed to list runtime models before preloading for app %s: %v", appID, err)
+	} else {
+		for _, m := range resp.Models {
+			preexisting[m.ModelId] = true
+		}
+	}
+
 	for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
 		if meta := s.getModelMeta(modelID); meta != nil {
-			_, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-				ModelId:      modelID,
-				ModelPath:    meta.FilePath,
-				OwnerId:      appID,
-				ModelType:    meta.ModelType,
-				ModelVariant: meta.Variant,
-			})
-			if err != nil {
-				logger.Warn("Failed to preload model %s for app %s: %v", modelID, appID, err)
-			} else {
-				logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, meta.FilePath, meta.ModelType, appID)
-			}
+			s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID])
 			continue
 		}
 		if b, ok := bundled[modelID]; ok {
@@ -2811,6 +2812,49 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 			continue
 		}
 		logger.Warn("App %s requires model %s, but it is neither in platform.db nor bundled in the app image", appID, modelID)
+	}
+}
+
+// preloadPlatformModel registers a platform.db model with ai-runtime through
+// the shared load-time composition, so a preloaded model behaves exactly like
+// one loaded via platform-api: detection models are materialized under a
+// plugin-recognized basename with a full-key variant blob, raw-output models
+// skip the postprocess session entirely. A freshly registered detection
+// model gets a load smoke test — a postprocess mismatch would otherwise
+// surface only as per-frame infer failures once the app is running — and the
+// registration is rolled back on failure with an Error log, since the app
+// cannot work without this model either way.
+func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string, meta *model.AIModel, fresh bool) {
+	path, variant, grpcType, err := modelload.RuntimeRegistration(meta)
+	if err != nil {
+		logger.Warn("Failed to compose runtime registration for model %s (app %s): %v", modelID, appID, err)
+		return
+	}
+	_, err = client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+		ModelId:      modelID,
+		ModelPath:    path,
+		OwnerId:      appID,
+		ModelType:    grpcType,
+		ModelVariant: variant,
+	})
+	if err != nil {
+		logger.Warn("Failed to preload model %s for app %s: %v", modelID, appID, err)
+		return
+	}
+	logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, path, grpcType, appID)
+
+	if !fresh || model.ResolveModelType(meta.ModelType) != "detection" {
+		return
+	}
+	info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+	if infoErr != nil {
+		info = nil // no tensor info: RunLoadSmokeTest skips the probe
+	}
+	if smokeErr := modelload.RunLoadSmokeTest(ctx, client, modelID, info); smokeErr != nil {
+		logger.Error("Load smoke test failed for preloaded model %s (app %s); rolling back registration: %v", modelID, appID, smokeErr)
+		if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID, OwnerId: appID}); unregErr != nil {
+			logger.Error("Failed to roll back registration of model %s for app %s: %v", modelID, appID, unregErr)
+		}
 	}
 }
 

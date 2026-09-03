@@ -15,6 +15,7 @@ import (
 	inferencepb "aipc/platform/ai-runtime/proto"
 	"aipc/platform/app-manager/manifest"
 	"aipc/platform/common/constants"
+	"aipc/platform/platform-api/model"
 )
 
 // stubInferenceClient embeds the generated interface so only the methods
@@ -28,6 +29,9 @@ type stubInferenceClient struct {
 	regErr        error                          // RPC-level error for RegisterModel
 	regStatus     map[string]*inferencepb.Status // by model id: success=false body
 	unregistered  []*inferencepb.ModelInfo
+	infos         map[string]*inferencepb.ModelInfo // GetModelInfo results by model id
+	inferCalls    []string                          // model ids probed via Infer
+	inferFail     string                            // non-empty: Infer reports this failure
 }
 
 func (c *stubInferenceClient) ListModels(ctx context.Context, in *inferencepb.Empty, opts ...grpc.CallOption) (*inferencepb.ModelListResponse, error) {
@@ -51,6 +55,24 @@ func (c *stubInferenceClient) RegisterModel(ctx context.Context, in *inferencepb
 func (c *stubInferenceClient) UnregisterModel(ctx context.Context, in *inferencepb.ModelInfo, opts ...grpc.CallOption) (*inferencepb.Status, error) {
 	c.unregistered = append(c.unregistered, in)
 	return &inferencepb.Status{Success: true}, nil
+}
+
+// GetModelInfo serves the configured probe info; ids without an entry get an
+// RPC error, which the preload smoke path treats as "no tensor info" and
+// skips the probe — matching a runtime that cannot describe the model.
+func (c *stubInferenceClient) GetModelInfo(ctx context.Context, in *inferencepb.ModelInfo, opts ...grpc.CallOption) (*inferencepb.ModelInfo, error) {
+	if info, ok := c.infos[in.ModelId]; ok {
+		return info, nil
+	}
+	return nil, errors.New("model not found")
+}
+
+func (c *stubInferenceClient) Infer(ctx context.Context, in *inferencepb.InferRequest, opts ...grpc.CallOption) (*inferencepb.InferResponse, error) {
+	c.inferCalls = append(c.inferCalls, in.ModelId)
+	if c.inferFail != "" {
+		return &inferencepb.InferResponse{Status: &inferencepb.Status{Success: false, Message: c.inferFail}}, nil
+	}
+	return &inferencepb.InferResponse{Status: &inferencepb.Status{Success: true}}, nil
 }
 
 func newValidationServer(client inferencepb.InferenceServiceClient, enabled bool) *AppManagerServer {
@@ -77,20 +99,22 @@ func withTempRoot(t *testing.T) string {
 	return root
 }
 
-// newModelMetaDB builds a throwaway sqlite db with the ai_models columns
-// getModelMeta reads.
-func newModelMetaDB(t *testing.T, rows map[string]ModelMeta) *gorm.DB {
+// newModelMetaDB builds a throwaway sqlite db with the real ai_models schema
+// getModelMeta reads (full AIModel rows — the load-time composition consumes
+// output_mode/config/threshold/max_detections too).
+func newModelMetaDB(t *testing.T, rows map[string]model.AIModel) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "platform.db")), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.Exec(`CREATE TABLE ai_models (model_id TEXT PRIMARY KEY, file_path TEXT, model_type TEXT, variant TEXT)`).Error; err != nil {
-		t.Fatalf("create ai_models: %v", err)
+	if err := db.AutoMigrate(&model.AIModel{}); err != nil {
+		t.Fatalf("AutoMigrate ai_models: %v", err)
 	}
 	for id, meta := range rows {
-		if err := db.Exec(`INSERT INTO ai_models (model_id, file_path, model_type, variant) VALUES (?, ?, ?, ?)`,
-			id, meta.FilePath, meta.ModelType, meta.Variant).Error; err != nil {
+		row := meta
+		row.ModelID = id
+		if err := db.Create(&row).Error; err != nil {
 			t.Fatalf("insert %s: %v", id, err)
 		}
 	}
@@ -103,7 +127,7 @@ func TestResolveModelDependencies(t *testing.T) {
 		client      inferencepb.InferenceServiceClient
 		enabled     bool
 		models      map[string]manifest.ModelMapping
-		dbRows      map[string]ModelMeta
+		dbRows      map[string]model.AIModel
 		wantErr     string // empty = expect success
 		wantWarning string // expected substring of the task message, empty = none
 		wantPending []string
@@ -129,7 +153,7 @@ func TestResolveModelDependencies(t *testing.T) {
 			models: map[string]manifest.ModelMapping{
 				"detector": {ID: "yolo_world_540", Required: true},
 			},
-			dbRows: map[string]ModelMeta{
+			dbRows: map[string]model.AIModel{
 				"yolo_world_540": {FilePath: "/data/aipc/models/yolo.hef", ModelType: "detection"},
 			},
 		},
@@ -140,7 +164,7 @@ func TestResolveModelDependencies(t *testing.T) {
 			models: map[string]manifest.ModelMapping{
 				"detector": {ID: "yolo_world_540", Required: true},
 			},
-			dbRows: map[string]ModelMeta{
+			dbRows: map[string]model.AIModel{
 				"yolo_world_540": {FilePath: "/data/aipc/models/yolo.hef", ModelType: "detection"},
 			},
 		},
@@ -609,7 +633,7 @@ func TestResolveModelDependenciesShadowedCapture(t *testing.T) {
 		{ModelId: "runtime_det", ModelPath: "/data/aipc/models/runtime.hef"},
 	}}
 	s := newValidationServer(client, true)
-	s.db = newModelMetaDB(t, map[string]ModelMeta{
+	s.db = newModelMetaDB(t, map[string]model.AIModel{
 		"db_det": {FilePath: "/data/aipc/models/db.hef", ModelType: "detection"},
 	})
 	m := &manifest.AppManifest{Spec: manifest.Spec{Models: map[string]manifest.ModelMapping{
