@@ -1049,6 +1049,19 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 // runtimeHasModel returns the runtime's current entry for modelID, or nil
 // when it is not registered. checked is false when the runtime itself was
 // unreachable, so callers can distinguish "absent" from "unknown".
+// systemOwnerID is the literal ai-runtime substitutes for an empty owner at
+// registration time (grpc_service.cpp: "if (owner_id.empty()) owner_id =
+// \"<system>\""), so ownerless entries surface in ListModels with this string
+// rather than "".
+const systemOwnerID = "<system>"
+
+// isSystemOwned reports whether a runtime entry's owner marks it as
+// device-level rather than app-owned. Both spellings occur: "" from local
+// tooling, systemOwnerID from the runtime's own normalization.
+func isSystemOwned(owner string) bool {
+	return owner == "" || owner == systemOwnerID
+}
+
 func runtimeHasModel(ctx context.Context, client inferencepb.InferenceServiceClient, modelID string) (rt *inferencepb.ModelInfo, checked bool) {
 	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
 	if err != nil {
@@ -1142,12 +1155,15 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 		// Legacy preload registrations handed the runtime the raw CAS blob
 		// path with an empty variant, silently degrading detection models to
 		// raw tensors; ModelInfo carries no variant, so the path is the only
-		// signal available. When a non-app-owned entry's path differs from
+		// signal available. When a system-owned entry's path differs from
 		// what composition would produce, unregister it and reload instead of
 		// refusing — otherwise the degradation could never self-heal.
-		// Composition errors leave the entry alone (nothing better to offer).
+		// (System-owned must cover the runtime's "<system>" normalization:
+		// ownerless registrations never list as "".) Composition errors
+		// leave the entry alone (nothing better to offer). App-owned and
+		// transient entries are somebody's live registration, untouched.
 		stale := false
-		if !rt.GetTransient() && rt.GetOwnerId() == "" && rt.GetModelPath() != "" {
+		if !rt.GetTransient() && isSystemOwned(rt.GetOwnerId()) && rt.GetModelPath() != "" {
 			if expectedPath, _, _, err := modelload.RuntimeRegistration(dbModel); err == nil && expectedPath != rt.GetModelPath() {
 				stale = true
 				logger.Info("Healing stale runtime registration for %s (path %q differs from composed %q), reloading", modelID, rt.GetModelPath(), expectedPath)

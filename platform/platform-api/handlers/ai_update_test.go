@@ -72,8 +72,15 @@ func (f *fakeAIRuntime) RegisterModel(_ context.Context, in *inferencepb.ModelRe
 		if f.liveInfos == nil {
 			f.liveInfos = map[string]*inferencepb.ModelInfo{}
 		}
+		owner := in.OwnerId
+		if owner == "" {
+			// grpc_service.cpp normalizes ownerless registrations to
+			// "<system>" before storing; mirror that so ListModels reports
+			// what a real runtime reports, not the "" the wire request had.
+			owner = systemOwnerID
+		}
 		f.liveInfos[in.ModelId] = &inferencepb.ModelInfo{
-			ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: in.OwnerId,
+			ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: owner,
 		}
 	}
 	if f.loadFail {

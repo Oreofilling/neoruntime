@@ -145,7 +145,10 @@ func TestLoadModelHealsLegacyBareBlobRegistration(t *testing.T) {
 		ModelID: "legacy_det", Name: "legacy_det", Status: "loaded", Source: "web",
 		ModelType: "detection", FilePath: blob, FileHash: "h1", DesiredState: "loaded",
 	})
-	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "legacy_det", ModelPath: blob})
+	// The real runtime reports ownerless registrations as "<system>", never
+	// "" — seed the exact shape a bare gRPC/legacy-preload registration has
+	// on device.
+	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "legacy_det", ModelPath: blob, OwnerId: systemOwnerID})
 
 	w := postModelAction(t, h, "load", "legacy_det")
 	if respCode(t, w) != 0 {
