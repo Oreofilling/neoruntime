@@ -15,6 +15,8 @@ export const aiApi = {
     file_hash: string;
     model_id: string;
     model_type: string;
+    // Output delivery mode: 'platform' (plugin-decoded) | 'raw' (bare tensors)
+    output_mode: string;
     model_variant: string;
     config: Record<string, unknown>;
     file_size: number;
@@ -30,6 +32,7 @@ export const aiApi = {
     data: Partial<{
       file_hash: string;
       model_type: string;
+      output_mode: string;
       model_variant: string;
       config: Record<string, unknown>;
       file_size: number;
@@ -69,6 +72,32 @@ export const aiApi = {
   // 从 NPU 卸载模型
   unloadModel: (modelId: string) => request.post(`/api/v1/ai/models/${modelId}/unload`),
 
+  // 导出为 AMPK 单文件包 (.bin)：HEF + 注册元数据
+  exportPackage: (modelId: string) => request.get<Blob>(`/api/v1/ai/models/${modelId}/export`, {
+      responseType: 'blob',
+    }),
+
   // 获取 AI 统计
   getStats: () => request.get('/api/v1/ai/stats'),
+};
+
+/**
+ * Download a model as an AMPK .bin package (HEF + registration metadata).
+ * Mirrors downloadDebugLogs: blob → object URL → anchor click.
+ */
+export const downloadModelPackage = async (modelId: string): Promise<void> => {
+  const result = await aiApi.exportPackage(modelId);
+  // The response interceptor returns data directly for blobs.
+  const blob = result as unknown as Blob;
+  if (!blob || blob.size === 0) {
+    throw new Error('Received empty file');
+  }
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${modelId}.bin`;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
 };

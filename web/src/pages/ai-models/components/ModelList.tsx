@@ -51,6 +51,9 @@ interface ModelData {
 
 interface ModelListProps {
   models: ModelData[];
+  /** total before filtering — distinguishes "no models" from "no match" */
+  totalCount?: number;
+  onClearFilters?: () => void;
   onDelete: (modelId: string, modelName: string) => void;
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
@@ -70,8 +73,17 @@ const formatLoadTime = (timestamp: number | undefined, t: any): string => {
   return `${Math.floor(diff / 86400)} ${t('sys.ai_models.time.days_ago', '天前')}`;
 };
 
+const formatFileSize = (bytes: number | undefined): string => {
+  if (!bytes) return '-';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
 export default function ModelList({
   models,
+  totalCount,
+  onClearFilters,
   onDelete,
   onLoad,
   onUnload,
@@ -118,7 +130,7 @@ export default function ModelList({
   return (
     <>
       <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
-        <table className="w-full min-w-[900px] text-sm text-left">
+        <table className="w-full min-w-[1100px] text-sm text-left">
           <thead className="border-b border-border bg-background text-muted-foreground font-medium shadow-sm">
             <tr>
               <th className="px-6 py-4 font-medium">
@@ -129,6 +141,12 @@ export default function ModelList({
               </th>
               <th className="px-6 py-4 font-medium">
                 {t('sys.ai_models.table.status', '状态')}
+              </th>
+              <th className="px-6 py-4 font-medium">
+                {t('sys.ai_models.detail.input_size', '输入尺寸')}
+              </th>
+              <th className="px-6 py-4 font-medium">
+                {t('sys.ai_models.detail.file_size', '文件大小')}
               </th>
               <th className="px-6 py-4 font-medium">
                 {t('sys.ai_models.table.model_path', '路径')}
@@ -145,15 +163,36 @@ export default function ModelList({
             {pagedModels.length === 0 ? (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={8}
                   className="px-6 py-12 text-center text-muted-foreground"
                 >
-                  <Empty
-                    description={t(
-                      'sys.ai_models.empty.installed',
-                      '暂无已安装的AI模型'
-                    )}
-                  />
+                  {models.length === 0 && (totalCount ?? 0) > 0 ? (
+                    <div className="flex flex-col items-center gap-3">
+                      <Empty
+                        description={t(
+                          'sys.ai_models.empty.no_match',
+                          '没有符合条件的模型'
+                        )}
+                      />
+                      {onClearFilters && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={onClearFilters}
+                        >
+                          {t('sys.ai_models.empty.clear_filters', '清除筛选')}
+                        </Button>
+                      )}
+                    </div>
+                  ) : (
+                    <Empty
+                      description={t(
+                        'sys.ai_models.empty.installed',
+                        '暂无已安装的AI模型'
+                      )}
+                    />
+                  )}
                 </td>
               </tr>
             ) : (
@@ -225,6 +264,14 @@ export default function ModelList({
                           ? t('sys.ai_models.status.loaded', '已加载')
                           : t('sys.ai_models.status.uploaded', '未加载')}
                       </Badge>
+                    </td>
+                    <td className="px-6 py-4 text-muted-foreground whitespace-nowrap">
+                      {model.input_width && model.input_height
+                        ? `${model.input_width}×${model.input_height}`
+                        : '-'}
+                    </td>
+                    <td className="px-6 py-4 text-muted-foreground whitespace-nowrap">
+                      {formatFileSize(model.file_size)}
                     </td>
                     <td className="px-6 py-4 min-w-0 max-w-[200px]">
                       {model.model_path ? (
@@ -504,6 +551,9 @@ export default function ModelList({
         model={detailModel}
         open={!!detailModel}
         onOpenChange={open => !open && setDetailModel(null)}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        loadingAction={loadingAction}
       />
     </>
   );

@@ -1,7 +1,22 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { aiApi } from '@/services/api';
+import { aiApi, downloadModelPackage } from '@/services/api';
 
 const unwrapApiData = (res: any) => res?.data ?? res;
+
+// Output delivery mode: 'platform' = plugin-decoded structured results,
+// 'raw' = bare tensors returned as-is (consumer decodes).
+export type OutputMode = 'platform' | 'raw';
+
+// Parse-result extras (POST /api/v1/ai/models/parse): output_format classifies
+// the HEF's compiled output (nms blob vs feature map); `package` is present
+// only for AMPK .bin imports and pre-fills the wizard from package metadata.
+export interface ModelPackagePrefill {
+  model_id: string;
+  name: string;
+  model_type: string;
+  output_mode: string;
+  config: Record<string, unknown>;
+}
 
 export const useModels = () => useQuery({
     queryKey: ['ai', 'models'],
@@ -166,6 +181,7 @@ export const useRegisterModelV2 = () => {
       file_hash: string;
       model_id: string;
       model_type: string;
+      output_mode: string;
       model_variant: string;
       config: Record<string, unknown>;
       file_size: number;
@@ -195,6 +211,7 @@ export const useUpdateModel = () => {
     } & Partial<{
       file_hash: string;
       model_type: string;
+      output_mode: string;
       model_variant: string;
       config: Record<string, unknown>;
       file_size: number;
@@ -211,3 +228,12 @@ export const useUpdateModel = () => {
     },
   });
 };
+
+// Export a device-level model as an AMPK .bin package (HEF + registration
+// metadata) and trigger a browser download of <model_id>.bin.
+export const useExportModel = () => useMutation({
+    mutationFn: async (modelId: string) => {
+      await downloadModelPackage(modelId);
+      return modelId;
+    },
+  });
