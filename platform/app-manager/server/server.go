@@ -2417,15 +2417,14 @@ type modelRef struct {
 }
 
 // pendingBundledModel is a spec.models entry whose id was not found on the
-// device but which declared a bundled image path: the file gets extracted
-// from the app image once it is available and registered as a transient
-// model.
+// device but which declared a bundled image path: the AMPK package gets
+// extracted from the app image once it is available, unpacked and registered
+// as a transient model.
 type pendingBundledModel struct {
-	alias     string
-	id        string
-	path      string // absolute container path inside the app image
-	modelType string
-	required  bool
+	alias    string
+	id       string
+	path     string // absolute container path of the .bin package inside the app image
+	required bool
 }
 
 // shadowedBundledModel is a spec.models entry whose id was found on the
@@ -2511,11 +2510,10 @@ func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appMani
 			}
 			if ref.mapping.Path != "" {
 				res.pathPending = append(res.pathPending, pendingBundledModel{
-					alias:     ref.alias,
-					id:        ref.mapping.ID,
-					path:      ref.mapping.Path,
-					modelType: ref.mapping.Type,
-					required:  ref.mapping.Required,
+					alias:    ref.alias,
+					id:       ref.mapping.ID,
+					path:     ref.mapping.Path,
+					required: ref.mapping.Required,
 				})
 				continue
 			}
@@ -2554,22 +2552,30 @@ func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appMani
 	return res, classify(true, loaded, "")
 }
 
-// appModelsDir is where bundled model files extracted from app images live:
-// {RootPath}/app-models/<app_id>/<alias>/<basename>. Reinstalling an app
-// overwrites its directory, making extraction idempotent.
+// appModelsDir is where bundled models unpacked from app images live:
+// {RootPath}/app-models/<app_id>/<alias>/ holding the extracted HEF plus its
+// registration.json sidecar (the .bin package itself is deleted after unpack).
+// Reinstalling an app overwrites its directory, making unpacking idempotent.
 func appModelsDir(appID string) string {
 	return filepath.Join(constants.RootPath(), "app-models", appID)
 }
 
-// extractImageModels extracts path-pending bundled models from the app image
-// (now present in containerd) and registers them with ai-runtime as transient
-// models: usable by the app, invisible on the model page. Called on both
-// install paths after image availability and before the app is registered. A
-// failing required model aborts the install via the returned error; optional
-// failures warn and continue. task may be nil (sync InstallApp path). On
-// failure, models registered by this call are unregistered again so a failed
-// install leaves nothing behind (the app is never registered, so UninstallApp
-// would not run for it).
+// extractImageModels unpacks path-pending bundled models — AMPK .bin packages
+// declared in spec.models — out of the app image (now present in containerd)
+// and registers them with ai-runtime as transient models: usable by the app,
+// invisible on the model page. Each package is digest-verified, its HEF
+// staged beside a registration.json sidecar (the durable record PreloadModels
+// restores from at every reboot), and registered with the composed variant;
+// the .bin itself is deleted after unpack. Fresh detection registrations get
+// a postprocess smoke test — a profile/HEF mismatch would otherwise surface
+// as per-frame infer failures once the app runs — and a failure rolls that
+// registration back and removes the unpacked files. Called on both install
+// paths after image availability and before the app is registered. A failing
+// required model aborts the install via the returned error; optional failures
+// warn and continue. task may be nil (sync InstallApp path). On failure,
+// models registered by this call are unregistered again so a failed install
+// leaves nothing behind (the app is never registered, so UninstallApp would
+// not run for it).
 func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string, appManifest *manifest.AppManifest, pending []pendingBundledModel, task *InstallTask) error {
 	if len(pending) == 0 {
 		return nil
@@ -2595,8 +2601,8 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 		return reportModelValidationAt("registering", 82, requiredErrs, warnings, task)
 	}
 
-	// Bundled models are extracted from the primary image (spec.image, or the
-	// main container's image for multi-container apps).
+	// Bundled packages are extracted from the primary image (spec.image, or
+	// the main container's image for multi-container apps).
 	imageRefs := appManifest.ImageReferences()
 	imageRef := ""
 	if len(imageRefs) > 0 {
@@ -2623,28 +2629,48 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 			fail("the app declares no image to extract from")
 			continue
 		}
-		extractedPath, err := extractFn(ctx, imageRef, p.path, filepath.Join(baseDir, p.alias))
+		aliasDir := filepath.Join(baseDir, p.alias)
+		binPath, err := extractFn(ctx, imageRef, p.path, aliasDir)
 		if err != nil {
 			fail("extract %q from image %s failed: %v", p.path, imageRef, err)
 			continue
 		}
+		reg, unpackErr := unpackBundledPackage(binPath, aliasDir, p.id)
+		os.Remove(binPath) // the .bin is transport only; HEF + sidecar remain
+		if unpackErr != nil {
+			fail("unpacking bundled package %s failed: %v", p.path, unpackErr)
+			continue
+		}
+		hefPath := filepath.Join(aliasDir, reg.HEF)
 		regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-			ModelId:   p.id,
-			ModelPath: extractedPath,
-			OwnerId:   appID,
-			ModelType: p.modelType,
-			Transient: true,
+			ModelId:      p.id,
+			ModelPath:    hefPath,
+			OwnerId:      appID,
+			ModelType:    reg.ModelType,
+			ModelVariant: reg.ModelVariant,
+			Transient:    true,
 		})
 		if err != nil {
-			fail("registering extracted model at %s failed: %v", extractedPath, err)
+			fail("registering unpacked model at %s failed: %v", hefPath, err)
 			continue
 		}
 		if regResp.Status != nil && !regResp.Status.Success {
-			fail("registering extracted model at %s failed: %s", extractedPath, regResp.Status.Message)
+			fail("registering unpacked model at %s failed: %s", hefPath, regResp.Status.Message)
 			continue
 		}
+		if reg.ModelType == "detection" {
+			if smokeErr := s.probeFreshRegistration(ctx, client, appID, p.id); smokeErr != nil {
+				fail("postprocess smoke test failed (%v); registration rolled back", smokeErr)
+				// The registration is gone; drop the unpacked files too so a
+				// later PreloadModels cannot resurrect a known-broken model.
+				if rmErr := os.RemoveAll(aliasDir); rmErr != nil {
+					logger.Warn("Failed to remove unpacked files for failed model %s: %v", p.id, rmErr)
+				}
+				continue
+			}
+		}
 		registered = append(registered, p.id)
-		logger.Info("Extracted and registered bundled model %q (alias %q) from %s%s for app %s (transient)",
+		logger.Info("Unpacked and registered bundled model %q (alias %q) from %s%s for app %s (transient)",
 			p.id, p.alias, imageRef, p.path, appID)
 	}
 
@@ -2707,14 +2733,15 @@ func fileSHA256(path string) (string, error) {
 // checkShadowedModels hardens the shadowing case: spec.models entries whose
 // id resolved from the platform while the image also bundles a copy. The
 // platform copy wins resolution, so a differing bundled version is silently
-// ignored — hash both files and warn "平台已有同 id 模型，镜像内版本被忽略"
-// on mismatch so the operator knows the app is not running its bundled
-// version. Purely informational: any failure to read or hash either side
-// (platform file gone, file absent from the image, containerd unavailable)
-// skips that entry via a debug log instead of failing the install. The
-// extracted copy lands in a temp dir that is always removed — nothing is
-// registered and nothing persists under app-models. Runs on both install
-// paths after the image is in containerd; task may be nil (sync path).
+// ignored — hash the platform file against the bundled package's inner HEF
+// and warn "平台已有同 id 模型，镜像内版本被忽略" on mismatch so the operator
+// knows the app is not running its bundled version. Purely informational:
+// any failure to read or hash either side (platform file gone, package absent
+// from the image, digest mismatch, containerd unavailable) skips that entry
+// via a debug log instead of failing the install. The extracted .bin lands
+// in a temp dir that is always removed — nothing is registered and nothing
+// persists under app-models. Runs on both install paths after the image is
+// in containerd; task may be nil (sync path).
 func (s *AppManagerServer) checkShadowedModels(ctx context.Context, appManifest *manifest.AppManifest, shadowed []shadowedBundledModel, task *InstallTask) {
 	if len(shadowed) == 0 || appManifest == nil {
 		return
@@ -2748,10 +2775,13 @@ func (s *AppManagerServer) checkShadowedModels(ctx context.Context, appManifest 
 			logger.Debug("Shadowed model %q (alias %q): bundled copy at %s unreadable (%v), skipping hash comparison", m.id, m.alias, m.path, err)
 			continue
 		}
-		imageHash, hashErr := fileSHA256(extractedPath)
+		// The bundled copy is an AMPK .bin: hash the inner HEF (digest-verified
+		// while streaming) so it compares against the platform's HEF hash — the
+		// package container itself would never match.
+		imageHash, hashErr := bundledPackageHEFHash(extractedPath)
 		os.RemoveAll(tmpDir)
 		if hashErr != nil {
-			logger.Debug("Shadowed model %q (alias %q): extracted copy %s unreadable (%v), skipping hash comparison", m.id, m.alias, extractedPath, hashErr)
+			logger.Debug("Shadowed model %q (alias %q): bundled package %s unreadable (%v), skipping hash comparison", m.id, m.alias, extractedPath, hashErr)
 			continue
 		}
 		if imageHash == platformHash {
@@ -2772,10 +2802,11 @@ func (s *AppManagerServer) checkShadowedModels(ctx context.Context, appManifest 
 }
 
 // PreloadModels registers the models the app depends on with ai-runtime:
-// platform models from platform.db, and bundled models extracted from the
-// app image at install time (restored e.g. after a device reboot, where the
-// runtime lost the registration but the extracted file survived). Registering
-// an already-loaded model adds co-ownership, so repeated starts are safe.
+// platform models from platform.db, and bundled models from the HEF +
+// registration.json sidecar unpacked from the app image's AMPK .bin packages
+// at install time (restored e.g. after a device reboot, where the runtime
+// lost the registration but the unpacked files survived). Registering an
+// already-loaded model adds co-ownership, so repeated starts are safe.
 func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appManifest *manifest.AppManifest) {
 	s.aiRuntimeMutex.RLock()
 	client := s.aiRuntimeClient
@@ -2789,16 +2820,17 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 	}
 
 	// Bundled (path-declared) mappings by model id, for the platform.db-miss
-	// fallback. First alias per id wins; spec.models is tiny so determinism
-	// only matters for logging.
-	type bundledModel struct{ alias, path, modelType string }
-	bundled := make(map[string]bundledModel, len(appManifest.Spec.Models))
+	// fallback: the alias locates the unpack dir whose registration.json sidecar
+	// holds the composed registration from install time (the .bin was deleted
+	// after unpack, so the type/variant cannot be re-derived). First alias per
+	// id wins; spec.models is tiny so determinism only matters for logging.
+	bundled := make(map[string]string, len(appManifest.Spec.Models))
 	for alias, mapping := range appManifest.Spec.Models {
 		if mapping.Path == "" {
 			continue
 		}
 		if _, exists := bundled[mapping.ID]; !exists {
-			bundled[mapping.ID] = bundledModel{alias: alias, path: mapping.Path, modelType: mapping.Type}
+			bundled[mapping.ID] = alias
 		}
 	}
 
@@ -2821,24 +2853,39 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 			s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID])
 			continue
 		}
-		if b, ok := bundled[modelID]; ok {
-			extracted := filepath.Join(appModelsDir(appID), b.alias, filepath.Base(b.path))
-			if _, statErr := os.Stat(extracted); statErr != nil {
-				logger.Warn("App %s declares bundled model %s at %s, but the extracted file is missing (was the app reinstalled?): %v",
-					appID, modelID, extracted, statErr)
+		if alias, ok := bundled[modelID]; ok {
+			aliasDir := filepath.Join(appModelsDir(appID), alias)
+			reg, regErr := loadBundledRegistration(aliasDir)
+			if regErr != nil {
+				logger.Warn("App %s declares bundled model %s (alias %q), but its unpack record is unreadable (reinstall the app): %v",
+					appID, modelID, alias, regErr)
+				continue
+			}
+			hefPath := filepath.Join(aliasDir, reg.HEF)
+			if _, statErr := os.Stat(hefPath); statErr != nil {
+				logger.Warn("App %s declares bundled model %s, but the unpacked file %s is missing (was the app reinstalled?): %v",
+					appID, modelID, hefPath, statErr)
 				continue
 			}
 			_, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-				ModelId:   modelID,
-				ModelPath: extracted,
-				OwnerId:   appID,
-				ModelType: b.modelType,
-				Transient: true,
+				ModelId:      modelID,
+				ModelPath:    hefPath,
+				OwnerId:      appID,
+				ModelType:    reg.ModelType,
+				ModelVariant: reg.ModelVariant,
+				Transient:    true,
 			})
 			if err != nil {
 				logger.Warn("Failed to restore bundled model %s for app %s: %v", modelID, appID, err)
-			} else {
-				logger.Info("Restored bundled model %s (path: %s, type: %s) for app %s (transient)", modelID, extracted, b.modelType, appID)
+				continue
+			}
+			logger.Info("Restored bundled model %s (path: %s, type: %s) for app %s (transient)", modelID, hefPath, reg.ModelType, appID)
+			// Fresh detection restore gets the same install-time smoke test:
+			// the HEF and sidecar are kept either way (the next start retries;
+			// only reinstall rewrites them), but a known-broken registration
+			// is not left behind for the app to infer against.
+			if !preexisting[modelID] && reg.ModelType == "detection" {
+				s.probeFreshRegistration(ctx, client, appID, modelID)
 			}
 			continue
 		}
@@ -2877,16 +2924,32 @@ func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client infe
 	if !fresh || model.ResolveModelType(meta.ModelType) != "detection" {
 		return
 	}
+	// The stored file stays (the platform row owns it); only this freshly
+	// created registration is rolled back on failure.
+	s.probeFreshRegistration(ctx, client, appID, modelID)
+}
+
+// probeFreshRegistration smoke-tests a registration this app just created and
+// rolls it back on failure. A detection model whose postprocess profile does
+// not match its HEF registers fine but then fails every infer; probing one
+// frame right after RegisterModel catches the mismatch while the caller can
+// still undo the registration. Missing tensor info skips the probe (that is
+// RunLoadSmokeTest's contract). The smoke failure is returned so install-path
+// callers can route it into the install result; preload-path callers just
+// take the rollback and its Error log.
+func (s *AppManagerServer) probeFreshRegistration(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string) error {
 	info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: modelID})
 	if infoErr != nil {
 		info = nil // no tensor info: RunLoadSmokeTest skips the probe
 	}
 	if smokeErr := modelload.RunLoadSmokeTest(ctx, client, modelID, info); smokeErr != nil {
-		logger.Error("Load smoke test failed for preloaded model %s (app %s); rolling back registration: %v", modelID, appID, smokeErr)
+		logger.Error("Load smoke test failed for freshly registered model %s (app %s); rolling back registration: %v", modelID, appID, smokeErr)
 		if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID, OwnerId: appID}); unregErr != nil {
 			logger.Error("Failed to roll back registration of model %s for app %s: %v", modelID, appID, unregErr)
 		}
+		return smokeErr
 	}
+	return nil
 }
 
 // UnloadModels unregisters the models for this app_id and removes the model

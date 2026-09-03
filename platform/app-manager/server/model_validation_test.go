@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"aipc/platform/app-manager/manifest"
 	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
+	"aipc/platform/platform-api/storage"
 )
 
 // stubInferenceClient embeds the generated interface so only the methods
@@ -202,7 +205,7 @@ func TestResolveModelDependencies(t *testing.T) {
 			client:  &stubInferenceClient{},
 			enabled: true,
 			models: map[string]manifest.ModelMapping{
-				"detector": {ID: "bundled_det", Path: "/app/models/det.hef", Type: "detection", Required: true},
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: true},
 			},
 			wantPending: []string{"detector"},
 		},
@@ -211,7 +214,7 @@ func TestResolveModelDependencies(t *testing.T) {
 			client:  &stubInferenceClient{models: []*inferencepb.ModelInfo{loadedModel("bundled_det")}},
 			enabled: true,
 			models: map[string]manifest.ModelMapping{
-				"detector": {ID: "bundled_det", Path: "/app/models/det.hef", Type: "detection", Required: true},
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: true},
 			},
 		},
 		{
@@ -219,8 +222,8 @@ func TestResolveModelDependencies(t *testing.T) {
 			client:  &stubInferenceClient{},
 			enabled: true,
 			models: map[string]manifest.ModelMapping{
-				"zeta":  {ID: "model_z", Path: "/app/models/z.hef", Type: "detection"},
-				"alpha": {ID: "model_a", Path: "/app/models/a.hef", Type: "detection"},
+				"zeta":  {ID: "model_z", Path: "/app/models/z.bin"},
+				"alpha": {ID: "model_a", Path: "/app/models/a.bin"},
 			},
 			wantPending: []string{"alpha", "zeta"},
 		},
@@ -351,19 +354,49 @@ func TestResolveModelDependenciesTaskOptional(t *testing.T) {
 // fakeExtractor mimics containerd.Client.ExtractFileFromImage: materializes
 // the "extracted" file under destDir and returns its path. Paths listed in
 // fail fail with an error instead.
-func fakeExtractor(fail map[string]bool) func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
+// fakeExtractor returns an extractModelFile stub that "extracts" genuine AMPK
+// packages built with storage.WritePackage, so unpackBundledPackage sees a
+// real digest-verified container rather than a fake byte blob. packages maps
+// container path → package metadata; paths without an entry get the canonical
+// detection package (the bundled flow's workhorse).
+func fakeExtractor(packages map[string]*storage.PackageMeta, fail map[string]bool) func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
 	return func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
 		if fail[containerPath] {
 			return "", errors.New("file not found in image")
+		}
+		meta := detectionPackageMeta("bundled_det")
+		if m, ok := packages[containerPath]; ok {
+			meta = m
 		}
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			return "", err
 		}
 		p := filepath.Join(destDir, filepath.Base(containerPath))
-		if err := os.WriteFile(p, []byte("fake-hef"), 0o644); err != nil {
+		f, err := os.Create(p)
+		if err != nil {
+			return "", err
+		}
+		if err := storage.WritePackage(f, meta, bytes.NewReader([]byte("fake-hef-bytes"))); err != nil {
+			f.Close()
+			return "", err
+		}
+		if err := f.Close(); err != nil {
 			return "", err
 		}
 		return p, nil
+	}
+}
+
+// detectionPackageMeta is the canonical bundled detection package: platform
+// output mode, no config overrides — postprocess profile and thresholds come
+// from the schema defaults at unpack time.
+func detectionPackageMeta(id string) *storage.PackageMeta {
+	return &storage.PackageMeta{
+		ModelID:    id,
+		ModelType:  "detection",
+		OutputMode: "platform",
+		Config:     json.RawMessage(`{}`),
+		HEF:        storage.PackageHEF{Filename: id + ".hef"},
 	}
 }
 
@@ -380,7 +413,7 @@ func bundledImageManifest() *manifest.AppManifest {
 		Spec: manifest.Spec{
 			Image: "docker.io/library/app-x:1.0.0",
 			Models: map[string]manifest.ModelMapping{
-				"detector": {ID: "bundled_det", Path: "/app/models/det.hef", Type: "detection", Required: true},
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: true},
 			},
 		},
 	}
@@ -388,14 +421,14 @@ func bundledImageManifest() *manifest.AppManifest {
 
 func pendingFor(m *manifest.AppManifest, alias string) []pendingBundledModel {
 	mp := m.Spec.Models[alias]
-	return []pendingBundledModel{{alias: alias, id: mp.ID, path: mp.Path, modelType: mp.Type, required: mp.Required}}
+	return []pendingBundledModel{{alias: alias, id: mp.ID, path: mp.Path, required: mp.Required}}
 }
 
 func TestExtractImageModels(t *testing.T) {
 	t.Run("success_registers_transient_model", func(t *testing.T) {
 		root := withTempRoot(t)
 		client := &stubInferenceClient{}
-		s := newExtractionServer(t, client, fakeExtractor(nil))
+		s := newExtractionServer(t, client, fakeExtractor(nil, nil))
 		m := bundledImageManifest()
 
 		task := &InstallTask{ID: "t", Phase: "pulling"}
@@ -407,13 +440,21 @@ func TestExtractImageModels(t *testing.T) {
 			t.Fatalf("registrations = %d, want 1", len(client.registrations))
 		}
 		reg := client.registrations[0]
-		wantPath := filepath.Join(root, "app-models", "app-x", "detector", "det.hef")
+		// Detection packages stage their HEF under the postprocess profile
+		// basename (schema default profile: no config overrides in the
+		// package), so modelload passes the file through without copying.
+		wantPath := filepath.Join(root, "app-models", "app-x", "detector", model.DefaultDetectionProfile+".hef")
 		if reg.ModelId != "bundled_det" || reg.ModelPath != wantPath || reg.OwnerId != "app-x" ||
 			reg.ModelType != "detection" || !reg.Transient {
 			t.Errorf("registration = %+v, want id=bundled_det path=%s owner=app-x type=detection transient=true", reg, wantPath)
 		}
 		if _, err := os.Stat(wantPath); err != nil {
-			t.Errorf("extracted file missing: %v", err)
+			t.Errorf("unpacked HEF missing: %v", err)
+		}
+		// The registration sidecar (the record PreloadModels restores from
+		// after a reboot) must have been written next to it.
+		if _, err := os.Stat(filepath.Join(root, "app-models", "app-x", "detector", "registration.json")); err != nil {
+			t.Errorf("registration sidecar missing: %v", err)
 		}
 		if len(client.unregistered) != 0 {
 			t.Errorf("unregistered = %v, want none on success", client.unregistered)
@@ -426,9 +467,9 @@ func TestExtractImageModels(t *testing.T) {
 	t.Run("required_extract_failure_rolls_back", func(t *testing.T) {
 		withTempRoot(t)
 		client := &stubInferenceClient{}
-		s := newExtractionServer(t, client, fakeExtractor(map[string]bool{"/app/models/missing.hef": true}))
+		s := newExtractionServer(t, client, fakeExtractor(nil, map[string]bool{"/app/models/missing.bin": true}))
 		m := bundledImageManifest()
-		m.Spec.Models["broken"] = manifest.ModelMapping{ID: "bundled_broken", Path: "/app/models/missing.hef", Type: "detection", Required: true}
+		m.Spec.Models["broken"] = manifest.ModelMapping{ID: "bundled_broken", Path: "/app/models/missing.bin", Required: true}
 
 		pending := append(pendingFor(m, "detector"), pendingFor(m, "broken")...)
 		err := s.extractImageModels(context.Background(), "app-x", m, pending, nil)
@@ -455,9 +496,9 @@ func TestExtractImageModels(t *testing.T) {
 	t.Run("optional_failure_warns_and_continues", func(t *testing.T) {
 		withTempRoot(t)
 		client := &stubInferenceClient{}
-		s := newExtractionServer(t, client, fakeExtractor(map[string]bool{"/app/models/opt.hef": true}))
+		s := newExtractionServer(t, client, fakeExtractor(nil, map[string]bool{"/app/models/opt.bin": true}))
 		m := bundledImageManifest()
-		m.Spec.Models["extra"] = manifest.ModelMapping{ID: "bundled_opt", Path: "/app/models/opt.hef", Type: "clip"}
+		m.Spec.Models["extra"] = manifest.ModelMapping{ID: "bundled_opt", Path: "/app/models/opt.bin"}
 
 		pending := append(pendingFor(m, "detector"), pendingFor(m, "extra")...)
 		task := &InstallTask{ID: "t", Phase: "pulling"}
@@ -477,7 +518,7 @@ func TestExtractImageModels(t *testing.T) {
 		client := &stubInferenceClient{regStatus: map[string]*inferencepb.Status{
 			"bundled_det": {Success: false, Message: "model_type is required for app-bundled model"},
 		}}
-		s := newExtractionServer(t, client, fakeExtractor(nil))
+		s := newExtractionServer(t, client, fakeExtractor(nil, nil))
 		m := bundledImageManifest()
 
 		err := s.extractImageModels(context.Background(), "app-x", m, pendingFor(m, "detector"), nil)
@@ -489,6 +530,78 @@ func TestExtractImageModels(t *testing.T) {
 		}
 		if _, statErr := os.Stat(appModelsDir("app-x")); !os.IsNotExist(statErr) {
 			t.Errorf("extraction dir still present after rollback (stat err=%v)", statErr)
+		}
+	})
+
+	t.Run("required_smoke_failure_fails_install", func(t *testing.T) {
+		withTempRoot(t)
+		// Probe inputs make the smoke test actually run an Infer frame;
+		// inferFail is the postprocess-mismatch scenario the probe exists for.
+		client := &stubInferenceClient{
+			infos:     map[string]*inferencepb.ModelInfo{"bundled_det": probeInputs("bundled_det")},
+			inferFail: "output tensor count mismatch",
+		}
+		s := newExtractionServer(t, client, fakeExtractor(nil, nil))
+		m := bundledImageManifest()
+
+		err := s.extractImageModels(context.Background(), "app-x", m, pendingFor(m, "detector"), nil)
+		if err == nil {
+			t.Fatal("extractImageModels() expected error when the smoke probe fails")
+		}
+		if !strings.Contains(err.Error(), "postprocess smoke test failed") {
+			t.Errorf("error = %q, want smoke failure reason", err.Error())
+		}
+		// The registration was attempted, probed, and rolled back — and the
+		// unpacked files are gone so PreloadModels cannot resurrect them.
+		if len(client.registrations) != 1 || client.registrations[0].ModelId != "bundled_det" {
+			t.Fatalf("registrations = %+v, want the attempted bundled_det registration", client.registrations)
+		}
+		if len(client.inferCalls) != 1 || client.inferCalls[0] != "bundled_det" {
+			t.Errorf("inferCalls = %v, want one bundled_det probe", client.inferCalls)
+		}
+		if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "bundled_det" {
+			t.Errorf("unregistered = %+v, want bundled_det rolled back", client.unregistered)
+		}
+		if _, statErr := os.Stat(appModelsDir("app-x")); !os.IsNotExist(statErr) {
+			t.Errorf("extraction dir still present after smoke rollback (stat err=%v)", statErr)
+		}
+	})
+
+	t.Run("optional_smoke_failure_warns_and_skips", func(t *testing.T) {
+		withTempRoot(t)
+		// The required detector gets no tensor info (GetModelInfo errors →
+		// probe skipped); only the optional model is probed and fails.
+		client := &stubInferenceClient{
+			infos:     map[string]*inferencepb.ModelInfo{"bundled_opt": probeInputs("bundled_opt")},
+			inferFail: "output tensor count mismatch",
+		}
+		s := newExtractionServer(t, client, fakeExtractor(map[string]*storage.PackageMeta{
+			"/app/models/opt.bin": detectionPackageMeta("bundled_opt"),
+		}, nil))
+		m := bundledImageManifest()
+		m.Spec.Models["extra"] = manifest.ModelMapping{ID: "bundled_opt", Path: "/app/models/opt.bin"}
+
+		pending := append(pendingFor(m, "detector"), pendingFor(m, "extra")...)
+		task := &InstallTask{ID: "t", Phase: "pulling"}
+		if err := s.extractImageModels(context.Background(), "app-x", m, pending, task); err != nil {
+			t.Fatalf("extractImageModels() unexpected error: %v", err)
+		}
+		if len(client.registrations) != 2 {
+			t.Fatalf("registrations = %d, want 2 attempts", len(client.registrations))
+		}
+		if len(client.inferCalls) != 1 || client.inferCalls[0] != "bundled_opt" {
+			t.Errorf("inferCalls = %v, want only the bundled_opt probe", client.inferCalls)
+		}
+		if !strings.Contains(task.Message, `optional model "bundled_opt" (alias "extra")`) {
+			t.Errorf("task.Message = %q, want optional bundled_opt warning", task.Message)
+		}
+		if !strings.Contains(task.Message, "postprocess smoke test failed") {
+			t.Errorf("task.Message = %q, want smoke failure in the warning", task.Message)
+		}
+		// The optional model's registration was rolled back; the required
+		// detector stays registered.
+		if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "bundled_opt" {
+			t.Errorf("unregistered = %+v, want only bundled_opt", client.unregistered)
 		}
 	})
 
@@ -522,13 +635,19 @@ func TestPreloadModelsRestoresBundledModels(t *testing.T) {
 	if err := os.WriteFile(extracted, []byte("fake-hef"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The sidecar install time wrote next to the unpacked HEF: it carries the
+	// composed gRPC registration the .bin itself is gone too far to re-derive.
+	sidecar := `{"model_id": "bundled_det", "hef": "det.hef", "model_type": "detection"}`
+	if err := os.WriteFile(filepath.Join(filepath.Dir(extracted), "registration.json"), []byte(sidecar), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	client := &stubInferenceClient{}
 	s := newValidationServer(client, true)
 	appManifest := &manifest.AppManifest{
 		Spec: manifest.Spec{
 			Models: map[string]manifest.ModelMapping{
-				"detector": {ID: "bundled_det", Path: "/app/models/det.hef", Type: "detection"},
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin"},
 			},
 			Permissions: manifest.Permissions{
 				Inference: manifest.InferencePerms{Models: []string{"bundled_det", "platform_only"}},
@@ -552,13 +671,24 @@ func TestPreloadModelsRestoresBundledModels(t *testing.T) {
 }
 
 func TestPreloadModelsBundledFileMissing(t *testing.T) {
-	withTempRoot(t) // no extracted file created
+	root := withTempRoot(t)
+	// Sidecar present, HEF gone (a partial wipe): the restore must warn and
+	// register nothing rather than point a registration at a missing file.
+	aliasDir := filepath.Join(root, "app-models", "app-x", "detector")
+	if err := os.MkdirAll(aliasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := `{"model_id": "bundled_det", "hef": "det.hef", "model_type": "detection"}`
+	if err := os.WriteFile(filepath.Join(aliasDir, "registration.json"), []byte(sidecar), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	client := &stubInferenceClient{}
 	s := newValidationServer(client, true)
 	appManifest := &manifest.AppManifest{
 		Spec: manifest.Spec{
 			Models: map[string]manifest.ModelMapping{
-				"detector": {ID: "bundled_det", Path: "/app/models/det.hef", Type: "detection"},
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin"},
 			},
 			Permissions: manifest.Permissions{
 				Inference: manifest.InferencePerms{Models: []string{"bundled_det"}},
@@ -593,15 +723,26 @@ func TestUnloadModelsRemovesExtractedDir(t *testing.T) {
 	}
 }
 
-// contentExtractor mimics containerd extraction with caller-controlled file
-// content so hash comparisons are deterministic.
+// contentExtractor mimics containerd extraction of an AMPK package whose
+// embedded HEF bytes are exactly content, so hash comparisons against a
+// platform HEF are deterministic (the shadowed-model check hashes the inner
+// HEF, not the container).
 func contentExtractor(content []byte) func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
 	return func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
 		if err := os.MkdirAll(destDir, 0o755); err != nil {
 			return "", err
 		}
 		p := filepath.Join(destDir, filepath.Base(containerPath))
-		if err := os.WriteFile(p, content, 0o644); err != nil {
+		f, err := os.Create(p)
+		if err != nil {
+			return "", err
+		}
+		meta := &storage.PackageMeta{HEF: storage.PackageHEF{Filename: "inner.hef"}}
+		if err := storage.WritePackage(f, meta, bytes.NewReader(content)); err != nil {
+			f.Close()
+			return "", err
+		}
+		if err := f.Close(); err != nil {
 			return "", err
 		}
 		return p, nil
@@ -637,8 +778,8 @@ func TestResolveModelDependenciesShadowedCapture(t *testing.T) {
 		"db_det": {FilePath: "/data/aipc/models/db.hef", ModelType: "detection"},
 	})
 	m := &manifest.AppManifest{Spec: manifest.Spec{Models: map[string]manifest.ModelMapping{
-		"rt":    {ID: "runtime_det", Path: "/app/models/rt.hef", Required: true},
-		"dbm":   {ID: "db_det", Path: "/app/models/db.hef", Required: true},
+		"rt":    {ID: "runtime_det", Path: "/app/models/rt.bin", Required: true},
+		"dbm":   {ID: "db_det", Path: "/app/models/db.bin", Required: true},
 		"plain": {ID: "runtime_det"}, // id hit without a path: resolved, never shadowed
 	}}}
 
@@ -678,7 +819,7 @@ func TestCheckShadowedModels(t *testing.T) {
 		task := &InstallTask{ID: "t", Phase: "pulling"}
 
 		s.checkShadowedModels(context.Background(), m, []shadowedBundledModel{
-			{alias: "detector", id: "shared_det", path: "/app/models/det.hef", platformPath: platform},
+			{alias: "detector", id: "shared_det", path: "/app/models/det.bin", platformPath: platform},
 		}, task)
 
 		if !strings.Contains(task.Message, "平台已有同 id 模型，镜像内版本被忽略") {
@@ -699,7 +840,7 @@ func TestCheckShadowedModels(t *testing.T) {
 		task := &InstallTask{ID: "t", Phase: "pulling"}
 
 		s.checkShadowedModels(context.Background(), m, []shadowedBundledModel{
-			{alias: "detector", id: "shared_det", path: "/app/models/det.hef", platformPath: platform},
+			{alias: "detector", id: "shared_det", path: "/app/models/det.bin", platformPath: platform},
 		}, task)
 
 		if task.Message != "" {
@@ -713,7 +854,7 @@ func TestCheckShadowedModels(t *testing.T) {
 		task := &InstallTask{ID: "t", Phase: "pulling"}
 
 		s.checkShadowedModels(context.Background(), m, []shadowedBundledModel{
-			{alias: "detector", id: "shared_det", path: "/app/models/det.hef", platformPath: filepath.Join(t.TempDir(), "gone.hef")},
+			{alias: "detector", id: "shared_det", path: "/app/models/det.bin", platformPath: filepath.Join(t.TempDir(), "gone.hef")},
 		}, task)
 
 		if task.Message != "" {
@@ -723,11 +864,11 @@ func TestCheckShadowedModels(t *testing.T) {
 
 	t.Run("image_copy_unreadable_skips", func(t *testing.T) {
 		platform := writeTempFile(t, "platform.hef", "platform-version")
-		s := newExtractionServer(t, &stubInferenceClient{}, fakeExtractor(map[string]bool{"/app/models/det.hef": true}))
+		s := newExtractionServer(t, &stubInferenceClient{}, fakeExtractor(nil, map[string]bool{"/app/models/det.bin": true}))
 		task := &InstallTask{ID: "t", Phase: "pulling"}
 
 		s.checkShadowedModels(context.Background(), m, []shadowedBundledModel{
-			{alias: "detector", id: "shared_det", path: "/app/models/det.hef", platformPath: platform},
+			{alias: "detector", id: "shared_det", path: "/app/models/det.bin", platformPath: platform},
 		}, task)
 
 		if task.Message != "" {
@@ -741,7 +882,7 @@ func TestCheckShadowedModels(t *testing.T) {
 		task := &InstallTask{ID: "t", Phase: "pulling"}
 
 		s.checkShadowedModels(context.Background(), m, []shadowedBundledModel{
-			{alias: "detector", id: "shared_det", path: "/app/models/det.hef", platformPath: "/data/models/x.hef"},
+			{alias: "detector", id: "shared_det", path: "/app/models/det.bin", platformPath: "/data/models/x.hef"},
 		}, task)
 
 		if task.Message != "" {

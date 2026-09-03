@@ -301,12 +301,12 @@ spec:
 // no-op, and siblings survive both.
 func TestPatchDocumentNullDeletesKey(t *testing.T) {
 	set := mustPatch(t, patchSrc,
-		FieldPatch{Path: "spec.models", Value: []byte(`{"detector":{"id":"yolov8s-640","path":"/opt/models/yolov8s.hef","type":"detection","required":true}}`)})
+		FieldPatch{Path: "spec.models", Value: []byte(`{"detector":{"id":"yolov8s-640","path":"/opt/models/yolov8s.bin","required":true}}`)})
 	parsed, err := ParseManifest(set)
 	if err != nil {
 		t.Fatalf("ParseManifest(set) error: %v\n%s", err, set)
 	}
-	if m := parsed.Spec.Models["detector"]; m.ID != "yolov8s-640" || m.Path != "/opt/models/yolov8s.hef" || m.Type != "detection" || !m.Required {
+	if m := parsed.Spec.Models["detector"]; m.ID != "yolov8s-640" || m.Path != "/opt/models/yolov8s.bin" || !m.Required {
 		t.Fatalf("models round-trip lost subfields: %+v\n%s", m, set)
 	}
 

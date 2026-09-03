@@ -173,51 +173,45 @@ func TestValidateModels(t *testing.T) {
 			wantErr: "spec.models.clip.id is required",
 		},
 		{
-			name:    "path_without_type",
-			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef"},
-			wantErr: "spec.models.clip.type is required when path is declared",
-		},
-		{
-			name:    "type_without_path",
-			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Type: "detection"},
-			wantErr: "spec.models.clip.type is only valid together with path",
-		},
-		{
 			name:    "path_relative",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "models/clip.hef", Type: "clip"},
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "models/clip.bin"},
 			wantErr: "absolute container path",
 		},
 		{
 			name:    "path_parent_escape",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/../etc/clip.hef", Type: "clip"},
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/../etc/clip.bin"},
 			wantErr: "absolute container path",
 		},
 		{
 			name:    "path_redundant_separator",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app//models/clip.hef", Type: "clip"},
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app//models/clip.bin"},
 			wantErr: "absolute container path",
 		},
 		{
 			name:    "path_directory_root",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/", Type: "clip"},
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/"},
 			wantErr: "absolute container path",
 		},
 		{
-			name:    "type_bad_token",
+			name:    "path_bare_hef",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef", Type: "Object Detection"},
-			wantErr: "spec.models.clip.type must match",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef"},
+			wantErr: "must be a .bin AMPK model package",
 		},
 		{
-			name:    "bundled_model_accepted",
+			name:    "path_without_extension",
 			alias:   "clip",
-			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.hef", Type: "clip", Required: true},
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip"},
+			wantErr: "must be a .bin AMPK model package",
+		},
+		{
+			name:    "bundled_bin_package_accepted",
+			alias:   "clip",
+			mapping: ModelMapping{ID: "clip_vit_b_32", Path: "/app/models/clip.bin", Required: true},
 			wantErr: "",
 		},
 	}
@@ -259,8 +253,7 @@ spec:
   models:
     detector:
       id: yolo_v5
-      path: /app/models/../models/yolo.hef
-      type: detection
+      path: /app/models/../models/yolo.bin
 `)
 	_, err := ParseManifest(data)
 	if err == nil {
@@ -269,6 +262,51 @@ spec:
 	if !strings.Contains(err.Error(), "models validation failed") {
 		t.Errorf("ParseManifest() error = %q, want 'models validation failed' in chain", err.Error())
 	}
+}
+
+func TestParseManifestRejectsLegacyModelType(t *testing.T) {
+	// A leftover spec.models.<alias>.type key must fail parsing outright:
+	// yaml.Unmarshal is not strict, so without the probe the key would be
+	// silently swallowed and the model would install with different
+	// postprocess configuration than its author wrote.
+	base := `
+apiVersion: v1
+kind: Application
+metadata:
+  id: test-app
+  name: Test App
+  version: 1.0.0
+spec:
+  image: docker.io/library/alpine:latest
+  models:
+    detector:
+      id: yolo_v5
+`
+	t.Run("type_with_path", func(t *testing.T) {
+		_, err := ParseManifest([]byte(base + "      path: /app/models/yolo.bin\n      type: detection\n"))
+		if err == nil {
+			t.Fatal("ParseManifest() expected error for legacy type key, got nil")
+		}
+		if !strings.Contains(err.Error(), "spec.models.detector.type is no longer supported") {
+			t.Errorf("ParseManifest() error = %q, want 'type is no longer supported'", err.Error())
+		}
+	})
+
+	t.Run("type_without_path", func(t *testing.T) {
+		_, err := ParseManifest([]byte(base + "      type: clip\n"))
+		if err == nil {
+			t.Fatal("ParseManifest() expected error for legacy type key, got nil")
+		}
+		if !strings.Contains(err.Error(), "spec.models.detector.type is no longer supported") {
+			t.Errorf("ParseManifest() error = %q, want 'type is no longer supported'", err.Error())
+		}
+	})
+
+	t.Run("no_type_key_parses", func(t *testing.T) {
+		if _, err := ParseManifest([]byte(base + "      path: /app/models/yolo.bin\n")); err != nil {
+			t.Fatalf("ParseManifest() unexpected error: %v", err)
+		}
+	})
 }
 
 func TestModelEnvVars(t *testing.T) {

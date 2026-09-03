@@ -68,17 +68,13 @@ type SecuritySpec struct {
 // ModelMapping resolves an app-side alias to a concrete model.
 type ModelMapping struct {
 	ID string `yaml:"id" json:"id"` // model id (required: runtime identity and AIPC_MODEL_<alias> value)
-	// Path is an in-image model file used when the id is not found on the
-	// platform: the file is extracted from the app image and registered as a
-	// transient (app-bundled) model, hidden from the model page. Absolute
-	// container path, no ".." segments. Requires Type.
-	Path string `yaml:"path,omitempty" json:"path,omitempty"`
-	// Type is the postprocess type for a path-declared (bundled) model —
-	// detection, segmentation, keypoint, ... It mirrors platform.db's
-	// model_type, which bundled models have no access to. Required with Path
-	// (ai-runtime rejects bundled models without it: raw-tensor-only output
-	// would silently break apps expecting structured results).
-	Type     string `yaml:"type,omitempty" json:"type,omitempty"`
+	// Path is an in-image AMPK model package (.bin) used when the id is not
+	// found on the platform: the package is extracted from the app image,
+	// digest-verified, and registered as a transient (app-bundled) model,
+	// hidden from the model page. The postprocess type and tuning config come
+	// from the package metadata — the manifest no longer declares them.
+	// Absolute container path, no ".." segments, ".bin" extension.
+	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
 	Required bool   `yaml:"required,omitempty" json:"required,omitempty"` // default false: warn when missing; true: block install
 }
 
@@ -260,11 +256,6 @@ type AutoRestart struct {
 // it must be a valid environment variable name fragment.
 var modelAliasPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// modelTypePattern guards the format of spec.models.<alias>.type. The
-// semantic authority for accepted postprocess types is ai-runtime's
-// init_post_process; this only catches authoring mistakes at parse time.
-var modelTypePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-
 // reservedModelAliases names that would shadow or be confused with
 // platform-injected container env names (AIPC_HOST_PREFIX, APP_ID, APP_ROLE,
 // CONTAINER_NAME). Refusing them keeps the container environment unambiguous.
@@ -304,6 +295,10 @@ func ParseManifest(data []byte) (*AppManifest, error) {
 		return nil, fmt.Errorf("failed to parse manifest: %w", err)
 	}
 
+	if err := rejectLegacyModelTypes(data); err != nil {
+		return nil, err
+	}
+
 	if err := manifest.Validate(); err != nil {
 		return nil, fmt.Errorf("manifest validation failed: %w", err)
 	}
@@ -311,6 +306,34 @@ func ParseManifest(data []byte) (*AppManifest, error) {
 	manifest.MergeModelPermissions()
 
 	return &manifest, nil
+}
+
+// rejectLegacyModelTypes fails manifests that still declare
+// spec.models.<alias>.type. The field was removed from ModelMapping (bundled
+// models take their postprocess type from AMPK package metadata), and
+// yaml.Unmarshal is not strict — without this probe a leftover type key would
+// be silently swallowed and the app would install with a silently different
+// model configuration than its author wrote.
+func rejectLegacyModelTypes(data []byte) error {
+	var probe struct {
+		Spec struct {
+			Models map[string]map[string]interface{} `yaml:"models"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		// Shape errors are the first (strict) decode's business; nothing to
+		// probe here.
+		return nil
+	}
+	for alias, mapping := range probe.Spec.Models {
+		if mapping == nil {
+			continue
+		}
+		if _, ok := mapping["type"]; ok {
+			return fmt.Errorf("manifest validation failed: spec.models.%s.type is no longer supported: bundled models install from AMPK .bin packages and take their postprocess type from package metadata", alias)
+		}
+	}
+	return nil
 }
 
 // Validate validates the manifest
@@ -392,7 +415,7 @@ func (m *AppManifest) Validate() error {
 // valid identifiers and must not shadow platform-injected env names.
 // A declared path turns the entry into a bundled-model fallback (extracted
 // from the app image when the id is not found on the platform); it must be
-// an absolute, clean container path and carry a postprocess type.
+// an absolute, clean container path pointing at an AMPK .bin package.
 func (m *AppManifest) ValidateModels() error {
 	for alias, mapping := range m.Spec.Models {
 		if !modelAliasPattern.MatchString(alias) {
@@ -405,12 +428,6 @@ func (m *AppManifest) ValidateModels() error {
 			return fmt.Errorf("spec.models.%s.id is required", alias)
 		}
 		if mapping.Path == "" {
-			if mapping.Type != "" {
-				// No semantics for a type without a bundled file — platform
-				// models take their postprocess type from platform.db. Reject
-				// instead of silently ignoring a field the author wrote.
-				return fmt.Errorf("spec.models.%s.type is only valid together with path", alias)
-			}
 			continue
 		}
 		// Bundled-model fallback declared: validate the in-image path.
@@ -418,15 +435,9 @@ func (m *AppManifest) ValidateModels() error {
 			return fmt.Errorf("spec.models.%s.path must be an absolute container path without '.', '..' or redundant separators (got %q)",
 				alias, mapping.Path)
 		}
-		if mapping.Type == "" {
-			// Mirror of the ai-runtime guard so the failure surfaces at
-			// manifest-parse time: bundled models have no platform.db entry
-			// to supply a postprocess type, and registering without one would
-			// silently yield raw-tensor-only output.
-			return fmt.Errorf("spec.models.%s.type is required when path is declared (e.g. detection, segmentation)", alias)
-		}
-		if !modelTypePattern.MatchString(mapping.Type) {
-			return fmt.Errorf("spec.models.%s.type must match %s", alias, modelTypePattern.String())
+		if ext := filepath.Ext(mapping.Path); ext != ".bin" {
+			return fmt.Errorf("spec.models.%s.path must be a .bin AMPK model package (got %q); bare .hef bundling is no longer supported",
+				alias, mapping.Path)
 		}
 	}
 	return nil
