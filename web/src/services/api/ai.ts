@@ -10,6 +10,13 @@ export const aiApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     }),
 
+  // Abandon a staged blob when the import wizard is cancelled. Server-side
+  // reference counting keeps blobs already shared with registered models.
+  abandonStaged: (fileHash: string, filePath: string) => request.post('/api/v1/ai/models/parse/abandon', {
+      file_hash: fileHash,
+      file_path: filePath,
+    }),
+
   // Register model from parsed result (step 2: confirm + register)
   registerModel: (data: {
     file_hash: string;
@@ -22,8 +29,10 @@ export const aiApi = {
     file_size: number;
     network_name: string;
     vstream_info: string;
-    input_width: number;
-    input_height: number;
+    // Omitted (not zero) when the parser could not extract a dimension —
+    // UpdateModel's pointer semantics treat a sent 0 as "clear".
+    input_width?: number;
+    input_height?: number;
   }) => request.post('/api/v1/ai/models', data),
 
   // Update an existing model (PUT); file_hash empty/omitted = metadata-only

@@ -25,6 +25,9 @@ export const useModels = () => useQuery({
       const data = unwrapApiData(response);
       return data?.models ?? [];
     },
+    // The list endpoint syncs against the runtime over gRPC (per-model N+1),
+    // so serve the cache for a beat instead of refetching on every focus.
+    staleTime: 30_000,
   });
 
 export const useModelInfo = (modelId: string) => useQuery({
@@ -187,8 +190,10 @@ export const useRegisterModelV2 = () => {
       file_size: number;
       network_name: string;
       vstream_info: string;
-      input_width: number;
-      input_height: number;
+      // Omitted when the parser could not extract a dimension — the backend
+      // treats a sent 0 as "clear", so null must never become 0.
+      input_width?: number;
+      input_height?: number;
     }) => {
       const response = await aiApi.registerModel(data);
       return unwrapApiData(response);

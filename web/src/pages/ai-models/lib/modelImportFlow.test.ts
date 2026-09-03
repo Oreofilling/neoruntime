@@ -7,7 +7,9 @@ import {
   classifyOutputFormat,
   fieldDefaultToState,
   formatFileSize,
+  mergeConfigOnTypeSwitch,
   modelFormIssueText,
+  MODEL_ID_PATTERN,
   partitionFields,
   sanitizeModelId,
   validateModelForm,
@@ -73,6 +75,58 @@ describe('sanitizeModelId', () => {
     ['', ''],
   ])('sanitizeModelId(%j) → %j', (input, expected) => {
     expect(sanitizeModelId(input)).toBe(expected);
+  });
+});
+
+describe('MODEL_ID_PATTERN', () => {
+  it.each([
+    ['yolov8n-demo', true],
+    ['A', true],
+    ['a'.repeat(64), true],
+    ['Model_2.v-1', true],
+    ['-leading-dash', false], // must start with letter/digit
+    ['.dotted-start', false],
+    ['my model', false], // space
+    ['检测模型', false], // non-ascii
+    ['a/b', false], // path separator
+    ['a'.repeat(65), false], // over 64 chars
+    ['', false],
+  ])('MODEL_ID_PATTERN.test(%j) → %s', (input, expected) => {
+    expect(MODEL_ID_PATTERN.test(input)).toBe(expected);
+  });
+});
+
+describe('mergeConfigOnTypeSwitch', () => {
+  const poseFields: ModelFieldDef[] = [
+    { key: 'name', type: 'text', required: true },
+    { key: 'postprocess_profile', type: 'select', default: 'yolov8n_pose' },
+    { key: 'threshold', type: 'number', default: 0.5 },
+    { key: 'max_detections', type: 'number', default: 64 },
+    { key: 'keypoint_threshold', type: 'number', default: 0.3 },
+  ];
+
+  it('keeps previously-entered values for keys the new type also has', () => {
+    const merged = mergeConfigOnTypeSwitch(
+      { ...baseForm.config, threshold: 0.35, labels: 'person' },
+      poseFields
+    );
+    // tuned threshold survives the detection → pose switch
+    expect(merged.threshold).toBe(0.35);
+    expect(merged.name).toBe('demo');
+    // detection-only key is dropped, pose-only key falls back to its default
+    expect(merged).not.toHaveProperty('labels');
+    expect(merged).not.toHaveProperty('nms_threshold');
+    expect(merged.keypoint_threshold).toBe(0.3);
+  });
+
+  it('falls back to the new type defaults when nothing was entered', () => {
+    const merged = mergeConfigOnTypeSwitch({}, poseFields);
+    expect(merged).toEqual(fieldDefaultToState(poseFields));
+  });
+
+  it('does not leak keys absent from the new schema even without defaults', () => {
+    const merged = mergeConfigOnTypeSwitch({ stale_key: 1 }, poseFields);
+    expect(merged).not.toHaveProperty('stale_key');
   });
 });
 
@@ -271,6 +325,30 @@ describe('validateModelForm', () => {
     const issues = validateModelForm({ ...baseForm, modelId: '   ' }, baseCtx);
     expect(issues).toEqual([
       { field: 'modelId', section: 'basic_info', reason: 'required' },
+    ]);
+  });
+
+  it.each([
+    '-det', // leading dash
+    'my model', // space
+    '检测模型', // non-ascii
+    'a'.repeat(65), // over 64 chars
+  ])('rejects an out-of-charset model id %j', id => {
+    const issues = validateModelForm({ ...baseForm, modelId: id }, baseCtx);
+    expect(issues).toEqual([
+      { field: 'modelId', section: 'basic_info', reason: 'model_id_invalid' },
+    ]);
+  });
+
+  it('checks the charset before the duplicate-id lookup', () => {
+    // '-det' is also present in the existing list; the charset gate must win.
+    const ctx: ValidateModelFormCtx = {
+      ...baseCtx,
+      existingModelIds: new Set(['-det']),
+    };
+    const issues = validateModelForm({ ...baseForm, modelId: '-det' }, ctx);
+    expect(issues).toEqual([
+      { field: 'modelId', section: 'basic_info', reason: 'model_id_invalid' },
     ]);
   });
 

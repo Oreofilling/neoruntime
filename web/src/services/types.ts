@@ -241,10 +241,8 @@ export interface StorageDevice {
  */
 export type WizardModelMapping = {
   id: string;
-  /** absolute in-image path of a bundled model file */
+  /** absolute in-image path of a bundled AMPK model package (.bin) */
   path?: string;
-  /** postprocess type, only valid together with path */
-  type?: string;
   /** install fails when the model is missing on device */
   required?: boolean;
 };

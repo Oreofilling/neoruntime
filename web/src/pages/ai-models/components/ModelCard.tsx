@@ -63,7 +63,8 @@ interface ModelCardProps {
   onUnload: (modelId: string, modelName: string) => void;
   onImportClick?: () => void;
   onUpdate?: (model: ModelData) => void;
-  loadingAction?: string | null;
+  /** per-model busy predicate — index holds a Set so concurrent actions show. */
+  isActionLoading?: (modelId: string) => boolean;
 }
 
 const getModelType = (
@@ -99,7 +100,7 @@ export default function ModelCard({
   onUnload,
   onImportClick,
   onUpdate,
-  loadingAction,
+  isActionLoading,
 }: ModelCardProps) {
   const { t } = useTranslation();
   const [detailModel, setDetailModel] = useState<ModelData | null>(null);
@@ -169,7 +170,7 @@ export default function ModelCard({
           const modelType = getModelType(model.model_type, model.model_id, t);
           const appsCount = model.used_by_apps?.length || 0;
           const isLoaded = model.status === 'loaded';
-          const isLoading = loadingAction === model.model_id;
+          const isLoading = isActionLoading?.(model.model_id) ?? false;
 
           return (
             <Card
@@ -364,7 +365,7 @@ export default function ModelCard({
         onOpenChange={open => !open && setDetailModel(null)}
         onLoad={onLoad}
         onUnload={onUnload}
-        loadingAction={loadingAction}
+        isActionLoading={isActionLoading}
       />
 
       {/* Delete confirmation */}
@@ -383,7 +384,7 @@ export default function ModelCard({
                   <span>
                     {t(
                       'sys.ai_models.message.delete_blocked',
-                      '该模型正在被以下应用引用，请先删除引用关系后再删除模型：'
+                      '该模型正在被以下应用引用（含未运行应用），请先删除引用关系后再删除模型：'
                     )}
                   </span>
                   <ul className="mt-2 space-y-1">

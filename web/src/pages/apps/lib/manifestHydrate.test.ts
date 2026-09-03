@@ -37,8 +37,7 @@ const manifest: AppManifestDTO = {
     models: {
       detector: {
         id: 'yolov8s-640',
-        path: '/opt/models/yolov8s.hef',
-        type: 'detection',
+        path: '/opt/models/yolov8s.bin',
         required: true,
       },
       clip: { id: 'clip_vit_b_32' },
@@ -67,8 +66,7 @@ describe('manifestToWizardConfig', () => {
     expect(config.models).toEqual({
       detector: {
         id: 'yolov8s-640',
-        path: '/opt/models/yolov8s.hef',
-        type: 'detection',
+        path: '/opt/models/yolov8s.bin',
         required: true,
       },
       clip: { id: 'clip_vit_b_32' },
@@ -153,8 +151,7 @@ describe('wizardConfigToPatchFields', () => {
     expect(fields['spec.models']).toEqual({
       detector: {
         id: 'yolov8s-640',
-        path: '/opt/models/yolov8s.hef',
-        type: 'detection',
+        path: '/opt/models/yolov8s.bin',
         required: true,
       },
       clip: { id: 'clip_vit_b_32' },

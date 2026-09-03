@@ -19,7 +19,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { filesApi } from '@/services/api';
+import { aiApi } from '@/services/api';
 import SectionNav from '@/pages/apps/components/import/SectionNav';
 import {
   backendFunctionForProfile,
@@ -27,6 +27,7 @@ import {
   classifyOutputFormat,
   fieldDefaultToState,
   initialModelImportForm,
+  mergeConfigOnTypeSwitch,
   modelFormIssueText,
   partitionFields,
   sanitizeModelId,
@@ -117,15 +118,36 @@ export default function ImportModelDialog({
     cancelRequestedRef.current = false;
   }
 
-  const cleanupUploadedFiles = async (
-    paths: Array<string | undefined | null>
+  // Cancel paths release the staged blob through the parse-scoped abandon
+  // endpoint, whose server-side reference counting keeps any blob a
+  // registered model already shares (identical uploads dedupe onto one CAS
+  // blob). A generic file delete could destroy such a shared blob, so a
+  // failed abandon only warns — never fall back to files.batchDelete.
+  const abandonStagedFiles = async (
+    staged: Array<ModelParseResult | null | undefined>
   ) => {
-    const uniq = Array.from(new Set(paths.filter(Boolean))) as string[];
-    if (uniq.length === 0) return;
-    try {
-      await filesApi.batchDelete(uniq);
-    } catch {
-      // best-effort cleanup
+    const seen = new Set<string>();
+    for (const result of staged) {
+      if (!result?.file_hash || !result.file_path) continue;
+      if (seen.has(result.file_hash)) continue;
+      seen.add(result.file_hash);
+      try {
+        // Sequential by design: each abandon is refcounted server-side and a
+        // failure must toast before the next blob is released.
+        // eslint-disable-next-line no-await-in-loop
+        await aiApi.abandonStaged(result.file_hash, result.file_path);
+      } catch {
+        toast({
+          title: t(
+            'sys.ai_models.wizard.abandon_failed',
+            'Staged file left behind'
+          ),
+          description: t(
+            'sys.ai_models.wizard.abandon_failed_hint',
+            'Cleanup failed, but existing models are unaffected'
+          ),
+        });
+      }
     }
   };
 
@@ -329,7 +351,7 @@ export default function ImportModelDialog({
       onSuccess: (data: any) => {
         const result = data as ModelParseResult;
         if (cancelRequestedRef.current) {
-          cleanupUploadedFiles([result?.file_path]);
+          abandonStagedFiles([result]);
           return;
         }
         setParseResult(result);
@@ -424,11 +446,13 @@ export default function ImportModelDialog({
 
   const handleModelTypeChange = (value: string) => {
     const typeOpt = modelTypeOptions.find(o => o.value === value);
-    const configDefaults = typeOpt ? fieldDefaultToState(typeOpt.fields) : {};
     setForm(prev => ({
       ...prev,
       modelType: value,
-      config: configDefaults,
+      // New type's defaults overlaid with previously-entered values for keys
+      // the new type also understands — keeps a tuned threshold alive across
+      // a detection↔pose switch instead of silently wiping it.
+      config: mergeConfigOnTypeSwitch(prev.config, typeOpt?.fields ?? []),
     }));
   };
 
@@ -507,8 +531,15 @@ export default function ImportModelDialog({
                 file_size: parseResult.file_size,
                 network_name: parseResult.network_name,
                 vstream_info: parseResult.vstream_info,
-                input_width: parseResult.input_width ?? 0,
-                input_height: parseResult.input_height ?? 0,
+                // UpdateModel's pointer semantics treat an explicit 0 as
+                // "clear" — send a dimension only when the parser extracted
+                // one, so an unknown width never wipes a real value.
+                ...(parseResult.input_width != null && {
+                  input_width: parseResult.input_width,
+                }),
+                ...(parseResult.input_height != null && {
+                  input_height: parseResult.input_height,
+                }),
               }
             : {}),
         },
@@ -549,8 +580,12 @@ export default function ImportModelDialog({
         file_size: parseResult.file_size,
         network_name: parseResult.network_name,
         vstream_info: parseResult.vstream_info,
-        input_width: parseResult.input_width ?? 0,
-        input_height: parseResult.input_height ?? 0,
+        ...(parseResult.input_width != null && {
+          input_width: parseResult.input_width,
+        }),
+        ...(parseResult.input_height != null && {
+          input_height: parseResult.input_height,
+        }),
       },
       {
         onSuccess: async () => {
@@ -588,7 +623,7 @@ export default function ImportModelDialog({
 
   const handleCancel = () => {
     cancelRequestedRef.current = true;
-    cleanupUploadedFiles([parseResult?.file_path]);
+    abandonStagedFiles([parseResult]);
     handleReset();
     onOpenChange(false);
     navigate('/models');

@@ -1517,10 +1517,10 @@
         "model_badge_bundled": "Bundled model",
         "model_badge_missing_required": "Missing · required",
         "model_badge_missing_optional": "Unregistered · optional",
-        "model_path": "Model path",
-        "model_type": "Model type",
+        "model_path": "Model package path",
+        "model_path_invalid": "The bundled model path must end in .bin (an AMPK model package); bare .hef bundling is no longer supported.",
         "model_required_row": "Required (install fails if missing)",
-        "model_custom_hint": "Declare a model bundled in the image and not registered with the system: when the id is not in the system list, the in-image model file path is required to pass install validation.",
+        "model_custom_hint": "Declare a model bundled in the image and not registered with the system: when the id is not in the system list, the in-image AMPK model package (.bin) path is required to pass install validation.",
         "model_unavailable_required": "A required model dependency is unregistered and declares no path — install would be blocked. Provide the model path or pick a system model.",
         "image_uploading": "Image upload is still in progress, please wait"
       },
@@ -1607,6 +1607,7 @@
         "number_min": "Value must be ≥ {{min}}",
         "number_max": "Value must be ≤ {{max}}",
         "model_id_exists": "This Model ID already exists. Please use a different one.",
+        "model_id_invalid": "Model ID must start with a letter or digit and contain only letters, digits, '.', '_' or '-' (max 64 chars)",
         "model_id_readonly": "Model ID cannot be changed on update",
         "postprocess_profile": "Postprocess Profile",
         "postprocess_profile_hint": "At load time the model is materialized under this file name for the Hailo postprocess plugin; it must match the actual network (n/s/m map to yolov8n/s/m; yolov5m_vehicles is the custom single-class vehicle model, 1920x1080 RGB input)",
@@ -1732,6 +1733,8 @@
         "json_view_tab": "JSON",
         "json_preview_hint": "Read-only preview of the payload that will be submitted. For JSON-level customization, edit the variant in the Advanced section.",
         "back_to_source": "Back to Upload",
+        "abandon_failed": "Staged file left behind",
+        "abandon_failed_hint": "Failed to clean up the staged upload; it was left in place. Registered models are unaffected",
         "mode_recommended": "Recommended",
         "output_mode_platform_brief": "Structured detections; thresholds tunable at runtime",
         "output_mode_raw_brief": "Bare tensors; your app decodes them",
@@ -1816,7 +1819,8 @@
       },
       "error": {
         "notFound": "Application not found",
-        "no_file": "Please select a model file first"
+        "no_file": "Please select a model file first",
+        "load_failed": "Failed to load models"
       },
       "message": {
         "import_success": "Model imported successfully",
@@ -1828,6 +1832,7 @@
         "npu_busy": "NPU resources insufficient, please unload other models first",
         "delete_success": "Model deleted",
         "delete_failed": "Failed to delete model",
+        "delete_blocked": "This model is referenced by the following apps (including stopped ones). Remove the references before deleting the model:",
         "update_success": "Model updated successfully"
       },
       "confirm": {

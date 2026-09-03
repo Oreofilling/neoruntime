@@ -84,8 +84,7 @@ describe('applyConfigToYamlText', () => {
       models: {
         detector: {
           id: 'custom-yolo',
-          path: '/opt/models/yolo.hef',
-          type: 'detection',
+          path: '/opt/models/yolo.bin',
           required: true,
         },
       },
@@ -106,8 +105,10 @@ describe('applyConfigToYamlText', () => {
     expect(text).toContain('unknown_field: keep-me');
     expect(text).toContain('name: Renamed App');
     expect(text).toContain('id: custom-yolo');
-    expect(text).toContain('path: /opt/models/yolo.hef');
-    expect(text).toContain('type: detection');
+    expect(text).toContain('path: /opt/models/yolo.bin');
+    // the manifest-level model type is gone — bundled models take it from
+    // the AMPK package metadata at install time
+    expect(text).not.toContain('type:');
     // false / 0 are meaningful values — they must be written, not dropped
     expect(text).toContain('autostart: false');
     expect(text).toContain('max_concurrent: 0');

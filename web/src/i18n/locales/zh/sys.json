@@ -1415,14 +1415,14 @@
         "model_badge_missing_required": "缺失 · 必需",
         "model_badge_system": "系统模型",
         "model_custom_add": "自定义模型…",
-        "model_custom_hint": "声明镜像内自带、未注册到系统的模型：id 不在系统列表时，需提供镜像内模型文件路径才能通过安装校验。",
+        "model_custom_hint": "声明镜像内自带、未注册到系统的模型：id 不在系统列表时，需提供镜像内 AMPK 模型包（.bin）路径才能通过安装校验。",
         "model_dep_add": "添加依赖",
         "model_dep_hint": "声明应用依赖的模型。每个别名会在运行时以 AIPC_MODEL_<别名> 环境变量注入。",
         "model_id_label": "模型 ID",
-        "model_path": "模型路径 (path)",
+        "model_path": "模型包路径 (path)",
+        "model_path_invalid": "模型包路径必须以 .bin 结尾（AMPK 模型包）；裸 .hef 内置不再支持。",
         "model_required_row": "必需（缺失时安装失败）",
         "model_select": "选择模型",
-        "model_type": "模型类型 (type)",
         "models_section": "模型",
         "nav_sections_aria": "配置分区导航",
         "no_model_deps": "未声明模型依赖",
@@ -1524,6 +1524,7 @@
         "number_min": "数值应 ≥ {{min}}",
         "number_max": "数值应 ≤ {{max}}",
         "model_id_exists": "模型 ID 已存在，请更换",
+        "model_id_invalid": "模型 ID 须以字母或数字开头，仅含字母、数字与 . _ -，最长 64 位",
         "model_id_readonly": "更新时不可修改",
         "postprocess_profile": "后处理 Profile",
         "postprocess_profile_hint": "加载时模型会以该文件名物化后交给 Hailo 后处理插件，须与模型实际网络对应（n/s/m 分别对应 yolov8n/s/m；yolov5m_vehicles 对应自训练车辆模型，单类、输入 1920x1080 RGB）",
@@ -1649,6 +1650,8 @@
         "json_view_tab": "JSON",
         "json_preview_hint": "即将提交的负载只读预览。如需 JSON 级自定义，请在「高级」分区编辑变体。",
         "back_to_source": "返回上传",
+        "abandon_failed": "暂存文件未清理",
+        "abandon_failed_hint": "清理已上传的暂存文件失败，文件已保留；不影响已注册模型",
         "mode_recommended": "推荐",
         "output_mode_platform_brief": "结构化检测结果，阈值运行期可调",
         "output_mode_raw_brief": "原始张量，由应用侧解码",
@@ -1733,7 +1736,8 @@
       },
       "error": {
         "notFound": "应用不存在",
-        "no_file": "请先选择模型文件"
+        "no_file": "请先选择模型文件",
+        "load_failed": "模型列表加载失败"
       },
       "message": {
         "import_success": "模型导入成功",
@@ -1745,6 +1749,7 @@
         "npu_busy": "NPU 资源不足，请先卸载其他模型",
         "delete_success": "模型已删除",
         "delete_failed": "删除失败",
+        "delete_blocked": "该模型正在被以下应用引用（含未运行应用），请先删除引用关系后再删除模型：",
         "update_success": "模型更新成功"
       },
       "confirm": {

@@ -76,7 +76,9 @@ describe('translateInstallError', () => {
         'Invalid image tar: manifest entry 0: layer "sha256:deadbeef" not found in archive',
         t
       )
-    ).toBe('镜像文件不合法：manifest entry 0: layer "sha256:deadbeef" not found in archive');
+    ).toBe(
+      '镜像文件不合法：manifest entry 0: layer "sha256:deadbeef" not found in archive'
+    );
   });
 
   it('maps upload-time size limit rejection', () => {

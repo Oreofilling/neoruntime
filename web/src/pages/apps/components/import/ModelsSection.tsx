@@ -34,10 +34,10 @@ export interface ModelsSectionProps {
  *
  * Each dependency row mirrors the backend resolveModelDependencies chain:
  * an id the device knows renders compact (system model); an unknown id is a
- * custom declaration that expands to edit path / type / required — a
- * declared path makes it a bundled model (installable), a missing path on a
- * required dependency is flagged as install-blocking, on an optional one as
- * a warn-only miss.
+ * custom declaration that expands to edit path / required — a declared
+ * in-image .bin package path makes it a bundled model (installable), a
+ * missing path on a required dependency is flagged as install-blocking, on
+ * an optional one as a warn-only miss.
  */
 export default function ModelsSection({
   config,
@@ -49,8 +49,8 @@ export default function ModelsSection({
   const entries = Object.entries(models);
   /**
    * Aliases switched to custom (free-text id) mode via the 自定义… select
-   * entry. UI-only state: the mapping itself records path/type/required.
-   * Hydrated unknown ids enter custom mode without needing an entry here.
+   * entry. UI-only state: the mapping itself records path/required. Hydrated
+   * unknown ids enter custom mode without needing an entry here.
    */
   const [customDrafts, setCustomDrafts] = useState<string[]>([]);
 
@@ -92,7 +92,7 @@ export default function ModelsSection({
     // unnamed draft ('') or one equal to the current mapping id (the user
     // hasn't typed a custom alias). Re-picking follows the new model; a
     // hand-typed alias is never clobbered, and a collision with another row
-    // keeps the current alias. path/type/required ride along untouched.
+    // keeps the current alias. path/required ride along untouched.
     const isAutoAlias = alias === '' || alias === models[alias]?.id;
     const aliasToUse = isAutoAlias && !(modelId in models) ? modelId : alias;
     if (modelId === CUSTOM_MODEL_VALUE) {
@@ -255,30 +255,17 @@ export default function ModelsSection({
                 </div>
 
                 {isCustom && (
-                  <div className="grid gap-2 rounded-md bg-muted/40 p-2.5 sm:grid-cols-3">
+                  <div className="grid gap-2 rounded-md bg-muted/40 p-2.5 sm:grid-cols-2">
                     <div>
                       <Label className="text-xs text-muted-foreground">
-                        {t('sys.apps.import.model_path', '模型路径 (path)')}
+                        {t('sys.apps.import.model_path', '模型包路径 (path)')}
                       </Label>
                       <Input
                         value={mapping.path ?? ''}
                         onChange={e => patchMapping(alias, {
                             path: e.target.value || undefined,
                           })}
-                        placeholder="/opt/models/yolo.hef"
-                        className="mt-1 font-mono text-sm"
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-xs text-muted-foreground">
-                        {t('sys.apps.import.model_type', '模型类型 (type)')}
-                      </Label>
-                      <Input
-                        value={mapping.type ?? ''}
-                        onChange={e => patchMapping(alias, {
-                            type: e.target.value || undefined,
-                          })}
-                        placeholder="detection"
+                        placeholder="/opt/models/yolo.bin"
                         className="mt-1 font-mono text-sm"
                       />
                     </div>
@@ -302,10 +289,10 @@ export default function ModelsSection({
                         </Label>
                       </div>
                     </div>
-                    <p className="text-xs text-muted-foreground sm:col-span-3">
+                    <p className="text-xs text-muted-foreground sm:col-span-2">
                       {t(
                         'sys.apps.import.model_custom_hint',
-                        '声明镜像内自带、未注册到系统的模型：id 不在系统列表时，需提供镜像内模型文件路径才能通过安装校验。'
+                        '声明镜像内自带、未注册到系统的模型：id 不在系统列表时，需提供镜像内 AMPK 模型包（.bin）路径才能通过安装校验。'
                       )}
                     </p>
                   </div>

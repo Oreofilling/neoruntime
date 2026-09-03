@@ -290,14 +290,13 @@ describe('collectInstallErrors', () => {
   });
 
   it('allows an unregistered required dependency that declares a bundled path', () => {
-    // Arrange — the user-declared custom model case (id + path)
+    // Arrange — the user-declared custom model case (id + .bin package path)
     const config: WizardConfig = {
       ...completeConfig,
       models: {
         detector: {
           id: 'yolo_world_540',
-          path: '/opt/models/yolo.hef',
-          type: 'detection',
+          path: '/opt/models/yolo.bin',
           required: true,
         },
       },
@@ -312,6 +311,33 @@ describe('collectInstallErrors', () => {
 
     // Assert
     expect(issues).toEqual([]);
+  });
+
+  it('rejects a bundled path that is not an AMPK .bin package', () => {
+    // Arrange — mirror of the backend manifest validation: bare .hef
+    // bundling is no longer supported on the install side
+    const config: WizardConfig = {
+      ...completeConfig,
+      models: {
+        detector: {
+          id: 'yolo_world_540',
+          path: '/opt/models/yolo.hef',
+          required: true,
+        },
+      },
+    };
+
+    // Act
+    const issues = collectInstallErrors(config, {
+      sourceType: 'local',
+      sourceReady: true,
+      availableModelIds: [],
+    });
+
+    // Assert
+    expect(issues).toEqual([
+      { section: 'models', reason: 'model_path_invalid' },
+    ]);
   });
 
   it('warns nothing for an optional unregistered dependency without a path', () => {

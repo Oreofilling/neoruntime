@@ -58,7 +58,8 @@ interface ModelListProps {
   onLoad: (modelId: string) => void;
   onUnload: (modelId: string, modelName: string) => void;
   onUpdate?: (model: ModelData) => void;
-  loadingAction?: string | null;
+  /** per-model busy predicate — index holds a Set so concurrent actions show. */
+  isActionLoading?: (modelId: string) => boolean;
 }
 
 const PAGE_SIZE = 10;
@@ -88,7 +89,7 @@ export default function ModelList({
   onLoad,
   onUnload,
   onUpdate,
-  loadingAction,
+  isActionLoading,
 }: ModelListProps) {
   const { t } = useTranslation();
   const [currentPage, setCurrentPage] = useState(1);
@@ -198,7 +199,7 @@ export default function ModelList({
             ) : (
               pagedModels.map(model => {
                 const isLoaded = model.status === 'loaded';
-                const isLoading = loadingAction === model.model_id;
+                const isLoading = isActionLoading?.(model.model_id) ?? false;
                 const modelType = getModelTypeLabel(
                   model.model_type,
                   model.model_id,
@@ -387,7 +388,9 @@ export default function ModelList({
               {
                 start: models.length === 0 ? 0 : startIndex + 1,
                 end: Math.min(startIndex + PAGE_SIZE, models.length),
-                total: models.length,
+                // Unfiltered count — the filtered slice must not shrink the
+                // reported total when the user is searching.
+                total: totalCount ?? models.length,
               }
             )}
           </span>
@@ -435,7 +438,7 @@ export default function ModelList({
                   <span>
                     {t(
                       'sys.ai_models.message.delete_blocked',
-                      '该模型正在被以下应用引用，请先删除引用关系后再删除模型：'
+                      '该模型正在被以下应用引用（含未运行应用），请先删除引用关系后再删除模型：'
                     )}
                   </span>
                   <ul className="mt-2 space-y-1">
@@ -553,7 +556,7 @@ export default function ModelList({
         onOpenChange={open => !open && setDetailModel(null)}
         onLoad={onLoad}
         onUnload={onUnload}
-        loadingAction={loadingAction}
+        isActionLoading={isActionLoading}
       />
     </>
   );

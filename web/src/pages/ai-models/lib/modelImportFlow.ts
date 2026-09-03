@@ -50,6 +50,11 @@ export const SUPPORTED_BACKEND_FUNCTIONS = [
   'yolov5m_vehicles',
 ];
 
+/** Runtime-safe model_id charset — mirrors the backend RegisterModel gate
+ *  (letters/digits first, then letters, digits, '.', '_' or '-', max 64).
+ *  The id flows into gRPC registrations and materialized runtime paths. */
+export const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 export interface ModelImportFormState {
   modelId: string;
   modelType: string;
@@ -221,6 +226,22 @@ export function fieldDefaultToState(
   return config;
 }
 
+/** Config after switching model type: the new type's defaults, overlaid
+ *  with previously-entered values for keys the new type ALSO understands —
+ *  a detection→pose switch keeps a tuned threshold instead of wiping it. */
+export function mergeConfigOnTypeSwitch(
+  prevConfig: Record<string, unknown>,
+  nextFields: ModelFieldDef[]
+): Record<string, unknown> {
+  const config = fieldDefaultToState(nextFields);
+  for (const f of nextFields) {
+    if (prevConfig[f.key] !== undefined) {
+      config[f.key] = prevConfig[f.key];
+    }
+  }
+  return config;
+}
+
 /** Which configure page a schema field renders on. */
 export function sectionForField(key: string): ModelImportSectionId {
   return POSTPROCESS_PAGE_FIELDS.includes(key) ? 'output' : 'basic_info';
@@ -271,6 +292,12 @@ export function validateModelForm(
       field: 'modelId',
       section: 'basic_info',
       reason: 'required',
+    });
+  } else if (!MODEL_ID_PATTERN.test(form.modelId.trim())) {
+    issues.push({
+      field: 'modelId',
+      section: 'basic_info',
+      reason: 'model_id_invalid',
     });
   } else if (!ctx.isUpdate && ctx.existingModelIds?.has(modelIdLower)) {
     issues.push({

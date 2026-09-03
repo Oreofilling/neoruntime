@@ -75,7 +75,8 @@ interface ModelDetailDialogProps {
   /** runtime actions surfaced in the dialog footer (card/list pass theirs) */
   onLoad?: (modelId: string) => void;
   onUnload?: (modelId: string, modelName: string) => void;
-  loadingAction?: string | null;
+  /** per-model busy predicate — index holds a Set so concurrent actions show. */
+  isActionLoading?: (modelId: string) => boolean;
 }
 
 /** Chips shown before the "+N more" fold kicks in. */
@@ -163,7 +164,7 @@ export default function ModelDetailDialog({
   onOpenChange,
   onLoad,
   onUnload,
-  loadingAction,
+  isActionLoading,
 }: ModelDetailDialogProps) {
   const { t } = useTranslation();
   const [labelsExpanded, setLabelsExpanded] = useState(false);
@@ -189,7 +190,7 @@ export default function ModelDetailDialog({
       : null;
   const appsCount = mergedModel.used_by_apps?.length || 0;
   const isLoaded = mergedModel.status === 'loaded';
-  const isActing = loadingAction === mergedModel.model_id;
+  const isActing = isActionLoading?.(mergedModel.model_id) ?? false;
 
   // Only DB-backed device models (with a content hash) can be exported as
   // AMPK packages; runtime-only fallback rows have nothing to package.

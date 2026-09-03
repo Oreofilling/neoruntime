@@ -91,6 +91,7 @@ export type InstallIssueReason =
   | 'local_source_required'
   | 'invalid_model_alias'
   | 'model_id_required'
+  | 'model_path_invalid'
   | 'model_unavailable_required';
 
 export interface InstallIssue {
@@ -146,6 +147,17 @@ export function collectInstallErrors(
   }
   if (Object.values(models).some(m => !m?.id?.trim())) {
     issues.push({ section: 'models', reason: 'model_id_required' });
+  }
+  // Mirror of the backend manifest validation: a declared bundling path must
+  // point at an AMPK model package — bare .hef bundling is no longer
+  // supported on the install side, so it must not pass the form either.
+  if (
+    Object.values(models).some(m => {
+      const p = m?.path?.trim();
+      return !!p && !p.toLowerCase().endsWith('.bin');
+    })
+  ) {
+    issues.push({ section: 'models', reason: 'model_path_invalid' });
   }
 
   // Mirror of the backend resolveModelDependencies fast-fail: a required

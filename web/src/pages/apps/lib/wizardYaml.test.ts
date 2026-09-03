@@ -70,8 +70,7 @@ describe('wizardConfigToYaml', () => {
       models: {
         detector: {
           id: 'yolov8s_pose',
-          path: '/opt/models/yolov8s.hef',
-          type: 'detection',
+          path: '/opt/models/yolov8s_pose.bin',
           required: true,
         },
         clip: { id: 'clip_vit_b_32' },
@@ -115,8 +114,7 @@ describe('wizardConfigToYaml', () => {
         '  models:',
         '    detector:',
         '      id: yolov8s_pose',
-        '      path: /opt/models/yolov8s.hef',
-        '      type: detection',
+        '      path: /opt/models/yolov8s_pose.bin',
         '      required: true',
         '    clip:',
         '      id: clip_vit_b_32',

@@ -36,6 +36,26 @@ type SortBy = 'default' | 'name' | 'size' | 'load_time';
 
 const SORT_OPTIONS: SortBy[] = ['default', 'name', 'size', 'load_time'];
 
+/** Keyword match across identity, provenance and label fields. Labels
+ *  arrive as an array or a comma-joined string depending on backend shape. */
+const matchesKeyword = (model: any, keyword: string): boolean => {
+  if (!keyword) return true;
+  const fields = [
+    model?.model_id,
+    model?.name,
+    model?.network_name,
+    model?.source,
+  ]
+    .filter(Boolean)
+    .map(v => String(v).toLowerCase());
+  const labels = Array.isArray(model?.labels)
+    ? model.labels.map((l: unknown) => String(l).toLowerCase())
+    : typeof model?.labels === 'string'
+      ? [model.labels.toLowerCase()]
+      : [];
+  return [...fields, ...labels].some(v => v.includes(keyword));
+};
+
 export default function AIModels() {
   const { t } = useTranslation();
   const [viewMode, setViewMode] = useState<'card' | 'list'>('card');
@@ -46,10 +66,12 @@ export default function AIModels() {
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [updateTarget, setUpdateTarget] = useState<any | null>(null);
-  const [loadingAction, setLoadingAction] = useState<string | null>(null);
+  // Concurrent load/unload requests each pin their model here; the pages
+  // consume it as an isActionLoading(id) predicate.
+  const [loadingActions, setLoadingActions] = useState<Set<string>>(() => new Set());
   const [scanning, setScanning] = useState(false);
 
-  const { data: models = [], isLoading, refetch } = useModels();
+  const { data: models = [], isLoading, error, refetch } = useModels();
   const unregisterModel = useUnregisterModel();
   const loadModel = useLoadModel();
   const unloadModel = useUnloadModel();
@@ -102,9 +124,7 @@ export default function AIModels() {
           || (statusFilter === 'loaded'
             ? model.status === 'loaded'
             : model.status !== 'loaded'))
-        && (!keyword
-          || model.model_id?.toLowerCase().includes(keyword)
-          || model.name?.toLowerCase().includes(keyword))
+        && matchesKeyword(model, keyword)
     );
   }, [sortedModels, search, typeFilter, statusFilter]);
 
@@ -122,45 +142,53 @@ export default function AIModels() {
       toast.success(
         t('sys.ai_models.message.delete_success', `模型 "${modelName}" 已删除`)
       );
-    } catch (error: any) {
+    } catch (err: any) {
       toast.error(
-        error?.response?.data?.message
+        err?.response?.data?.message
           || t('sys.ai_models.message.delete_failed', 'Failed to delete model')
       );
     }
   };
 
   const handleLoadModel = async (modelId: string) => {
-    setLoadingAction(modelId);
+    setLoadingActions(prev => new Set(prev).add(modelId));
     try {
       await loadModel.mutateAsync(modelId);
       toast.success(
         t('sys.ai_models.message.load_success', '模型已加载到 NPU')
       );
-    } catch (error: any) {
+    } catch (err: any) {
       toast.error(
-        error?.response?.data?.message
+        err?.response?.data?.message
           || t('sys.ai_models.message.load_failed', '加载失败')
       );
     } finally {
-      setLoadingAction(null);
+      setLoadingActions(prev => {
+        const next = new Set(prev);
+        next.delete(modelId);
+        return next;
+      });
     }
   };
 
   const handleUnloadModel = async (modelId: string, _modelName: string) => {
-    setLoadingAction(modelId);
+    setLoadingActions(prev => new Set(prev).add(modelId));
     try {
       await unloadModel.mutateAsync(modelId);
       toast.success(
         t('sys.ai_models.message.unload_success', '模型已从 NPU 卸载')
       );
-    } catch (error: any) {
+    } catch (err: any) {
       toast.error(
-        error?.response?.data?.message
+        err?.response?.data?.message
           || t('sys.ai_models.message.unload_failed', '卸载失败')
       );
     } finally {
-      setLoadingAction(null);
+      setLoadingActions(prev => {
+        const next = new Set(prev);
+        next.delete(modelId);
+        return next;
+      });
     }
   };
 
@@ -185,8 +213,8 @@ export default function AIModels() {
           ) as string
         );
       }
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : 'Scan failed';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Scan failed';
       toast.error(msg);
     } finally {
       setScanning(false);
@@ -200,6 +228,31 @@ export default function AIModels() {
 
   if (isLoading) {
     return <AIModelsPageSkeleton viewMode={viewMode} />;
+  }
+
+  // A failed list must not masquerade as an empty library — surface the
+  // error with a retry instead of the "no models" intake hints.
+  if (error) {
+    return (
+      <div className="p-4 md:p-6 mx-auto max-w-[1600px]">
+        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border bg-muted/20 px-6 py-12 text-center">
+          <p className="text-sm font-medium text-foreground">
+            {t('sys.ai_models.error.load_failed', '模型列表加载失败')}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {error instanceof Error ? error.message : String(error)}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => refetch()}
+          >
+            {t('common.retry', '重试')}
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   const statusChips: { value: StatusFilter; label: string }[] = [
@@ -341,7 +394,7 @@ export default function AIModels() {
             onUnload={handleUnloadModel}
             onImportClick={() => setImportDialogOpen(true)}
             onUpdate={handleOpenUpdateDialog}
-            loadingAction={loadingAction}
+            isActionLoading={id => loadingActions.has(id)}
           />
         ) : (
           <ModelList
@@ -352,7 +405,7 @@ export default function AIModels() {
             onLoad={handleLoadModel}
             onUnload={handleUnloadModel}
             onUpdate={handleOpenUpdateDialog}
-            loadingAction={loadingAction}
+            isActionLoading={id => loadingActions.has(id)}
           />
         )}
       </div>
