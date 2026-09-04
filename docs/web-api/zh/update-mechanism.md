@@ -67,6 +67,7 @@ pnpm dev        # 重新生成规范 + 启动带热更新的 VitePress
 
 | 路径 | 职责 |
 | --- | --- |
+| `docs/`（wiki） | 项目文档树——每次构建由 `scripts/sync_project_docs.py` 同步到站点 `/project/...`；在那里修改文件，下次合并后站点自动更新。 |
 | `docs/api/swagger.yaml` | 主 OpenAPI 规范（事实来源，英文）。 |
 | `docs/web-api/i18n/zh.yaml` | 构建时合并到主规范的中文 overlay。 |
 | `docs/web-api/scripts/build_specs.py` | 校验翻译覆盖率并生成 `public/swagger.json` / `public/swagger.zh.json`。 |

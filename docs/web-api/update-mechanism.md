@@ -67,6 +67,7 @@ The generated spec files (`public/swagger*.json`) are build artifacts — they a
 
 | Path | Role |
 | --- | --- |
+| `docs/` (wiki) | Project documentation tree — synced into the site at `/project/...` on every build by `scripts/sync_project_docs.py`; editing a file there updates the site automatically on the next merge. |
 | `docs/api/swagger.yaml` | Master OpenAPI spec (source of truth, English). |
 | `docs/web-api/i18n/zh.yaml` | Chinese overlay merged onto the master spec at build time. |
 | `docs/web-api/scripts/build_specs.py` | Validates overlay coverage and generates `public/swagger.json` / `public/swagger.zh.json`. |

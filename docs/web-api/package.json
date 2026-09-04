@@ -4,8 +4,8 @@
   "description": "Bilingual (EN/zh) Web API documentation site for NeoRuntime, built with VitePress + Redoc and deployed to GitHub Pages.",
   "scripts": {
     "gen": "python3 scripts/build_specs.py",
-    "build": "python3 scripts/build_specs.py && node scripts/copy-redoc.mjs && vitepress build",
-    "dev": "python3 scripts/build_specs.py && node scripts/copy-redoc.mjs && vitepress dev",
+    "build": "python3 scripts/build_specs.py && node scripts/copy-redoc.mjs && python3 scripts/sync_project_docs.py && vitepress build",
+    "dev": "python3 scripts/build_specs.py && node scripts/copy-redoc.mjs && python3 scripts/sync_project_docs.py && vitepress dev",
     "preview": "vitepress preview"
   },
   "devDependencies": {

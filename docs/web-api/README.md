@@ -1,11 +1,20 @@
-# NeoRuntime Web API Documentation Site
+# NeoRuntime Documentation Site
 
-Bilingual (English default, 简体中文) documentation for the NeoRuntime platform
-Web API, rendered with **VitePress** (guides) + **Redoc** (full OpenAPI
-reference) and deployed to GitHub Pages.
+The project documentation hub for NeoRuntime, deployed to GitHub Pages:
 
-- English (default): `https://<site>/`
-- 中文: `https://<site>/zh/`
+- **Project wiki** — everything under the repository's `docs/` tree
+  (getting started, architecture, services, deployment, references,
+  benchmarks) is synced into the site at build time by
+  `scripts/sync_project_docs.py`, so it can never go stale. Wiki pages
+  live under `/project/...` and are English (the source documents).
+- **Web API guides** — bilingual (English default, 简体中文 at `/zh/`),
+  rendered with VitePress.
+- **Web API reference** — a standalone full-page Redoc instance at
+  `/api-reference/` (`/api-reference/zh/` in Chinese), rendered from the
+  OpenAPI spec and following the system colour scheme.
+
+The site lives in `docs/web-api/` for historical reasons; it hosts the
+whole documentation site, not only the Web API part.
 
 ## How it stays in sync with the code
 

@@ -2,37 +2,49 @@
 layout: home
 
 hero:
-  name: NeoRuntime Web API
-  text: REST · WebSocket · SSE for edge AI devices
-  tagline: Bilingual reference for the NeoRuntime platform API — model management, event bus, device control, app lifecycle, media pipelines and streaming, all over one authenticated HTTP surface.
+  name: NeoRuntime
+  text: Edge AI Computing Platform
+  tagline: Documentation hub for NeoRuntime — an edge AI platform for smart cameras and edge devices, with a hardware abstraction layer, platform services, a web console and multi-SoC support. The project wiki and the full Web API reference live here.
   actions:
     - theme: brand
       text: Get Started
-      link: /introduction
+      link: /project/getting-started/quick_start
     - theme: alt
-      text: API Reference
+      text: Web API Reference
       link: /api-reference/
     - theme: alt
       text: 简体中文
       link: /zh/
 
 features:
-  - icon: 🔐
-    title: JWT Bearer authentication
-    details: One login endpoint issues a bearer token; every write endpoint shares the same 400/401 error envelope with business error codes from 1000 to 10001.
+  - icon: 📖
+    title: Project Wiki
+    details: Getting started, build guides, architecture, service design documents, deployment & OS upgrade, protocols and benchmarks — synced from the repository on every build.
+    link: /project/architecture/readme
+    linkText: Browse the wiki
+  - icon: 🔌
+    title: Web API
+    details: One authenticated HTTP surface for everything — 232 operations across 23 groups covering AI runtime, device control, media pipelines, apps and streaming. Bilingual, rendered from the OpenAPI spec.
+    link: /introduction
+    linkText: API guides
   - icon: 🤖
-    title: AI runtime
-    details: Register, upload, parse and load HEF/ONNX/TFLite models, track apps using them, and read NPU/AI statistics.
-  - icon: 📡
-    title: Events & streaming
-    details: Pub/sub event bus over WebSocket, zero-latency H264 video, SSE gyro attitude, log streaming and two-way audio talk.
+    title: AI Runtime
+    details: Register, parse and load HEF/ONNX/TFLite models on the NPU, track per-app usage and inference statistics.
+    link: /project/services/ai-runtime
+    linkText: Service design
   - icon: 🎛️
-    title: Full device control
-    details: PTZ, lens zoom/focus/iris with one-shot AF, GPIO, IR/white light, fan/heater/radar, RS485, alarm outputs and privacy masks.
+    title: Device Control & Media
+    details: PTZ, lens zoom/focus/iris with one-shot autofocus, GPIO, IR/lighting, plus ISP tuning, encoder pipelines, OSD and audio.
+    link: /project/services/device-control
+    linkText: Service design
   - icon: 📦
-    title: Apps & containers
-    details: App store installs, wizard-driven deployment, containerd container and image management, live logs and exec consoles.
+    title: Apps & Containers
+    details: Application store, wizard-driven installs, containerd lifecycle management, live logs and interactive consoles.
+    link: /project/services/app-manager
+    linkText: Service design
   - icon: 🔄
-    title: Stays in sync with the code
-    details: The spec behind this site is CI-gated against the gin routes in the source; every API change must land with its spec and Chinese translation in the same PR.
+    title: Docs That Cannot Drift
+    details: CI gates keep the OpenAPI spec identical to the gin routes and the Chinese translations complete; every merge to main redeploys this site automatically.
+    link: /update-mechanism
+    linkText: How it works
 ---
