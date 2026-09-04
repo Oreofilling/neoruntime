@@ -16,8 +16,17 @@
     .top-links a { color: #0053b3; text-decoration: none; }
     .top-links a:hover { text-decoration: underline; }
     html.dark .top-links a { color: #6cb2ff; }
-    /* Dark-mode fixes for the few hardcoded-light styles Redoc renders
-       inside spec descriptions (markdown tables, chips, selected tabs). */
+    /* Redoc hardcodes a few light-only colors (uppercase h5 section
+       labels, the content-type chip, markdown inline code, tables, selected
+       tabs). The theme tokens cannot reach them, so patch them per mode. */
+    #redoc-container code { color: #c62828; }
+    #redoc-container pre code, #redoc-container .redoc-json code { color: #ffffff; }
+    html.dark #redoc-container code { color: #ffb3ad !important; background-color: rgba(255, 255, 255, 0.06) !important; }
+    html.dark #redoc-container pre code, html.dark #redoc-container .redoc-json code { color: #dfe6ef !important; background-color: transparent !important; }
+    /* regex pattern chip: derived from a light-only token Redoc does not expose */
+    html.dark #redoc-container span.sc-Nxspf { color: #45d3e8 !important; }
+    html.dark #redoc-container h5 { color: #98a6b4 !important; border-bottom-color: #2c3442 !important; }
+    html.dark #redoc-container h5 span { color: #c3cede !important; }
     html.dark table tr { background-color: #1a212c !important; }
     html.dark td, html.dark th { border-color: #2c3442 !important; }
     html.dark .react-tabs__tab--selected { color: #e3e8f0 !important; background: #1a212c !important; }
@@ -36,14 +45,28 @@
     function theme(dark) {
       if (!dark) {
         return {
-          colors: { primary: { main: '#0053b3' } },
-          typography: { fontSize: '15px', lineHeight: '1.6em' },
+          colors: {
+            primary: { main: '#0053b3', light: '#3b7dd8', dark: '#003f75' },
+            responses: {
+              success: { color: '#1e7e34' },
+              error: { color: '#c92a2a' },
+              redirect: { color: '#1971c2' },
+              info: { color: '#0b7285' },
+            },
+            typography: { fontSize: '15px', lineHeight: '1.6em' },
+          },
         }
       }
       return {
         colors: {
           tonalOffset: 0.05,
-          primary: { main: '#6cb2ff' },
+          primary: { main: '#6cb2ff', light: '#a5cdff', dark: '#45d3e8' },
+          responses: {
+            success: { color: '#69db7c' },
+            error: { color: '#ff8787' },
+            redirect: { color: '#74c0fc' },
+            info: { color: '#66d9e8' },
+          },
           text: { primary: '#e3e8f0', secondary: '#9fb0c3' },
           border: { light: '#2c3442', dark: '#1f2632' },
           gray: { 50: '#1a212c', 100: '#141a24' },
