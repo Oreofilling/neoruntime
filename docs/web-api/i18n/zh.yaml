@@ -1,0 +1,1050 @@
+# Chinese (zh) translation overlay for docs/api/swagger.yaml.
+#
+# This file is merged onto the master spec by scripts/build_specs.py at
+# build time to produce public/swagger.zh.json. Anything NOT translated
+# here falls back to the English text — but every operation's summary
+# and description MUST be translated: scripts/build_specs.py fails (and
+# CI with it) when an operation or tag is missing, so a swagger.yaml
+# change in a PR forces the matching zh update in the same PR.
+#
+# Per-operation keys:
+#   summary, description            — required
+#   parameters: <name>:             — optional, {description, example}
+#   responses: <status>:            — optional, {description}
+#   requestBody: {description}      — optional
+info:
+  title: NeoRuntime 平台 API
+  description: |-
+    AIPC 平台 REST API，面向边缘 AI 计算平台。
+
+    提供统一访问：
+
+    - AI 运行时（模型管理与推理）
+    - 事件总线（发布/订阅消息）
+    - 设备控制（摄像头、PTZ、GPIO）
+    - 应用管理（容器生命周期）
+    - 视频流（H264 视频流）
+    - 错误语义（所有接口）：校验失败返回 HTTP 400，响应信封为
+      {code: 1001, message: "Invalid request", error: {detail}}；
+      缺失、无效或已吊销的 Bearer 令牌返回 HTTP 401 与 code 2000。
+      下方各操作仅记录成功响应；即使未逐一标注，400/401 错误行为
+      同样适用于每个写接口。
+
+tags:
+  System:
+    name: 系统
+    description: 系统信息与健康状态
+  AI Runtime:
+    name: AI 运行时
+    description: 模型管理与推理
+  Event Bus:
+    name: 事件总线
+    description: 发布/订阅事件消息
+  Device Control:
+    name: 设备控制
+    description: 摄像头与设备控制
+  App Manager:
+    name: 应用管理
+    description: 容器应用生命周期
+  Stream:
+    name: 视频流
+    description: 视频流传输
+  Settings:
+    name: 设置
+    description: 动态系统配置（键值存储）
+  Monitor:
+    name: 监控
+    description: 系统资源监控（CPU、内存、磁盘、网络）
+  Processes:
+    name: 进程
+    description: 系统进程管理
+  Files:
+    name: 文件
+    description: 远程文件管理
+  Terminal:
+    name: 终端
+    description: 网页终端访问
+  SSH:
+    name: SSH
+    description: SSH 服务配置
+  Logs:
+    name: 日志
+    description: 系统与服务日志查看
+  Storage:
+    name: 存储
+    description: 磁盘操作与热插拔支持
+  Media:
+    name: 媒体
+    description: 摄像头与媒体配置
+  Event Logs:
+    name: 事件日志
+    description: 事件日志的管理与查询
+  Debug Logs:
+    name: 调试日志
+    description: 调试日志导出与服务日志访问
+  Network:
+    name: 网络
+    description: 网络接口配置（DHCP、静态 IP）
+  Device Info:
+    name: 设备信息
+    description: 设备信息与命名
+  Store:
+    name: 应用商店
+    description: 发现并安装应用的应用商店
+  Dev:
+    name: 开发工作台
+    description: 应用开发工作台
+  Containers:
+    name: 容器
+    description: 容器管理（containerd）
+  Images:
+    name: 镜像
+    description: 容器镜像管理
+
+paths:
+  /system/info:
+    get:
+      summary: 获取系统信息
+      description: 返回平台版本与服务可用性状态
+  /system/stats:
+    get:
+      summary: 获取系统统计信息
+      description: 返回系统与各服务的实时统计
+  /system/health:
+    get:
+      summary: 健康检查
+      description: 返回服务健康状态（无需认证）
+  /system/password:
+    post:
+      summary: 修改后台登录密码
+      description: 修改用于登录 Web 后台的密码。
+  /system/restart:
+    post:
+      summary: 触发系统重启
+      description: 触发整机重启。
+  /system/ota/detect:
+    get:
+      summary: 检测新的 OTA 固件更新
+      description: 检查是否存在待安装的新固件版本。
+  /system/ota/install:
+    post:
+      summary: 上传并安装新固件包
+      description: |-
+        先解析固件包（兼容性检查仅供参考），随后执行部署。不兼容的包会在
+        validate 阶段失败（状态为 failed）——parse 接口可提前给出同样的判定结果。
+  /login:
+    post:
+      summary: 认证并获取 API 令牌
+      description: |-
+        远程调用者注意事项：(1) 完整路径为 /api/login——没有 /v1 段；
+        (2) 返回的 token 字符串已自带 "Bearer " 前缀——请原样放入
+        Authorization 请求头（Authorization: Bearer eyJ...）；
+        (3) JWT 签名密钥在每次启动时重新生成，设备重启后令牌即失效——
+        重启后需要重新登录。
+  /logout:
+    post:
+      summary: 吊销当前 API 令牌
+      description: 吊销本次请求所使用的 Bearer 令牌（服务端吊销）。
+  /auth/public-key:
+    get:
+      summary: 获取设备 RSA 公钥
+      description: |-
+        PEM 格式公钥，供客户端在登录时加密密码字段。无需认证——在会话令牌
+        存在之前就要获取它。
+  /system/ota/status:
+    get:
+      summary: 获取 OTA 升级状态
+      description: 特意设为公开（无需会话认证），升级进行期间可从全新客户端轮询安装进度。
+  /system/ota/parse:
+    post:
+      summary: 解析固件文件但不安装
+      description: 上传固件文件并查看其中的版本信息。
+  /system/ota/install-from-path:
+    post:
+      summary: 从本地路径安装 OTA 固件
+      description: 从设备本地文件路径安装 OTA 固件包。
+  /system/os-upgrade/upload:
+    post:
+      summary: 流式上传 SWUpdate OS 包到持久存储
+      description: 以流式方式将 OS 升级包写入持久存储。
+  /system/os-upgrade/validate:
+    post:
+      summary: 校验已上传的 OS 包
+      description: 校验已上传 OS 包的完整性与兼容性。
+  /system/os-upgrade/install:
+    post:
+      summary: 开始写入非活动 OS 副本
+      description: 开始将 OS 包写入非活动（inactive）分区副本。
+  /system/os-upgrade/status:
+    get:
+      summary: 获取持久化的 OS 升级状态与日志尾部
+      description: 特意设为公开（无需会话认证），与 OTA 状态接口一致。
+  /system/os-upgrade/reboot:
+    post:
+      summary: 重启进入新安装的 OS 副本
+      description: 重启并切换到新安装的 OS 副本。
+  /system/os-upgrade/cancel:
+    post:
+      summary: 在安装前取消任务
+      description: 在安装开始之前取消 OS 升级任务。
+  /system/os-upgrade/package:
+    delete:
+      summary: 删除已存储的 OS 升级包
+      description: 删除保存在持久存储中的 OS 升级包。
+  /system/time/sync-from-client:
+    post:
+      summary: 依据客户端时间戳同步设备时钟
+      description: 使用客户端的 Unix epoch 秒设置设备时钟；在可测量时补偿请求传输时延。
+  /system/time:
+    get:
+      summary: 获取当前系统时间
+      description: 返回设备当前系统时间。
+  /system/time/set:
+    post:
+      summary: 手动设置系统时间
+      description: 手动设置设备系统时间。
+  /system/time/config:
+    get:
+      summary: 获取时间配置（NTP 设置）
+      description: 返回时区与 NTP 相关配置。
+    put:
+      summary: 保存时间配置（时区）
+      description: 将时区持久化写入设备时间配置。
+  /system/time/timezone:
+    put:
+      summary: 设置时区
+      description: 设置设备时区。
+  /system/time/ntp:
+    put:
+      summary: 配置 NTP 设置
+      description: 配置 NTP 服务器与开关。
+  /system/time/ntp/sync:
+    post:
+      summary: 触发 NTP 时间同步
+      description: 立即触发一次 NTP 时间同步。
+  /system/time/timezones:
+    get:
+      summary: 列出可用时区
+      description: 返回设备支持的时区列表。
+  /config/jobs:
+    get:
+      summary: 列出配置控制器应用任务
+      description: 只读审计配置 apply/delete/reconcile 任务历史。
+  /config/jobs/{id}:
+    get:
+      summary: 按 ID 获取单个配置任务
+      description: 按 ID 返回一条配置任务详情。
+
+  /ai/capabilities:
+    get:
+      summary: 获取支持的模型格式与类型
+      description: 返回 AI 运行时支持的模型格式（HEF/ONNX/TFLite 等）与模型类型。
+  /ai/models/parse:
+    post:
+      summary: 解析上传的模型文件
+      description: 上传模型文件（multipart 字段 "model"）并返回解析出的元数据（HEF 网络/输入信息），不加载模型。
+  /ai/models/scan:
+    post:
+      summary: 重新扫描磁盘上的模型文件
+      description: 从磁盘模型目录种子化/刷新模型注册表。
+  /ai/models/{model_id}/load:
+    post:
+      summary: 将模型加载进 AI 运行时
+      description: 加载指定模型，使其可用于推理。
+  /ai/models/{model_id}/unload:
+    post:
+      summary: 从 AI 运行时卸载模型
+      description: 卸载指定模型，释放运行时资源。
+  /ai/models:
+    get:
+      summary: 列出所有已注册模型
+      description: 返回模型注册表中的全部模型。
+    post:
+      summary: 注册新模型
+      description: 通过指定模型文件路径注册模型。
+  /ai/models/upload:
+    post:
+      summary: 上传并注册模型文件
+      description: 上传模型文件（HEF、ONNX、TFLite）并注册。
+  /ai/models/{model_id}:
+    get:
+      summary: 获取模型信息
+      description: 返回指定模型的详细信息。
+    delete:
+      summary: 注销模型
+      description: 从注册表中移除指定模型。
+  /ai/models/{model_id}/apps:
+    get:
+      summary: 获取使用某模型的应用
+      description: 返回正在使用该模型的应用列表。
+  /ai/stats:
+    get:
+      summary: 获取 AI 运行时统计信息
+      description: 返回 AI 运行时（NPU 等）的统计信息。
+
+  /events/topics:
+    get:
+      summary: 列出所有事件主题
+      description: 返回事件总线的全部主题。
+  /events/publish:
+    post:
+      summary: 发布事件
+      description: 向事件总线发布一条事件。
+  /events/stream:
+    get:
+      summary: 订阅事件流（WebSocket）
+      description: |-
+        用于实时事件订阅的 WebSocket 端点。
+
+        远程（nginx TLS）：`wss://{host}/api/v1/events/stream?token={jwt_token}`；
+        设备本地：`ws://localhost:8080/api/v1/events/stream?token={jwt_token}`。
+
+  /device/status:
+    get:
+      summary: 获取设备状态
+      description: 返回受控设备/外设的当前状态。
+  /device/light:
+    post:
+      summary: 设置白光灯亮度
+      description: 设置补光灯亮度等级。
+  /device/ir-led:
+    post:
+      summary: 控制红外补光灯
+      description: 开启/关闭或调节红外 LED。
+  /device/ir-cut:
+    post:
+      summary: 设置 IR-CUT 滤光片模式
+      description: 切换 IR-CUT 滤光片（白天/夜间模式）。
+  /device/ptz:
+    post:
+      summary: 控制 PTZ（云台）
+      description: 控制云台的水平/垂直转动与变焦。
+  /device/zoom:
+    post:
+      summary: 控制变焦
+      description: 调节镜头变焦。
+  /device/focus:
+    post:
+      summary: 控制对焦
+      description: 调节镜头对焦。
+  /device/autofocus:
+    post:
+      summary: 启用/禁用自动对焦
+      description: 开启或关闭自动对焦。
+  /device/gpio:
+    get:
+      summary: 批量读取 GPIO 值
+      description: 一次调用读取多个 GPIO 引脚。不带 pins 参数时返回带实时值的完整引脚目录。
+    post:
+      summary: 写入 GPIO 值
+      description: 写单个 GPIO 引脚的值。
+  /device/gpio/{pin}:
+    get:
+      summary: 读取 GPIO 值
+      description: 读取单个 GPIO 引脚的值。
+  /device/lens/status:
+    get:
+      summary: 获取镜头电机状态
+      description: 变焦/对焦电机状态、位置、光圈 ADC 及已配置的行程限位。
+  /device/lens/oneshot-af:
+    post:
+      summary: 触发单次自动对焦
+      description: 启动一次单次自动对焦流程。
+  /device/lens/af/oneshot:
+    post:
+      summary: 触发单次自动对焦（别名）
+      description: /device/lens/oneshot-af 的别名。
+  /device/lens/zoom-follow:
+    post:
+      summary: 在指定变焦倍率下启动对焦跟随
+      description: 将对焦跟踪锁定到给定光学变焦倍率（必须大于 0）。
+  /device/lens/af/status:
+    get:
+      summary: 获取自动对焦任务状态
+      description: 富的单次 AF 状态——状态机、进度、最佳对焦度量、置信度、可重复性、估计距离与位置。
+  /device/lens/af/cancel:
+    post:
+      summary: 取消正在运行的自动对焦任务
+      description: 取消当前自动对焦任务。
+  /device/lens/zoom-level:
+    put:
+      summary: 将变焦移动到归一化等级
+      description: 将变焦移动到 0-1 归一化等级。
+  /device/lens/focus-level:
+    put:
+      summary: 将对焦移动到归一化等级
+      description: 将对焦移动到 0-1 归一化等级。
+  /device/lens/reset-zero:
+    post:
+      summary: 重置镜头电机零点
+      description: 重新校准变焦和/或对焦电机零点（长耗时操作，最长 120 秒）。
+  /device/lens/iris:
+    post:
+      summary: 驱动光圈电机
+      description: 直接驱动光圈电机。
+  /device/lens/iris-target:
+    post:
+      summary: 设置光圈目标 ADC 值
+      description: 设置光圈闭环的目标 ADC 值。
+  /device/lens/limits:
+    put:
+      summary: 设置变焦/对焦行程限位
+      description: 设置变焦与对焦电机的行程限位。
+  /device/lens/init:
+    post:
+      summary: 以已配置限位初始化镜头
+      description: 使用 device-control.yaml 中的限位初始化镜头；无需请求体。
+  /device/lens/goto:
+    post:
+      summary: 将镜头定位到指定变焦倍率与对焦距离
+      description: 高层 AF0832 定位——例如 zoom_ratio 2.0、focus_distance_m 5.0。
+  /device/fan:
+    get:
+      summary: 获取风扇状态
+      description: 返回风扇当前状态。
+    post:
+      summary: 启用/禁用风扇
+      description: 开启或关闭风扇。
+  /device/heat:
+    get:
+      summary: 获取加热器状态
+      description: 返回加热器当前状态。
+    post:
+      summary: 启用/禁用加热器
+      description: 开启或关闭加热器。
+  /device/radar:
+    get:
+      summary: 获取雷达状态
+      description: 返回雷达当前状态。
+    post:
+      summary: 启用/禁用雷达
+      description: 开启或关闭雷达。
+  /device/alarm-out:
+    post:
+      summary: 设置告警输出通道状态
+      description: 设置指定告警输出通道的状态。
+  /device/alarm-out/{channel}:
+    get:
+      summary: 获取告警输出通道状态
+      description: 返回指定告警输出通道的状态。
+  /device/wiegand:
+    post:
+      summary: 设置韦根输出通道状态
+      description: 设置指定韦根（wiegand）输出通道的状态。
+  /device/wiegand/{channel}:
+    get:
+      summary: 获取韦根输出通道状态
+      description: 返回指定韦根输出通道的状态。
+  /device/alarm-outputs:
+    get:
+      summary: 获取全部告警/韦根输出状态
+      description: 一次返回所有告警与韦根输出通道的状态。
+  /device/rs485/init:
+    post:
+      summary: 初始化 RS485 总线
+      description: 按给定参数初始化 RS485 总线。
+  /device/rs485/deinit:
+    post:
+      summary: 反初始化 RS485 总线
+      description: 释放 RS485 总线。
+  /device/rs485/tx:
+    post:
+      summary: 通过 RS485 发送数据
+      description: 向 RS485 总线发送一段数据。
+  /device/capabilities:
+    get:
+      summary: 获取设备硬件能力
+      description: 标识当前硬件变体所支持能力的特性开关。
+
+  /apps:
+    get:
+      summary: 列出所有应用
+      description: 返回已安装的全部应用。
+    post:
+      summary: 安装应用
+      description: 安装一个应用。
+  /apps/{app_id}:
+    get:
+      summary: 获取应用信息
+      description: 返回指定应用的详细信息。
+    delete:
+      summary: 卸载应用
+      description: 卸载指定应用。
+  /apps/{app_id}/start:
+    post:
+      summary: 启动应用
+      description: 启动指定应用。
+  /apps/{app_id}/stop:
+    post:
+      summary: 停止应用
+      description: 停止指定应用。
+  /apps/{app_id}/stats:
+    get:
+      summary: 获取应用统计信息
+      description: 返回指定应用的资源统计。
+  /apps/{app_id}/logs:
+    get:
+      summary: 获取应用日志
+      description: 返回指定应用的日志。
+  /apps/{app_id}/permissions:
+    get:
+      summary: 获取应用权限
+      description: 返回授予某应用的权限列表。
+  /apps/wizard:
+    post:
+      summary: 通过向导安装应用
+      description: 按向导流程安装应用。
+  /apps/upload-image:
+    post:
+      summary: 上传容器镜像
+      description: 上传应用容器镜像。
+  /apps/upload-manifest:
+    post:
+      summary: 上传应用清单
+      description: 上传 YAML 应用清单（multipart 字段 "file"，仅支持 .yaml/.yml），供后续打包安装使用。
+  /apps/install-package:
+    post:
+      summary: 从已上传的清单与镜像安装应用
+      description: 异步安装——返回 task_id，进度通过 /apps/install-progress/{task_id} 查询。
+  /apps/install-progress/{task_id}:
+    get:
+      summary: 获取异步安装进度
+      description: 返回指定安装任务的进度。
+  /containers/{id}/logs/ws:
+    get:
+      summary: 通过 WebSocket 实时流式获取容器日志
+      description: 实时推送容器日志的 WebSocket 端点。
+  /containers/{id}/exec/ws:
+    get:
+      summary: 通过 WebSocket 交互式容器控制台
+      description: 附加到容器交互式控制台的 WebSocket 端点。
+  /apps/{app_id}/restart:
+    post:
+      summary: 重启应用
+      description: 重启指定应用。
+
+  /h264/{stream_id}:
+    get:
+      summary: 订阅 H264 视频流（WebSocket）
+      description: |-
+        零延迟 H264 视频流的 WebSocket 端点。
+        远程（nginx TLS）：`wss://{host}/api/v1/h264/{stream_id}`；
+        设备本地：`ws://localhost:8080/api/v1/h264/{stream_id}`。
+
+  /settings:
+    get:
+      summary: 获取全部设置
+      description: 返回键值存储中的所有设置项。
+    post:
+      summary: 创建或更新设置项
+      description: 创建或更新一个设置项。
+  /settings/{key}:
+    delete:
+      summary: 删除设置项
+      description: 删除指定键的设置项。
+
+  /monitor/summary:
+    get:
+      summary: 获取系统资源摘要
+      description: 一次调用返回 CPU、内存、磁盘、网络与主机信息。
+  /monitor/cpu:
+    get:
+      summary: 获取 CPU 使用详情
+      description: 返回 CPU 使用率详情。
+  /monitor/memory:
+    get:
+      summary: 获取内存与交换分区使用
+      description: 返回内存及 swap 使用情况。
+  /monitor/disk:
+    get:
+      summary: 获取磁盘分区使用
+      description: 返回各磁盘分区的使用情况。
+  /monitor/network:
+    get:
+      summary: 获取网络 I/O 计数
+      description: 返回网络接口收发计数器。
+  /monitor/snapshot:
+    get:
+      summary: 单次资源快照
+      description: 单次调用采样 CPU、内存、NPU 使用率、温度与网络计数——比轮询单项接口开销更低。
+  /monitor/gyro/attitude:
+    get:
+      summary: 陀螺仪姿态流（SSE）
+      description: |-
+        设备倾角（pitch/roll）的 Server-Sent Events 流。`EventSource` 无法
+        设置自定义请求头，因此认证使用 `token` 查询参数（原始值，不带
+        `Bearer ` 前缀）。响应带 `X-Accel-Buffering: no`。完整客户端契约
+        见 `docs/references/gyro-attitude-sse.md`。
+
+  /processes:
+    get:
+      summary: 列出运行中的进程
+      description: 返回系统运行中的进程列表。
+  /processes/{pid}:
+    get:
+      summary: 获取进程详情
+      description: 返回指定进程的详细信息。
+  /processes/{pid}/kill:
+    post:
+      summary: 向进程发送信号
+      description: 向指定进程发送信号（如 SIGTERM）。
+
+  /files:
+    get:
+      summary: 列出目录内容
+      description: 列出指定路径下的文件与子目录。
+    delete:
+      summary: 删除文件或目录
+      description: 删除指定文件或目录。
+  /files/content:
+    get:
+      summary: 读取文件内容
+      description: 返回文件的文本内容（最大 1MB）。
+    post:
+      summary: 写入文件内容
+      description: 写入文件的文本内容。
+  /files/upload:
+    post:
+      summary: 上传文件
+      description: 上传一个文件到指定目录。
+  /files/download:
+    get:
+      summary: 下载文件
+      description: 下载指定文件。
+  /files/mkdir:
+    post:
+      summary: 创建目录
+      description: 创建一个目录。
+  /files/rename:
+    post:
+      summary: 重命名或移动文件/目录
+      description: 重命名或移动文件与目录。
+  /files/batch-download:
+    post:
+      summary: 批量下载文件为 ZIP
+      description: 将多个文件打包为 ZIP 下载。
+  /files/batch-delete:
+    post:
+      summary: 批量删除文件
+      description: 一次删除多个文件。
+
+  /terminal/ws:
+    get:
+      summary: 网页终端（WebSocket）
+      description: |-
+        交互式 shell 的 WebSocket 端点。
+
+        远程（nginx TLS）：`wss://{host}/api/v1/terminal/ws`；
+        设备本地：`ws://localhost:8080/api/v1/terminal/ws`
+
+        - 文本消息：终端 I/O
+        - 二进制消息：调整尺寸 `{"cols":80,"rows":24}`
+
+  /ssh/config:
+    get:
+      summary: 获取 SSH 配置
+      description: 返回解析后的 sshd_config 设置。
+    post:
+      summary: 更新 SSH 配置
+      description: 更新 sshd_config，并可选地重启服务。
+  /ssh/status:
+    get:
+      summary: 获取 SSH 服务状态
+      description: 返回 SSH 服务运行状态。
+  /ssh/logs:
+    get:
+      summary: 获取 SSH 登录日志
+      description: 返回最近的 SSH 认证日志条目。
+
+  /logs/services:
+    get:
+      summary: 获取可查看日志的系统服务
+      description: 列出可读取日志的系统服务。
+  /logs/files:
+    get:
+      summary: 获取可读日志文件列表
+      description: 列出可读取的日志文件。
+  /logs/content:
+    get:
+      summary: 读取日志内容
+      description: 读取指定日志的内容。
+  /logs/download:
+    get:
+      summary: 下载完整日志文件或服务 journal
+      description: 下载完整的日志文件或 systemd 服务 journal。
+  /logs/stream/ws:
+    get:
+      summary: 通过 WebSocket 实时流式查看日志
+      description: 实时推送日志的 WebSocket 端点。
+
+  /store/apps:
+    get:
+      summary: 列出商店应用
+      description: 返回应用商店中的应用列表。
+  /store/apps/{key}:
+    get:
+      summary: 获取商店应用详情
+      description: 返回指定商店应用的详情。
+  /store/apps/{key}/install:
+    post:
+      summary: 从商店安装应用
+      description: 安装指定商店应用。
+  /store/categories:
+    get:
+      summary: 列出应用分类
+      description: 返回商店应用分类。
+  /store/tags:
+    get:
+      summary: 列出应用标签
+      description: 返回商店应用标签。
+  /store/installs:
+    get:
+      summary: 列出已安装应用
+      description: 返回商店安装记录。
+    post:
+      summary: 创建安装记录
+      description: 创建一条商店安装记录。
+  /store/installs/{app_id}:
+    get:
+      summary: 获取安装详情
+      description: 返回指定应用的安装详情。
+    put:
+      summary: 更新安装记录
+      description: 更新指定应用的安装记录。
+    delete:
+      summary: 删除安装记录
+      description: 删除指定应用的安装记录。
+
+  /dev/base-images:
+    get:
+      summary: 列出用于开发的镜像
+      description: 返回可用于开发的容器基础镜像列表。
+  /dev/projects:
+    get:
+      summary: 列出开发项目
+      description: 返回开发工作台中的项目列表。
+    post:
+      summary: 创建新项目
+      description: 创建一个新的开发项目。
+  /dev/projects/{id}:
+    get:
+      summary: 获取项目详情
+      description: 返回指定项目详情。
+    put:
+      summary: 更新项目
+      description: 更新指定项目。
+    delete:
+      summary: 删除项目
+      description: 删除指定项目。
+  /dev/projects/{id}/upload:
+    post:
+      summary: 向项目上传文件
+      description: 向指定项目上传一个文件。
+  /dev/projects/{id}/source:
+    post:
+      summary: 向项目上传源码压缩包
+      description: 上传源码归档并解压到项目中。
+  /dev/projects/{id}/files:
+    get:
+      summary: 列出项目文件
+      description: 列出指定项目的文件树。
+  /dev/projects/{id}/file:
+    get:
+      summary: 获取文件内容
+      description: 返回项目内某文件的内容。
+    post:
+      summary: 保存文件内容
+      description: 保存项目内某文件的内容。
+  /dev/projects/{id}/builds:
+    get:
+      summary: 列出项目构建
+      description: 返回项目的构建历史。
+  /dev/projects/{id}/build:
+    post:
+      summary: 启动新构建
+      description: 触发项目的一次新构建。
+
+  /containers:
+    get:
+      summary: 列出容器
+      description: 返回容器列表。
+  /containers/{id}:
+    get:
+      summary: 获取容器详情
+      description: 返回指定容器详情。
+    delete:
+      summary: 删除容器
+      description: 删除指定容器。
+  /containers/{id}/stats:
+    get:
+      summary: 获取容器统计
+      description: 返回容器资源统计。
+  /containers/{id}/logs:
+    get:
+      summary: 获取容器日志
+      description: 返回容器日志。
+  /containers/{id}/logs/stream:
+    get:
+      summary: 流式获取容器日志（SSE）
+      description: 以 Server-Sent Events 流式返回容器日志。
+  /containers/{id}/start:
+    post:
+      summary: 启动容器
+      description: 启动指定容器。
+  /containers/{id}/stop:
+    post:
+      summary: 停止容器
+      description: 停止指定容器。
+  /containers/{id}/restart:
+    post:
+      summary: 重启容器
+      description: 重启指定容器。
+
+  /images:
+    get:
+      summary: 列出容器镜像
+      description: 返回本机容器镜像列表。
+  /images/pull:
+    post:
+      summary: 拉取镜像
+      description: 从 registry 拉取镜像。
+  /images/{image}:
+    delete:
+      summary: 删除镜像
+      description: 删除指定容器镜像。
+
+  /storage/disks:
+    get:
+      summary: 列出可用磁盘与分区
+      description: 返回可用块设备与分区列表。
+  /storage/mount:
+    post:
+      summary: 挂载块设备到目标路径
+      description: 将块设备挂载到指定目录。
+  /storage/unmount:
+    post:
+      summary: 卸载先前挂载的磁盘
+      description: 卸载指定挂载点。
+  /storage/format:
+    post:
+      summary: 以指定文件系统格式化磁盘
+      description: 按给定文件系统类型格式化磁盘。
+
+  /media/config:
+    get:
+      summary: 获取摄像头守护进程配置
+      description: 返回 camera-daemon 的当前配置。
+    post:
+      summary: 更新摄像头守护进程配置并应用变更
+      description: 更新 camera-daemon 配置并应用（必要时重建管线）。
+  /media/config/field:
+    get:
+      summary: 读取单个标量媒体配置字段
+      description: 读取媒体 profile 中的一个标量字段。
+    put:
+      summary: 更新单个白名单标量媒体配置字段
+      description: 更新媒体 profile 白名单中的一个标量字段。
+  /media/config/export:
+    get:
+      summary: 导出统一媒体配置信封
+      description: 导出完整的统一媒体配置。
+  /media/config/import:
+    post:
+      summary: 导入统一媒体配置信封
+      description: 导入统一媒体配置并应用。
+  /media/image:
+    get:
+      summary: 获取当前 ISP 图像参数
+      description: 返回当前 ISP 图像参数。
+    put:
+      summary: 更新 ISP 图像参数
+      description: 更新 ISP 图像参数（亮度、对比度等）。
+  /media/encoder:
+    put:
+      summary: 更新某路流的编码器参数
+      description: 更新指定流的编码器参数。
+  /media/rtsp:
+    put:
+      summary: 启用或禁用 RTSP 服务
+      description: 开启或关闭 RTSP 服务器。
+  /media/ai-overlay:
+    put:
+      summary: 更新 AI 叠加配置
+      description: 更新 AI 检测结果叠加层配置。
+  /media/osd:
+    get:
+      summary: 获取 OSD（屏幕显示）配置
+      description: 返回 OSD 叠加配置。
+    put:
+      summary: 更新 OSD（屏幕显示）配置
+      description: 更新 OSD 叠加配置。
+  /media/encoder/reconfig:
+    put:
+      summary: 重配编码器（完全重建）
+      description: 完全重配编码器参数。会造成短暂的流中断。
+  /media/transform:
+    get:
+      summary: 获取变换配置
+      description: 返回图像变换配置。
+    put:
+      summary: 更新变换配置
+      description: 部分更新——旋转（0/90/180/270）、翻转、去畸变、灰度、DIS 与 EIS。
+  /media/osd/upload-image:
+    post:
+      summary: 上传 OSD 叠加图片
+      description: 仅支持 PNG 或 BMP；存储于 /data/aipc/etc/osd，图片叠加层通过 image_path 引用。
+  /media/osd/font:
+    get:
+      summary: 下载 OSD 字体文件
+      description: 下载 OSD 使用的字体文件。
+  /media/osd/image/{name}:
+    get:
+      summary: 提供已存储的 OSD 叠加图片
+      description: 返回已上传的 OSD 叠加图片。
+  /media/privacy-mask:
+    get:
+      summary: 获取隐私遮蔽配置
+      description: 返回隐私遮蔽区域配置。
+    put:
+      summary: 更新隐私遮蔽配置
+      description: 部分更新；区域顶点数组同时接受 snake_case 与 camelCase（points_x / pointsX）。
+  /media/profile:
+    get:
+      summary: 获取当前激活的管线 profile
+      description: 返回当前使用的管线 profile 名称。
+  /media/profiles:
+    get:
+      summary: 列出可用管线 profile
+      description: 返回设备支持的管线 profile 列表。
+  /media/profile/switch:
+    post:
+      summary: 切换激活的管线 profile
+      description: 热切换 profile——返回 accepted 标志与预期的流中断时长。
+  /media/profile/backup:
+    post:
+      summary: 备份当前激活的管线 profile
+      description: 备份当前激活的管线 profile。
+  /media/pipeline/reconfigure:
+    post:
+      summary: 重配完整管线
+      description: 发送 1-4 路流定义（输入几何 + 编码器设置）；camera-daemon 会重建管线。
+  /media/status:
+    get:
+      summary: 获取所有流的实时状态
+      description: 合并 camera-daemon 实时编码器状态与已配置的流表；禁用的流以 "inactive" 状态出现。
+  /media/streams:
+    post:
+      summary: 添加一路流
+      description: 运行时添加编码流（stream_id、几何、fps、编解码、码率、gop）。编解码默认 h264。
+  /media/streams/{name}:
+    delete:
+      summary: 移除一路流
+      description: 主码流不可移除。
+  /media/streams/{name}/enable:
+    post:
+      summary: 启用一路流
+      description: 通过 ReconfigurePipeline 在管线层启用；主码流始终启用。
+  /media/streams/{name}/disable:
+    delete:
+      summary: 禁用一路流
+      description: 通过 ReconfigurePipeline 在管线层禁用；主码流不可禁用。
+
+  /audio/capture-devices:
+    get:
+      summary: 列出音频采集设备
+      description: 返回可用的音频输入设备。
+  /audio/playback-devices:
+    get:
+      summary: 列出音频播放设备
+      description: 返回可用的音频输出设备。
+  /audio/status:
+    get:
+      summary: 获取音频管线状态
+      description: 返回音频采集/播放管线状态。
+  /audio/capture/start:
+    post:
+      summary: 开始音频采集
+      description: 启动音频采集。
+  /audio/capture/stop:
+    post:
+      summary: 停止音频采集
+      description: 停止音频采集。
+  /audio/config:
+    put:
+      summary: 更新音频配置
+      description: 将音频配置持久化到 camera-daemon.yaml（设备、采样率、声道、编解码、码率、音量、静音、playback_enabled）。
+  /audio/playback/start:
+    post:
+      summary: 开始音频播放
+      description: 启动音频播放。
+  /audio/playback/stop:
+    post:
+      summary: 停止音频播放
+      description: 停止音频播放。
+  /audio/stream:
+    get:
+      summary: 音频采集流（WebSocket）
+      description: 将设备采集的音频帧推送到浏览器的 WebSocket。
+  /audio/talk:
+    get:
+      summary: 双向对讲（WebSocket）
+      description: 按讲模式——浏览器麦克风 PCM 推送到设备扬声器。
+
+  /event-logs:
+    get:
+      summary: 列出事件日志
+      description: 支持过滤与分页的事件日志查询。
+    post:
+      summary: 创建事件日志条目
+      description: 写入一条事件日志。
+    delete:
+      summary: 清理旧事件日志
+      description: 按条件清理历史事件日志。
+  /event-logs/statistics:
+    get:
+      summary: 获取事件日志统计
+      description: 返回事件日志的统计信息。
+  /event-logs/templates:
+    get:
+      summary: 获取事件消息模板
+      description: 全部事件代码及其本地化（en/zh）消息模板、所属模块、级别与声明参数。
+
+  /debug-logs/export:
+    post:
+      summary: 导出调试日志为 tar.gz
+      description: 打包导出调试日志。
+  /debug-logs/services:
+    get:
+      summary: 列出可导出日志的 systemd 服务
+      description: 列出可用于日志导出的 systemd 服务。
+  /debug-logs/files:
+    get:
+      summary: 列出可用日志文件
+      description: 列出可导出的日志文件。
+
+  /network/config:
+    get:
+      summary: 获取网络配置
+      description: 返回网络接口配置。
+    post:
+      summary: 更新网络配置
+      description: 在 DHCP 与静态 IP 之间切换。修改网络配置可能导致连接短暂中断。
+  /network/interfaces:
+    get:
+      summary: 列出所有网络接口
+      description: 返回全部网络接口信息。
+
+  /device-info:
+    get:
+      summary: 获取设备信息
+      description: 返回设备信息。
+    put:
+      summary: 更新设备名称
+      description: 修改设备名称。
+  /device-info/factory:
+    get:
+      summary: 获取出厂信息
+      description: 只读的出厂烧录字段（批次、产线、标定日期等）。
+    post:
+      summary: 写入单个出厂字段
+      description: 写入单个出厂烧录字段（一次性写入语义；面向产线使用）。

@@ -1,0 +1,9 @@
+/* Let the Redoc canvas breathe inside the VitePress content column. */
+.api-reference {
+  margin-top: 8px;
+}
+
+/* Redoc renders its own max-width container; align it with the docs page. */
+.api-reference redoc {
+  display: block;
+}

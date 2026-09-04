@@ -1,0 +1,73 @@
+name: Docs (Web API) Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/api/**'
+      - 'docs/web-api/**'
+      - 'platform/platform-api/server/main.go'
+      - '.github/workflows/docs-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: docs/web-api
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # lastUpdated timestamps need git history
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: docs/web-api/pnpm-lock.yaml
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Generate bilingual API specs (also gates zh translation coverage)
+        run: python3 scripts/build_specs.py
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build VitePress site
+        run: pnpm exec vitepress build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/web-api/.vitepress/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
