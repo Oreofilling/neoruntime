@@ -192,6 +192,40 @@ grpc::Status AIRuntimeServiceImpl::UnregisterModel(
 
 // ─── ListModels ───────────────────────────────────────────────────────────────
 
+// Copies HAL tensor specs onto a protobuf ModelInfo. Shared by ListModels and
+// GetModelInfo so the list path carries the same per-tensor facts as the
+// detail path (platform-api backfills its DB rows from the list response).
+void AIRuntimeServiceImpl::fill_tensor_specs(const HalModelInfo& mi,
+                                             pb::ModelInfo* info) {
+    for (uint32_t i = 0; i < mi.num_inputs; i++) {
+        auto* spec = info->add_inputs();
+        spec->set_name(mi.inputs[i].name);
+        spec->set_dtype(hal_dtype_to_proto(mi.inputs[i].dtype));
+        // NV12/NV21/I420 inputs map to the ambiguous NHW layout in HAL; the
+        // pixel format itself lives only in is_nv12. Surface it as "NV12" so
+        // clients can tell image-plane tensors from planar RGB without
+        // inferring from byte_size (W*H*3/2).
+        spec->set_layout(mi.inputs[i].is_nv12 != 0
+                             ? "NV12"
+                             : hal_layout_to_string(mi.inputs[i].layout));
+        spec->set_byte_size(mi.inputs[i].byte_size);
+        for (int d = 0; d < mi.inputs[i].ndim; d++) {
+            spec->add_shape(mi.inputs[i].shape[d]);
+        }
+    }
+
+    for (uint32_t i = 0; i < mi.num_outputs; i++) {
+        auto* spec = info->add_outputs();
+        spec->set_name(mi.outputs[i].name);
+        spec->set_dtype(hal_dtype_to_proto(mi.outputs[i].dtype));
+        spec->set_layout(hal_layout_to_string(mi.outputs[i].layout));
+        spec->set_byte_size(mi.outputs[i].byte_size);
+        for (int d = 0; d < mi.outputs[i].ndim; d++) {
+            spec->add_shape(mi.outputs[i].shape[d]);
+        }
+    }
+}
+
 grpc::Status AIRuntimeServiceImpl::ListModels(
     grpc::ServerContext* /*ctx*/,
     const pb::Empty* /*req*/,
@@ -211,6 +245,7 @@ grpc::Status AIRuntimeServiceImpl::ListModels(
         if (!owners.empty()) {
             info->set_owner_id(owners[0]);
         }
+        fill_tensor_specs(m.model_info, info);
     }
     return grpc::Status::OK;
 }
@@ -233,34 +268,7 @@ grpc::Status AIRuntimeServiceImpl::GetModelInfo(
     resp->set_version(m.model_info.version);
     resp->set_load_timestamp(static_cast<uint64_t>(m.load_time));
     resp->set_transient(m.transient);
-
-    for (uint32_t i = 0; i < m.model_info.num_inputs; i++) {
-        auto* spec = resp->add_inputs();
-        spec->set_name(m.model_info.inputs[i].name);
-        spec->set_dtype(hal_dtype_to_proto(m.model_info.inputs[i].dtype));
-        // NV12/NV21/I420 inputs map to the ambiguous NHW layout in HAL; the
-        // pixel format itself lives only in is_nv12. Surface it as "NV12" so
-        // clients can tell image-plane tensors from planar RGB without
-        // inferring from byte_size (W*H*3/2).
-        spec->set_layout(m.model_info.inputs[i].is_nv12 != 0
-                             ? "NV12"
-                             : hal_layout_to_string(m.model_info.inputs[i].layout));
-        spec->set_byte_size(m.model_info.inputs[i].byte_size);
-        for (int d = 0; d < m.model_info.inputs[i].ndim; d++) {
-            spec->add_shape(m.model_info.inputs[i].shape[d]);
-        }
-    }
-
-    for (uint32_t i = 0; i < m.model_info.num_outputs; i++) {
-        auto* spec = resp->add_outputs();
-        spec->set_name(m.model_info.outputs[i].name);
-        spec->set_dtype(hal_dtype_to_proto(m.model_info.outputs[i].dtype));
-        spec->set_layout(hal_layout_to_string(m.model_info.outputs[i].layout));
-        spec->set_byte_size(m.model_info.outputs[i].byte_size);
-        for (int d = 0; d < m.model_info.outputs[i].ndim; d++) {
-            spec->add_shape(m.model_info.outputs[i].shape[d]);
-        }
-    }
+    fill_tensor_specs(m.model_info, resp);
 
     return grpc::Status::OK;
 }
