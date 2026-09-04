@@ -94,6 +94,7 @@
 | -------- | ----------- |
 | [testing/hal_lens_af0832_usage.md](testing/hal_lens_af0832_usage.md) | HAL lens (AF0832) usage |
 | [api/swagger.yaml](api/swagger.yaml) | OpenAPI spec for the Platform API |
+| [web-api/](web-api/) | Bilingual Web API docs site (VitePress + Redoc, deployed to GitHub Pages) |
 | [testing/lens_api_test.sh](testing/lens_api_test.sh) | Lens API test harness |
 
 SDK and application guides live in the sibling repositories:

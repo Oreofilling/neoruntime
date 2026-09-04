@@ -89,3 +89,30 @@ jobs:
         run: pip install pyyaml
       - name: docs/api/swagger.yaml matches registered routes
         run: python scripts/check_swagger_sync.py
+
+  docs-site:
+    name: Web API docs site
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: docs/web-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: docs/web-api/pnpm-lock.yaml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Generate bilingual API specs (gates zh translation coverage)
+        run: python3 scripts/build_specs.py
+      - run: pnpm install --frozen-lockfile
+      - name: Build site
+        run: pnpm exec vitepress build
