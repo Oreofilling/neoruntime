@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, ArrowRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -9,7 +9,6 @@ import {
   useUpdateModel,
   useLoadModel,
   useModels,
-  type ModelTypeDef,
 } from '@/hooks/useModels';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
@@ -32,23 +31,15 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { aiApi } from '@/services/api';
-import SectionNav from '@/pages/apps/components/import/SectionNav';
 import {
-  backendFunctionForProfile,
-  buildRegisterPreview,
   classifyOutputFormat,
   fieldDefaultToState,
   initialModelImportForm,
-  mergeConfigOnTypeSwitch,
-  modelFormIssueText,
-  partitionFields,
+  prefillUpdateForm,
   sanitizeModelId,
   suggestPostprocessProfile,
   suggestModelId,
-  validateModelForm,
-  variantFormIssue,
   type ModelImportFormState,
-  type ModelImportSectionId as SectionId,
   type ModelParseResult,
 } from '../lib/modelImportFlow';
 import {
@@ -57,11 +48,10 @@ import {
   MODEL_LOAD_FAILED_CODE,
 } from '../lib/apiErrors';
 import SourceModelForm from './import/SourceModelForm';
-import BasicInfoSection from './import/BasicInfoSection';
-import OutputSection from './import/OutputSection';
-import AdvancedVariantSection from './import/AdvancedVariantSection';
-import FormJsonSwitch, { type ModelFormView } from './import/FormJsonSwitch';
-import JsonPreviewPane from './import/JsonPreviewPane';
+import ModelConfigEditor, {
+  useModelTypeOptions,
+  type ModelConfigEditorHandle,
+} from './import/ModelConfigEditor';
 import WizardStepper from './import/WizardStepper';
 
 /** Existing-model shape needed to prefill the update mode. */
@@ -122,21 +112,19 @@ export default function ImportModelDialog({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   const [screen, setScreen] = useState<Screen>('source');
-  const [activeSection, setActiveSection] = useState<SectionId>('basic_info');
-  const [view, setView] = useState<ModelFormView>('form');
   const [file, setFile] = useState<File | null>(null);
   const [parseResult, setParseResult] = useState<ModelParseResult | null>(null);
   const [form, setForm] = useState<ModelImportFormState>(
     initialModelImportForm
   );
-  // Only blur/submit marks survive here — error text is derived from the
-  // form via validateModelForm, so it clears itself as values become valid.
-  const [touched, setTouched] = useState<Record<string, boolean>>({});
   // Update mode: profile as loaded, to hint when the selection changes.
   const initialProfileRef = useRef<string | null>(null);
   // Update mode: form as prefilled from the existing row, to detect edits an
   // accidental close would discard.
   const initialFormRef = useRef<ModelImportFormState | null>(null);
+  // Submit gate of the configure screen (touch-all → validate → hand back
+  // the form, or null after toasting the first issue and jumping there).
+  const editorRef = useRef<ModelConfigEditorHandle>(null);
   // Esc / header-close confirmation when unsaved work exists.
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
@@ -189,14 +177,9 @@ export default function ImportModelDialog({
     }
   };
 
-  const modelTypeOptions = useMemo(() => {
-    if (!capabilities?.model_types) return [];
-    return capabilities.model_types.map((mt: ModelTypeDef) => ({
-      value: mt.id,
-      label: t(`sys.ai_models.model_type.${mt.id}`, mt.label),
-      fields: mt.fields,
-    }));
-  }, [capabilities, t]);
+  // Select options for the configure screen, resolved from capabilities by
+  // the shared editor (labels stay identical wherever it renders).
+  const modelTypeOptions = useModelTypeOptions();
 
   const acceptFormats = useMemo(() => {
     if (!capabilities?.formats) return FALLBACK_ACCEPT;
@@ -234,46 +217,27 @@ export default function ImportModelDialog({
     return ids;
   }, [existingModels]);
 
-  // Currently selected type's fields
-  const currentFields = useMemo(() => {
-    const opt = modelTypeOptions.find(o => o.value === form.modelType);
-    return opt?.fields ?? [];
-  }, [modelTypeOptions, form.modelType]);
-
   // Update mode: prefill the form from the existing model each time the
-  // dialog opens (config values live at the model row's top level, e.g.
-  // threshold / max_detections, falling back to schema defaults).
+  // dialog opens — schema defaults overlaid with the row's persisted config
+  // (a JSON string on list rows) and its promoted columns, so config-only
+  // values like labels survive the round-trip.
   useEffect(() => {
     if (!open || !isUpdate || !model) return;
     const typeOpt = modelTypeOptions.find(o => o.value === model.model_type);
-    const config: Record<string, unknown> = {};
-    for (const f of typeOpt?.fields ?? []) {
-      const current = model[f.key];
-      if (current !== undefined && current !== null && current !== '') {
-        config[f.key] = current;
-      } else if (f.default !== undefined) {
-        config[f.key] = f.default;
-      }
-    }
     setScreen('source');
-    setActiveSection('basic_info');
-    setView('form');
     setFile(null);
     setParseResult(null);
-    setTouched({});
-    const rawProfile = config.postprocess_profile;
-    const initialProfile = typeof rawProfile === 'string' ? rawProfile : null;
-    initialProfileRef.current = initialProfile;
-    const prefilled: ModelImportFormState = {
-      modelId: model.model_id,
-      modelType: model.model_type ?? '',
-      outputMode: model.output_mode === 'raw' ? 'raw' : 'platform',
-      variant: model.variant ?? '',
-      config,
-    };
+    const prefilled = prefillUpdateForm(model, typeOpt?.fields ?? []);
+    const rawProfile = prefilled.config.postprocess_profile;
+    initialProfileRef.current =      typeof rawProfile === 'string' ? rawProfile : null;
     initialFormRef.current = prefilled;
     setForm(prefilled);
   }, [open, isUpdate, model, modelTypeOptions]);
+
+  // The configure screen (and only it) patches the parent-owned form.
+  const handlePatch = useCallback((patch: Partial<ModelImportFormState>) => {
+    setForm(prev => ({ ...prev, ...patch }));
+  }, []);
 
   const isLoading =    parseMutation.isPending
     || registerMutation.isPending
@@ -290,66 +254,6 @@ export default function ImportModelDialog({
     }
     return '';
   }, [parseResult, isUpdate, model]);
-
-  // Platform decode requires the NMS output layer: a feature-map detection
-  // HEF cannot enter the plugin pipeline at all, so the platform card is
-  // disabled with the reason shown on the card itself.
-  const platformModeDisabled =    form.modelType === 'detection' && outputFormat === 'feature_map';
-
-  // When platform decode becomes impossible, fall through to raw instead of
-  // sitting on an unregisterable selection.
-  useEffect(() => {
-    if (platformModeDisabled && form.outputMode === 'platform') {
-      setForm(prev => ({ ...prev, outputMode: 'raw' }));
-    }
-  }, [platformModeDisabled, form.outputMode]);
-
-  // One validator drives everything: submit gates on issues[0] (toast +
-  // jump to its section) and inline text is the same issue, gated on blur.
-  const issues = useMemo(
-    () => validateModelForm(form, {
-        isUpdate,
-        platformModeDisabled,
-        existingModelIds: modelsReady ? existingModelIdSet : null,
-        fields: currentFields,
-      }),
-    [
-      form,
-      isUpdate,
-      platformModeDisabled,
-      modelsReady,
-      existingModelIdSet,
-      currentFields,
-    ]
-  );
-
-  const errorFor = (field: string): string | undefined => {
-    if (!touched[field]) return undefined;
-    const issue = issues.find(i => i.field === field);
-    return issue ? modelFormIssueText(issue, t) : undefined;
-  };
-
-  // Live client mirror of the backend custom-variant guard, so a broken
-  // blob is rejected before the request leaves the page (not blur-gated —
-  // matches the old behavior under the textarea).
-  const variantLiveText = useMemo(() => {
-    const issue = variantFormIssue(form.variant);
-    return issue ? modelFormIssueText(issue, t) : null;
-  }, [form.variant, t]);
-
-  // The inverse cross-check: the HEF ships the NMS output layer but is not
-  // classified as detection — almost certainly miscategorized.
-  const typeMismatch =    !!parseResult
-    && parseResult.suggested_type !== 'detection'
-    && form.modelType !== 'detection'
-    && outputFormat === 'nms';
-
-  // Update mode: hint that changing the postprocess profile reloads a
-  // loaded model rather than silently keeping the old profile on the NPU.
-  const profileChanged =    isUpdate
-    && initialProfileRef.current !== null
-    && form.config.postprocess_profile !== undefined
-    && form.config.postprocess_profile !== initialProfileRef.current;
 
   // Work an accidental close (Esc / header X) would discard: a staged file,
   // or configure-screen edits that diverge from the prefilled row. A clean
@@ -398,31 +302,6 @@ export default function ImportModelDialog({
       },
     ],
     [t, screen, parseResult, parsePending, isUpdate]
-  );
-
-  const { basic: basicFields, postprocess: postprocessFields } = useMemo(
-    () => partitionFields(currentFields),
-    [currentFields]
-  );
-
-  const preview = useMemo(() => buildRegisterPreview(form), [form]);
-
-  const sections = useMemo(
-    () => [
-      {
-        id: 'basic_info',
-        label: t('sys.ai_models.wizard.nav_basic_info', 'Basic Info'),
-      },
-      {
-        id: 'output',
-        label: t('sys.ai_models.wizard.nav_output', 'Output & Postprocess'),
-      },
-      {
-        id: 'advanced',
-        label: t('sys.ai_models.wizard.nav_advanced', 'Advanced'),
-      },
-    ],
-    [t]
   );
 
   // Handlers
@@ -539,9 +418,6 @@ export default function ImportModelDialog({
   };
 
   const handleContinue = () => {
-    setTouched({});
-    setActiveSection('basic_info');
-    setView('form');
     setScreen('configure');
   };
 
@@ -554,121 +430,22 @@ export default function ImportModelDialog({
     setParseResult(null);
   };
 
-  const handleSectionChange = (id: string) => {
-    // "Take me to that page": a nav click leaves the read-only JSON
-    // projection — without this the pane stays on JsonPreviewPane and the
-    // click looks dead (nothing to flush here, unlike apps' YAML view).
-    setView('form');
-    setActiveSection(id as SectionId);
-  };
-
-  const handleModelIdChange = (value: string) => {
-    setForm(prev => ({ ...prev, modelId: value }));
-  };
-
-  const handleOutputModeChange = (value: string) => {
-    setForm(prev => ({ ...prev, outputMode: value }));
-  };
-
-  const handleVariantChange = (value: string) => {
-    setForm(prev => ({ ...prev, variant: value }));
-  };
-
-  const markModelIdTouched = () => {
-    setTouched(prev => ({ ...prev, modelId: true }));
-  };
-
-  const markVariantTouched = () => {
-    setTouched(prev => ({ ...prev, variant: true }));
-  };
-
-  const markFieldTouched = (key: string) => {
-    setTouched(prev => ({ ...prev, [`config_${key}`]: true }));
-  };
-
-  const handleSwitchToDetection = () => handleModelTypeChange('detection');
-
-  const handleModelTypeChange = (value: string) => {
-    const typeOpt = modelTypeOptions.find(o => o.value === value);
-    setForm(prev => ({
-      ...prev,
-      modelType: value,
-      // New type's defaults overlaid with previously-entered values for keys
-      // the new type also understands — keeps a tuned threshold alive across
-      // a detection↔pose switch instead of silently wiping it.
-      config: mergeConfigOnTypeSwitch(prev.config, typeOpt?.fields ?? []),
-    }));
-  };
-
-  const updateConfig = (key: string, value: unknown) => {
-    setForm(prev => ({
-      ...prev,
-      config: { ...prev.config, [key]: value },
-    }));
-  };
-
-  // Seed the variant textarea with a schema-complete blob composed from the
-  // visible form values, so the escape hatch starts from something the
-  // postprocess plugin actually accepts.
-  const insertVariantTemplate = () => {
-    const rawProfile = form.config.postprocess_profile;
-    const fallbackProfile = 'hailo_yolov8n_384_640';
-    const profile =      typeof rawProfile === 'string' ? rawProfile : fallbackProfile;
-    const num = (v: unknown, fallback: number) => {
-      if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
-        return fallback;
-      }
-      return v;
-    };
-    const configLabels = form.config.labels;
-    const rawLabels = typeof configLabels === 'string' ? configLabels : '';
-    const labels = rawLabels
-      .split(',')
-      .map(s => s.trim())
-      .filter(s => s !== '');
-    const template = {
-      backend_function: backendFunctionForProfile(profile),
-      iou_threshold: num(form.config.nms_threshold, 0.45),
-      detection_threshold: num(form.config.threshold, 0.25),
-      output_activation: 'none',
-      label_offset: 1,
-      max_boxes: num(form.config.max_detections, 64),
-      // Index 0 is a placeholder so labels[N] names class_id N.
-      labels: ['unlabeled', ...labels],
-    };
-    setForm(prev => ({ ...prev, variant: JSON.stringify(template, null, 2) }));
-  };
-
   const handleRegister = () => {
-    const newTouched: Record<string, boolean> = {
-      modelId: true,
-      modelType: true,
-      variant: true,
-      outputMode: true,
-    };
-    for (const f of currentFields) {
-      newTouched[`config_${f.key}`] = true;
-    }
-    setTouched(newTouched);
-
-    if (issues.length > 0) {
-      toast({
-        title: modelFormIssueText(issues[0], t),
-        variant: 'destructive',
-      });
-      handleSectionChange(issues[0].section);
-      return;
-    }
+    // Submit gate lives in the shared editor: it marks every field touched,
+    // and on the first issue toasts it and jumps to its section (returning
+    // null so the request never leaves).
+    const validForm = editorRef.current?.submit();
+    if (!validForm) return;
 
     if (isUpdate) {
       // No file uploaded → metadata-only update (file_hash omitted).
       updateMutation.mutate(
         {
-          modelId: form.modelId.trim(),
-          model_type: form.modelType,
-          output_mode: form.outputMode,
-          model_variant: form.variant.trim(),
-          config: form.config,
+          modelId: validForm.modelId.trim(),
+          model_type: validForm.modelType,
+          output_mode: validForm.outputMode,
+          model_variant: validForm.variant.trim(),
+          config: validForm.config,
           ...(parseResult
             ? {
                 file_hash: parseResult.file_hash,
@@ -732,16 +509,16 @@ export default function ImportModelDialog({
     if (!parseResult) return;
 
     // Captured before the reset below wipes the form.
-    const modelId = form.modelId.trim();
+    const modelId = validForm.modelId.trim();
 
     registerMutation.mutate(
       {
         file_hash: parseResult.file_hash,
         model_id: modelId,
-        model_type: form.modelType,
-        output_mode: form.outputMode,
-        model_variant: form.variant.trim(),
-        config: form.config,
+        model_type: validForm.modelType,
+        output_mode: validForm.outputMode,
+        model_variant: validForm.variant.trim(),
+        config: validForm.config,
         file_size: parseResult.file_size,
         network_name: parseResult.network_name,
         vstream_info: parseResult.vstream_info,
@@ -804,13 +581,10 @@ export default function ImportModelDialog({
 
   const handleReset = () => {
     setScreen('source');
-    setActiveSection('basic_info');
-    setView('form');
     setFile(null);
     setParseResult(null);
     setUploadProgress(null);
     setForm(initialModelImportForm);
-    setTouched({});
     setLoadAfterRegister(false);
     initialProfileRef.current = null;
     initialFormRef.current = null;
@@ -932,63 +706,19 @@ export default function ImportModelDialog({
             </div>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
-            <SectionNav
-              sections={sections}
-              activeId={activeSection}
-              onActiveChange={handleSectionChange}
-              header={navHeader}
-            />
-            <div className="flex min-h-0 flex-1 flex-col">
-              <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-2 sm:px-6">
-                <FormJsonSwitch view={view} onChange={setView} />
-              </div>
-              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8">
-                {view === 'json' ? (
-                  <JsonPreviewPane preview={preview} />
-                ) : activeSection === 'basic_info' ? (
-                  <BasicInfoSection
-                    form={form}
-                    onModelIdChange={handleModelIdChange}
-                    onModelTypeChange={handleModelTypeChange}
-                    onBlurModelId={markModelIdTouched}
-                    modelTypeOptions={modelTypeOptions}
-                    basicFields={basicFields}
-                    isUpdate={isUpdate}
-                    disabled={isLoading}
-                    errorFor={errorFor}
-                    onBlurField={markFieldTouched}
-                    onConfigChange={updateConfig}
-                  />
-                ) : activeSection === 'output' ? (
-                  <OutputSection
-                    outputMode={form.outputMode}
-                    onOutputModeChange={handleOutputModeChange}
-                    platformModeDisabled={platformModeDisabled}
-                    postprocessFields={postprocessFields}
-                    config={form.config}
-                    typeMismatch={typeMismatch}
-                    onSwitchToDetection={handleSwitchToDetection}
-                    profileChanged={profileChanged}
-                    disabled={isLoading}
-                    errorFor={errorFor}
-                    onBlurField={markFieldTouched}
-                    onConfigChange={updateConfig}
-                  />
-                ) : (
-                  <AdvancedVariantSection
-                    variant={form.variant}
-                    onChange={handleVariantChange}
-                    onBlur={markVariantTouched}
-                    liveErrorText={variantLiveText}
-                    onInsertTemplate={insertVariantTemplate}
-                    isRawMode={form.outputMode === 'raw'}
-                    disabled={isLoading}
-                  />
-                )}
-              </div>
-            </div>
-          </div>
+          <ModelConfigEditor
+            ref={editorRef}
+            form={form}
+            onPatch={handlePatch}
+            isUpdate={isUpdate}
+            modelTypeOptions={modelTypeOptions}
+            initialProfile={initialProfileRef.current}
+            outputFormat={outputFormat}
+            suggestedType={parseResult?.suggested_type}
+            existingModelIds={modelsReady ? existingModelIdSet : null}
+            disabled={isLoading}
+            navHeader={navHeader}
+          />
         )}
 
         <div className="flex flex-row items-center gap-2 border-t border-border bg-muted/20 px-4 py-3 sm:justify-between sm:px-6 sm:py-4">

@@ -293,6 +293,66 @@ export function mergeConfigOnTypeSwitch(
   return config;
 }
 
+/** A model list row (or detail object) used to seed the update-mode form —
+ *  the platform list persists config as raw JSON plus promoted top-level
+ *  columns (threshold, max_detections, …). */
+export interface UpdatePrefillSource {
+  model_id: string;
+  model_type?: string;
+  output_mode?: string;
+  variant?: string;
+  config?: unknown;
+  [key: string]: unknown;
+}
+
+/** Build the update-mode form from a registered model row: the selected
+ *  type's schema defaults, overlaid with the row's persisted config (a raw
+ *  object or a JSON string), overlaid with the promoted top-level columns.
+ *  Columns win — they are the effective values the list displays. Without
+ *  this merge, prefilling from the row's top-level keys alone loses every
+ *  config-only value (labels, nms_threshold, postprocess_profile). */
+export function prefillUpdateForm(
+  model: UpdatePrefillSource,
+  fields: ModelFieldDef[]
+): ModelImportFormState {
+  let stored: Record<string, unknown> = {};
+  if (typeof model.config === 'string' && model.config.trim() !== '') {
+    try {
+      const parsed = JSON.parse(model.config) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        stored = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Corrupt persisted config: fall through to defaults + columns.
+    }
+  } else if (
+    model.config
+    && typeof model.config === 'object'
+    && !Array.isArray(model.config)
+  ) {
+    stored = model.config as Record<string, unknown>;
+  }
+
+  const config = fieldDefaultToState(fields);
+  for (const f of fields) {
+    if (stored[f.key] !== undefined) {
+      config[f.key] = stored[f.key];
+    }
+    const col = model[f.key];
+    if (col !== undefined && col !== null && col !== '') {
+      config[f.key] = col;
+    }
+  }
+
+  return {
+    modelId: model.model_id,
+    modelType: model.model_type ?? '',
+    outputMode: model.output_mode === 'raw' ? 'raw' : 'platform',
+    variant: model.variant ?? '',
+    config,
+  };
+}
+
 /** Which configure page a schema field renders on. */
 export function sectionForField(key: string): ModelImportSectionId {
   return POSTPROCESS_PAGE_FIELDS.includes(key) ? 'output' : 'basic_info';

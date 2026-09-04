@@ -374,6 +374,7 @@ export default function ModelCard({
         onOpenChange={open => !open && setDetailModel(null)}
         onLoad={onLoad}
         onUnload={onUnload}
+        onUpdateFile={onUpdate}
         isActionLoading={isActionLoading}
       />
 

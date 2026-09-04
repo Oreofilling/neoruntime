@@ -1,5 +1,5 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -19,7 +19,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { useModelInfo, useExportModel } from '@/hooks/useModels';
+import { useModelInfo, useExportModel, useUpdateModel } from '@/hooks/useModels';
 import { useToast } from '@/hooks/use-toast';
 import {
   HardDrive,
@@ -34,10 +34,25 @@ import {
   Power,
   PowerOff,
   Loader2,
+  Pencil,
   type LucideIcon,
 } from 'lucide-react';
 import { getModelTypeLabel, getModelTypeDescription } from '../utils';
 import { getModelIcon } from '../modelIcons';
+import {
+  apiErrorText,
+  apiErrorCode,
+  MODEL_LOAD_FAILED_CODE,
+} from '../lib/apiErrors';
+import {
+  classifyOutputFormat,
+  prefillUpdateForm,
+  type ModelImportFormState,
+} from '../lib/modelImportFlow';
+import ModelConfigEditor, {
+  useModelTypeOptions,
+  type ModelConfigEditorHandle,
+} from './import/ModelConfigEditor';
 import TensorTable from './TensorTable';
 
 interface ModelData {
@@ -65,6 +80,9 @@ interface ModelData {
   // Input dimensions from HEF
   input_width?: number;
   input_height?: number;
+  // Output vstream names from the parse — classifies nms vs feature_map for
+  // the edit mode's platform-decode guard.
+  vstream_info?: string;
   // Schema-driven config; the API may send a parsed object or a JSON string
   config?: unknown;
 }
@@ -76,6 +94,8 @@ interface ModelDetailDialogProps {
   /** runtime actions surfaced in the dialog footer (card/list pass theirs) */
   onLoad?: (modelId: string) => void;
   onUnload?: (modelId: string, modelName: string) => void;
+  /** opens the import wizard in update mode to replace the model file */
+  onUpdateFile?: (model: ModelData) => void;
   /** per-model busy predicate — index holds a Set so concurrent actions show. */
   isActionLoading?: (modelId: string) => boolean;
 }
@@ -156,16 +176,45 @@ export default function ModelDetailDialog({
   onOpenChange,
   onLoad,
   onUnload,
+  onUpdateFile,
   isActionLoading,
 }: ModelDetailDialogProps) {
   const { t } = useTranslation();
   const [labelsExpanded, setLabelsExpanded] = useState(false);
   const [unloadConfirmOpen, setUnloadConfirmOpen] = useState(false);
 
+  // Inline edit mode: the shared configure editor over a prefilled form,
+  // saved through the metadata-only update (the model id stays fixed).
+  const [editing, setEditing] = useState(false);
+  const [editForm, setEditForm] = useState<ModelImportFormState | null>(null);
+  const [editConfirmOpen, setEditConfirmOpen] = useState(false);
+  const initialEditFormRef = useRef<ModelImportFormState | null>(null);
+  const editInitialProfileRef = useRef<string | null>(null);
+  const editorRef = useRef<ModelConfigEditorHandle>(null);
+
+  const modelTypeOptions = useModelTypeOptions();
   const modelId = open ? (model?.model_id ?? '') : '';
   const { data: modelDetail } = useModelInfo(modelId);
   const exportMutation = useExportModel();
+  const updateMutation = useUpdateModel();
   const { toast } = useToast();
+
+  // Leaving the dialog always drops any inline edit session with it.
+  useEffect(() => {
+    if (open) return;
+    setEditing(false);
+    setEditForm(null);
+    initialEditFormRef.current = null;
+    editInitialProfileRef.current = null;
+    setEditConfirmOpen(false);
+  }, [open]);
+
+  const handleEditPatch = useCallback(
+    (patch: Partial<ModelImportFormState>) => {
+      setEditForm(prev => (prev ? { ...prev, ...patch } : prev));
+    },
+    []
+  );
 
   if (!model) return null;
   const mergedModel: ModelData =    modelDetail && typeof modelDetail === 'object'
@@ -223,6 +272,118 @@ export default function ModelDetailDialog({
     });
   };
 
+  // Inline edit is offered only for types the capabilities schema knows —
+  // the editor is schema-driven, so an unknown type has nothing to render.
+  const editTypeOpt = modelTypeOptions.find(
+    o => o.value === mergedModel.model_type
+  );
+  const canEdit = !!editTypeOpt;
+
+  const isEditDirty = () => {
+    if (!editing || !editForm) return false;
+    const initial = initialEditFormRef.current;
+    if (!initial) return true;
+    return (
+      editForm.modelId !== initial.modelId
+      || editForm.modelType !== initial.modelType
+      || editForm.outputMode !== initial.outputMode
+      || editForm.variant !== initial.variant
+      || JSON.stringify(editForm.config) !== JSON.stringify(initial.config)
+    );
+  };
+
+  const exitEdit = () => {
+    setEditing(false);
+    setEditForm(null);
+    initialEditFormRef.current = null;
+    editInitialProfileRef.current = null;
+    setEditConfirmOpen(false);
+  };
+
+  const handleStartEdit = () => {
+    if (!editTypeOpt) return;
+    // Spread into a plain snapshot: prefillUpdateForm reads promoted
+    // top-level columns through its index signature.
+    const prefilled = prefillUpdateForm(
+      { ...mergedModel },
+      editTypeOpt.fields
+    );
+    const rawProfile = prefilled.config.postprocess_profile;
+    editInitialProfileRef.current =      typeof rawProfile === 'string' ? rawProfile : null;
+    initialEditFormRef.current = prefilled;
+    setEditForm(prefilled);
+    setEditing(true);
+  };
+
+  const handleSave = () => {
+    // Submit gate lives in the shared editor: touch everything, validate,
+    // toast the first issue and jump to its section (null = do not send).
+    const validForm = editorRef.current?.submit();
+    if (!validForm) return;
+    updateMutation.mutate(
+      {
+        // The id is fixed in edit mode — the editor renders it read-only.
+        modelId: mergedModel.model_id,
+        model_type: validForm.modelType,
+        output_mode: validForm.outputMode,
+        model_variant: validForm.variant.trim(),
+        config: validForm.config,
+      },
+      {
+        onSuccess: () => {
+          toast({
+            title: t(
+              'sys.ai_models.message.update_success',
+              '模型更新成功'
+            ),
+          });
+          exitEdit();
+        },
+        onError: (error: any) => {
+          // 5001 = the row committed but the NPU reload failed: report the
+          // partial success as a warning and drop back to the view (the
+          // refetched row shows the now-unloaded state).
+          if (apiErrorCode(error) === MODEL_LOAD_FAILED_CODE) {
+            toast({
+              title: t(
+                'sys.ai_models.message.update_reload_failed',
+                '更新已保存，但在 NPU 上重新加载失败'
+              ),
+              description: apiErrorText(error),
+              variant: 'warning',
+            });
+            exitEdit();
+            return;
+          }
+          toast({
+            title: t('common.error', '错误'),
+            description: apiErrorText(error),
+            variant: 'destructive',
+          });
+        },
+      }
+    );
+  };
+
+  // Esc / header X while editing intercepts the close: dirty work confirms
+  // before being discarded, and both paths land back in view mode — the
+  // dialog itself only ever closes from view mode.
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (nextOpen) {
+      onOpenChange(true);
+      return;
+    }
+    if (editing) {
+      if (isEditDirty() && !updateMutation.isPending) {
+        setEditConfirmOpen(true);
+        return;
+      }
+      exitEdit();
+      return;
+    }
+    onOpenChange(false);
+  };
+
   // One labelled KV cell of a section grid.
   const item = (
     icon: LucideIcon,
@@ -255,8 +416,14 @@ export default function ModelDetailDialog({
   );
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
+      <DialogContent
+        className={`max-h-[90vh] flex flex-col overflow-hidden ${
+          editing
+            ? 'sm:max-w-4xl sm:h-[90vh] w-full max-w-[calc(100%-1rem)]'
+            : 'sm:max-w-2xl'
+        }`}
+      >
         <DialogHeader className="min-w-0 shrink-0">
           <DialogTitle className="flex items-start gap-2 min-w-0">
             <div className="w-8 h-8 shrink-0 rounded-lg flex items-center justify-center bg-primary/10 text-primary">
@@ -275,6 +442,22 @@ export default function ModelDetailDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {editing && editForm ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <ModelConfigEditor
+              ref={editorRef}
+              form={editForm}
+              onPatch={handleEditPatch}
+              isUpdate
+              modelTypeOptions={modelTypeOptions}
+              initialProfile={editInitialProfileRef.current}
+              outputFormat={classifyOutputFormat(
+                mergedModel.vstream_info ?? ''
+              )}
+              disabled={updateMutation.isPending}
+            />
+          </div>
+        ) : (
         <div className="space-y-5 py-4 flex-1 min-h-0 overflow-y-auto">
           {/* Badges + type description */}
           <div className="space-y-2">
@@ -518,51 +701,91 @@ export default function ModelDetailDialog({
             </>
           )}
         </div>
+        )}
 
         <div className="flex items-center justify-end gap-2 shrink-0">
-          {onLoad
-            && onUnload
-            && (isLoaded ? (
+          {editing ? (
+            <>
+              {onUpdateFile && (
+                <Button
+                  variant="outline"
+                  disabled={updateMutation.isPending}
+                  onClick={() => {
+                    // The wizard is the full-featured path (file replace);
+                    // drop the inline session on the way out.
+                    exitEdit();
+                    onUpdateFile(mergedModel);
+                  }}
+                >
+                  {t('sys.ai_models.detail.action_replace_file', '更换文件')}
+                </Button>
+              )}
               <Button
                 variant="outline"
-                disabled={isActing}
-                onClick={() => setUnloadConfirmOpen(true)}
+                disabled={updateMutation.isPending}
+                onClick={exitEdit}
               >
-                {isActing ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                ) : (
-                  <PowerOff className="w-4 h-4 mr-2" />
-                )}
-                {t('sys.ai_models.action.unload', '卸载')}
+                {t('common.cancel', '取消')}
               </Button>
-            ) : (
-              <Button
-                disabled={isActing}
-                onClick={() => onLoad(mergedModel.model_id)}
-              >
-                {isActing ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                ) : (
-                  <Power className="w-4 h-4 mr-2" />
-                )}
-                {t('sys.ai_models.action.load', '加载')}
+              <Button disabled={updateMutation.isPending} onClick={handleSave}>
+                {updateMutation.isPending
+                  ? t('sys.ai_models.detail.saving', '保存中...')
+                  : t('sys.ai_models.detail.action_save', '保存')}
               </Button>
-            ))}
-          {canExport && (
-            <Button
-              variant="outline"
-              onClick={handleExport}
-              disabled={exportMutation.isPending}
-            >
-              <Download className="w-4 h-4 mr-2" />
-              {exportMutation.isPending
-                ? t('sys.ai_models.detail.exporting', '导出中...')
-                : t('sys.ai_models.detail.export_bin', '导出 .bin')}
-            </Button>
+            </>
+          ) : (
+            <>
+              {onLoad
+                && onUnload
+                && (isLoaded ? (
+                  <Button
+                    variant="outline"
+                    disabled={isActing}
+                    onClick={() => setUnloadConfirmOpen(true)}
+                  >
+                    {isActing ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <PowerOff className="w-4 h-4 mr-2" />
+                    )}
+                    {t('sys.ai_models.action.unload', '卸载')}
+                  </Button>
+                ) : (
+                  <Button
+                    disabled={isActing}
+                    onClick={() => onLoad(mergedModel.model_id)}
+                  >
+                    {isActing ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <Power className="w-4 h-4 mr-2" />
+                    )}
+                    {t('sys.ai_models.action.load', '加载')}
+                  </Button>
+                ))}
+              {canExport && (
+                <Button
+                  variant="outline"
+                  onClick={handleExport}
+                  disabled={exportMutation.isPending}
+                >
+                  <Download className="w-4 h-4 mr-2" />
+                  {exportMutation.isPending
+                    ? t('sys.ai_models.detail.exporting', '导出中...')
+                    : t('sys.ai_models.detail.export_bin', '导出 .bin')}
+                </Button>
+              )}
+              {canEdit && (
+                <Button variant="outline" onClick={handleStartEdit}>
+                  <Pencil className="w-4 h-4 mr-2" />
+                  {t('sys.ai_models.detail.action_edit', '编辑')}
+                </Button>
+              )}
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                {t('common.close', '关闭')}
+              </Button>
+            </>
           )}
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {t('common.close', '关闭')}
-          </Button>
         </div>
       </DialogContent>
 
@@ -593,6 +816,35 @@ export default function ModelDetailDialog({
               }}
             >
               {t('sys.ai_models.action.unload', '卸载')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Edit discard confirmation — guards Esc / header X while editing.
+          "Discard" returns to view mode; the dialog itself stays open. */}
+      <AlertDialog open={editConfirmOpen} onOpenChange={setEditConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t(
+                'sys.ai_models.wizard.close_confirm_title',
+                '放弃未保存的修改？'
+              )}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'sys.ai_models.detail.edit_discard_desc',
+                '未保存的修改将丢失。'
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>
+              {t('sys.ai_models.wizard.close_confirm_keep', '继续编辑')}
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={exitEdit}>
+              {t('sys.ai_models.detail.edit_discard', '放弃修改')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

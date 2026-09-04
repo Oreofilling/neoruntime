@@ -11,6 +11,7 @@ import {
   modelFormIssueText,
   MODEL_ID_PATTERN,
   partitionFields,
+  prefillUpdateForm,
   sanitizeModelId,
   suggestModelId,
   suggestPostprocessProfile,
@@ -636,5 +637,79 @@ describe('suggestPostprocessProfile', () => {
     expect(
       suggestPostprocessProfile(options, 'yolov5m_vehicles_conv21')
     ).toBeNull();
+  });
+});
+
+describe('prefillUpdateForm', () => {
+  it('merges schema defaults, persisted config and promoted columns', () => {
+    // The regression this guards: labels/nms_threshold live only in config,
+    // threshold is promoted to a row column — all three must survive.
+    const form = prefillUpdateForm(
+      {
+        model_id: 'yolov8n-demo',
+        model_type: 'detection',
+        output_mode: 'platform',
+        variant: '',
+        config: JSON.stringify({
+          postprocess_profile: 'yolov8s',
+          nms_threshold: 0.6,
+          labels: 'person,car',
+        }),
+        threshold: 0.3,
+      },
+      detectionFields
+    );
+
+    expect(form.modelId).toBe('yolov8n-demo');
+    expect(form.modelType).toBe('detection');
+    expect(form.outputMode).toBe('platform');
+    expect(form.config.postprocess_profile).toBe('yolov8s');
+    expect(form.config.nms_threshold).toBe(0.6);
+    expect(form.config.labels).toBe('person,car');
+    // The promoted column wins over any config value.
+    expect(form.config.threshold).toBe(0.3);
+    // Fields absent from both config and columns fall back to defaults.
+    expect(form.config.max_detections).toBe(64);
+  });
+
+  it('accepts an already-parsed config object', () => {
+    const form = prefillUpdateForm(
+      {
+        model_id: 'pose',
+        model_type: 'detection',
+        config: { labels: ['a', 'b'] },
+      },
+      detectionFields
+    );
+    expect(form.config.labels).toEqual(['a', 'b']);
+  });
+
+  it('falls back to defaults + columns on corrupt config JSON', () => {
+    const form = prefillUpdateForm(
+      {
+        model_id: 'm',
+        model_type: 'detection',
+        config: '{not json',
+        threshold: 0.42,
+      },
+      detectionFields
+    );
+    expect(form.config.threshold).toBe(0.42);
+    expect(form.config.postprocess_profile).toBe('yolov8n');
+  });
+
+  it('normalizes unknown output modes to platform and missing variant to empty', () => {
+    const form = prefillUpdateForm(
+      { model_id: 'm', model_type: 'detection' },
+      detectionFields
+    );
+    expect(form.outputMode).toBe('platform');
+    expect(form.variant).toBe('');
+
+    const raw = prefillUpdateForm(
+      { model_id: 'm', model_type: 'detection', output_mode: 'raw' },
+      detectionFields
+    );
+    expect(raw.outputMode).toBe('raw');
   });
 });

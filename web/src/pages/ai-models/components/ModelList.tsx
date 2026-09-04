@@ -565,6 +565,7 @@ export default function ModelList({
         onOpenChange={open => !open && setDetailModel(null)}
         onLoad={onLoad}
         onUnload={onUnload}
+        onUpdateFile={onUpdate}
         isActionLoading={isActionLoading}
       />
     </>
