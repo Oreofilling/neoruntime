@@ -11,7 +11,7 @@ hero:
       link: /zh/introduction
     - theme: alt
       text: API 参考
-      link: /zh/api-reference
+      link: /api-reference/zh/
     - theme: alt
       text: English
       link: /

@@ -30,7 +30,7 @@ GitHub Pages is redeployed automatically
 
 ### Build & deploy
 
-On every push to `main` that touches the API surface, the docs, or the workflow itself, `docs-pages.yml` regenerates the bilingual spec JSONs, builds the VitePress site and publishes it to GitHub Pages. Nothing is hand-copied: the English page renders `swagger.json` verbatim and the Chinese page renders `swagger.zh.json`, produced by merging the overlay onto the master spec (untranslated strings fall back to English).
+On every push to `main` that touches the API surface, the docs, or the workflow itself, `docs-pages.yml` regenerates the bilingual spec JSONs, builds the VitePress site and publishes it to GitHub Pages. Nothing is hand-copied: the full-page reference at `/api-reference/` renders `swagger.json` verbatim (English) / `swagger.zh.json` (Chinese), produced by merging the overlay onto the master spec (untranslated strings fall back to English).
 
 ## How to change the API (checklist)
 
@@ -70,5 +70,6 @@ The generated spec files (`public/swagger*.json`) are build artifacts — they a
 | `docs/api/swagger.yaml` | Master OpenAPI spec (source of truth, English). |
 | `docs/web-api/i18n/zh.yaml` | Chinese overlay merged onto the master spec at build time. |
 | `docs/web-api/scripts/build_specs.py` | Validates overlay coverage and generates `public/swagger.json` / `public/swagger.zh.json`. |
-| `docs/web-api/.vitepress/` | Site configuration, theme, Redoc embed component. |
+| `docs/web-api/.vitepress/` | Site configuration and theme. |
+| `docs/web-api/public/api-reference/` | Standalone full-page Redoc reference (EN + zh), following the system colour scheme. |
 | `.github/workflows/docs-pages.yml` | Builds and deploys the site to GitHub Pages on merges to `main`. |

@@ -79,6 +79,6 @@ On the device itself you would use `ws://localhost:8080/api/v1/events/stream?tok
 
 ## 5. Next steps
 
-- The full surface: [API Reference](/api-reference).
+- The full surface: [API Reference](/api-reference/).
 - How passwords can be RSA-encrypted, token lifetime and revocation: [Authentication](/authentication).
 - Business error codes and the response envelope: [Errors & Status Codes](/errors).

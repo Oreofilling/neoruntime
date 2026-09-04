@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API Reference — NeoRuntime Web API</title>
+  <meta name="description" content="Full OpenAPI 3.0 reference for the NeoRuntime platform Web API.">
+  <style>
+    html, body { margin: 0; padding: 0; background: #ffffff; }
+    html.dark, body.dark { background: #171b22; }
+    .top-links {
+      position: fixed; top: 14px; right: 18px; z-index: 1000;
+      display: flex; gap: 14px; align-items: center;
+      font: 500 13px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    .top-links a { color: #0053b3; text-decoration: none; }
+    .top-links a:hover { text-decoration: underline; }
+    html.dark .top-links a { color: #6cb2ff; }
+    /* Dark-mode fixes for the few hardcoded-light styles Redoc renders
+       inside spec descriptions (markdown tables, chips, selected tabs). */
+    html.dark table tr { background-color: #1a212c !important; }
+    html.dark td, html.dark th { border-color: #2c3442 !important; }
+    html.dark .react-tabs__tab--selected { color: #e3e8f0 !important; background: #1a212c !important; }
+  </style>
+</head>
+<body>
+  <nav class="top-links">
+    <a href="zh/">中文</a>
+    <a href="../">&#8592; Back to guides</a>
+  </nav>
+  <div id="redoc-container"></div>
+  <script src="../redoc.standalone.js"></script>
+  <script>
+    var SPEC_URL = '../swagger.json'
+
+    function theme(dark) {
+      if (!dark) {
+        return {
+          colors: { primary: { main: '#0053b3' } },
+          typography: { fontSize: '15px', lineHeight: '1.6em' },
+        }
+      }
+      return {
+        colors: {
+          tonalOffset: 0.05,
+          primary: { main: '#6cb2ff' },
+          text: { primary: '#e3e8f0', secondary: '#9fb0c3' },
+          border: { light: '#2c3442', dark: '#1f2632' },
+          gray: { 50: '#1a212c', 100: '#141a24' },
+        },
+        typography: {
+          fontSize: '15px',
+          lineHeight: '1.6em',
+          code: { color: '#e3e8f0', backgroundColor: '#1a212c' },
+          links: { color: '#6cb2ff', visited: '#6cb2ff', hover: '#9ccaff' },
+        },
+        sidebar: {
+          backgroundColor: 'transparent',
+          textColor: '#c3cede',
+          activeTextColor: '#ffffff',
+          groupItems: { activeBackgroundColor: '#242e3c', activeTextColor: '#ffffff' },
+          level1Items: { activeBackgroundColor: '#242e3c', activeTextColor: '#ffffff' },
+          arrow: { color: '#8fa1b5' },
+        },
+        rightPanel: { backgroundColor: '#11161e', textColor: '#dfe6ef' },
+        codeBlock: { backgroundColor: '#11161e' },
+        schema: {
+          linesColor: '#2c3442',
+          nestedBackground: '#181f29',
+          typeNameColor: '#8cc4ff',
+          typeTitleColor: '#9fb0c3',
+          requireLabelColor: '#e5776b',
+          arrow: { color: '#8fa1b5' },
+        },
+        fab: { backgroundColor: '#242e3c', color: '#e3e8f0' },
+      }
+    }
+
+    var mq = window.matchMedia('(prefers-color-scheme: dark)')
+
+    function render(spec) {
+      var dark = mq.matches
+      document.documentElement.classList.toggle('dark', dark)
+      document.body.classList.toggle('dark', dark)
+      var container = document.getElementById('redoc-container')
+      container.innerHTML = ''
+      Redoc.init(spec, {
+        hideDownloadButton: true,
+        pathInMiddlePanel: true,
+        jsonSampleExpandLevel: 2,
+        showObjectSchemaExamples: true,
+        lazyRendering: true,
+        theme: theme(dark),
+      }, container)
+    }
+
+    fetch(SPEC_URL)
+      .then(function (r) { return r.json() })
+      .then(function (spec) {
+        render(spec)
+        if (mq.addEventListener) mq.addEventListener('change', function () { render(spec) })
+      })
+      .catch(function (e) {
+        document.getElementById('redoc-container').innerHTML =
+          '<p style="padding:32px;font-family:sans-serif">Failed to load ' + SPEC_URL + ': ' + e + '</p>'
+      })
+  </script>
+</body>
+</html>

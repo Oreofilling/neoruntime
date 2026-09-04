@@ -50,7 +50,7 @@ Codes are grouped by thousand-bands; the groups are stable, individual codes are
 | `9xxx` | SSH errors | `9000` config error · `9001` service error |
 | `10xxx` | Process errors | `10000` process not found · `10001` kill failed |
 
-The authoritative list lives in `platform/platform-api/handlers/response.go`; the per-operation documentation in the [API Reference](/api-reference) spells out the success responses, and the 400/401 behaviour described here applies to every write endpoint even where not repeated per operation.
+The authoritative list lives in `platform/platform-api/handlers/response.go`; the per-operation documentation in the [API Reference](/api-reference/) spells out the success responses, and the 400/401 behaviour described here applies to every write endpoint even where not repeated per operation.
 
 ## Example: validation failure
 

@@ -79,6 +79,6 @@ ws.onmessage = (ev) => console.log(JSON.parse(ev.data))
 
 ## 5. 接下来
 
-- 完整接口清单：[API 参考](/zh/api-reference)。
+- 完整接口清单：[API 参考](/api-reference/zh/)。
 - 密码 RSA 加密、令牌生命周期与吊销：[认证](/zh/authentication)。
 - 业务错误码与响应信封：[错误与状态码](/zh/errors)。

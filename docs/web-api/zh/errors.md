@@ -50,7 +50,7 @@ HTTP 状态是粗粒度信号，业务 `code` 才是精确信号：
 | `9xxx` | SSH 错误 | `9000` 配置错误 · `9001` 服务错误 |
 | `10xxx` | 进程错误 | `10000` 进程不存在 · `10001` 终止失败 |
 
-权威列表位于 `platform/platform-api/handlers/response.go`；[API 参考](/zh/api-reference)中各操作文档只描述成功响应，本文所述的 400/401 行为适用于每个写接口，即使未逐一标注。
+权威列表位于 `platform/platform-api/handlers/response.go`；[API 参考](/api-reference/zh/)中各操作文档只描述成功响应，本文所述的 400/401 行为适用于每个写接口，即使未逐一标注。
 
 ## 示例：校验失败
 

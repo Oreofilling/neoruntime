@@ -11,7 +11,7 @@ hero:
       link: /introduction
     - theme: alt
       text: API Reference
-      link: /api-reference
+      link: /api-reference/
     - theme: alt
       text: 简体中文
       link: /zh/

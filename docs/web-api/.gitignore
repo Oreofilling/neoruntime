@@ -3,3 +3,4 @@ node_modules/
 .vitepress/cache/
 public/swagger.json
 public/swagger.zh.json
+public/redoc.standalone.js

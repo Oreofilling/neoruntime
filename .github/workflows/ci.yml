@@ -111,8 +111,7 @@ jobs:
           python-version: '3.12'
       - name: Install PyYAML
         run: pip install pyyaml
-      - name: Generate bilingual API specs (gates zh translation coverage)
-        run: python3 scripts/build_specs.py
-      - run: pnpm install --frozen-lockfile
-      - name: Build site
-        run: pnpm exec vitepress build
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate specs (gates zh coverage) and build site
+        run: pnpm build

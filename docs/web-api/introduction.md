@@ -16,7 +16,7 @@ WebSocket endpoints follow the same rule: use `wss://{host}/api/v1/...` remotely
 
 ## Surface areas
 
-The API is organised into the following functional groups (tags in the [API Reference](/api-reference)):
+The API is organised into the following functional groups (tags in the [API Reference](/api-reference/)):
 
 - **System** — platform info, health, restart, OTA firmware updates, OS (A/B) upgrades, time/NTP configuration.
 - **AI Runtime** — model registration/upload/parse, load/unload, per-model app usage, AI statistics.

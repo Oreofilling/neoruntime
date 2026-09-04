@@ -48,14 +48,11 @@ jobs:
       - name: Install PyYAML
         run: pip install pyyaml
 
-      - name: Generate bilingual API specs (also gates zh translation coverage)
-        run: python3 scripts/build_specs.py
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build VitePress site
-        run: pnpm exec vitepress build
+      - name: Generate specs (gates zh coverage) and build site
+        run: pnpm build
 
       - uses: actions/upload-pages-artifact@v3
         with:

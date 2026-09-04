@@ -10,7 +10,7 @@ const guideEn = [
   { text: 'Quickstart', link: '/quickstart' },
   { text: 'Authentication', link: '/authentication' },
   { text: 'Errors & Status Codes', link: '/errors' },
-  { text: 'API Reference', link: '/api-reference' },
+  { text: 'API Reference', link: '/api-reference/' },
   { text: 'Keeping Docs in Sync', link: '/update-mechanism' },
 ]
 
@@ -19,7 +19,7 @@ const guideZh = [
   { text: '快速开始', link: '/zh/quickstart' },
   { text: '认证', link: '/zh/authentication' },
   { text: '错误与状态码', link: '/zh/errors' },
-  { text: 'API 参考', link: '/zh/api-reference' },
+  { text: 'API 参考', link: '/api-reference/zh/' },
   { text: '文档同步机制', link: '/zh/update-mechanism' },
 ]
 

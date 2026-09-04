@@ -30,7 +30,7 @@ GitHub Pages 自动重新部署
 
 ### 构建与部署
 
-每当 `main` 上有触及 API 面、文档或工作流本身的推送，`docs-pages.yml` 会重新生成双语规范 JSON、构建 VitePress 站点并发布到 GitHub Pages。没有任何手工拷贝：英文页直接渲染 `swagger.json`，中文页渲染由 overlay 合并到主规范生成的 `swagger.zh.json`（未翻译的字符串自动回退英文）。
+每当 `main` 上有触及 API 面、文档或工作流本身的推送，`docs-pages.yml` 会重新生成双语规范 JSON、构建 VitePress 站点并发布到 GitHub Pages。没有任何手工拷贝：`/api-reference/` 全屏参考页直接渲染 `swagger.json`（英文）与 overlay 合并生成的 `swagger.zh.json`（中文）（未翻译的字符串自动回退英文）。
 
 ## 修改 API 的检查清单
 
@@ -70,5 +70,6 @@ pnpm dev        # 重新生成规范 + 启动带热更新的 VitePress
 | `docs/api/swagger.yaml` | 主 OpenAPI 规范（事实来源，英文）。 |
 | `docs/web-api/i18n/zh.yaml` | 构建时合并到主规范的中文 overlay。 |
 | `docs/web-api/scripts/build_specs.py` | 校验翻译覆盖率并生成 `public/swagger.json` / `public/swagger.zh.json`。 |
-| `docs/web-api/.vitepress/` | 站点配置、主题、Redoc 嵌入组件。 |
+| `docs/web-api/.vitepress/` | 站点配置与主题。 |
+| `docs/web-api/public/api-reference/` | 独立全屏 Redoc 参考页（中英），跟随系统深浅色。 |
 | `.github/workflows/docs-pages.yml` | 合并到 `main` 后构建并部署站点到 GitHub Pages。 |
