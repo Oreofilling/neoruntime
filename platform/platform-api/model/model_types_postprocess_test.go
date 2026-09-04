@@ -50,9 +50,29 @@ func TestDetectionFieldsIncludePostprocessControls(t *testing.T) {
 		t.Fatalf("postprocess_profile options = %d, want %d", len(profile.Options), len(DetectionPostprocessProfiles))
 	}
 	for _, opt := range profile.Options {
-		if _, ok := LookupDetectionProfile(opt.Value); !ok {
+		p, ok := LookupDetectionProfile(opt.Value)
+		if !ok {
 			t.Fatalf("option %q not present in DetectionPostprocessProfiles", opt.Value)
 		}
+		if opt.Custom != p.Custom {
+			t.Fatalf("option %q custom = %v, want %v (flag must propagate)", opt.Value, opt.Custom, p.Custom)
+		}
+	}
+
+	// The customer-specific basename is the only custom entry: it stays
+	// selectable (load-time resolution is unchanged) but the generic UI
+	// hides it unless it is already the active value.
+	customCount := 0
+	for _, opt := range profile.Options {
+		if opt.Custom {
+			customCount++
+			if opt.Value != "yolov5m_vehicles" {
+				t.Fatalf("unexpected custom option %q", opt.Value)
+			}
+		}
+	}
+	if customCount != 1 {
+		t.Fatalf("custom options = %d, want exactly 1 (yolov5m_vehicles)", customCount)
 	}
 
 	if labels == nil {

@@ -12,8 +12,10 @@ import {
   MODEL_ID_PATTERN,
   partitionFields,
   sanitizeModelId,
+  suggestPostprocessProfile,
   validateModelForm,
   variantFormIssue,
+  visibleSelectOptions,
   type ModelImportFormState,
   type ValidateModelFormCtx,
 } from './modelImportFlow';
@@ -523,5 +525,72 @@ describe('validateModelForm', () => {
       'outputMode',
       'config_threshold',
     ]);
+  });
+});
+
+describe('visibleSelectOptions', () => {
+  const options = [
+    { value: 'hailo_yolov8n_384_640', label: 'YOLOv8n 384x640 (default)' },
+    { value: 'hailo_yolov8s_384_640', label: 'YOLOv8s 384x640' },
+    {
+      value: 'yolov5m_vehicles',
+      label: 'YOLOv5m Vehicles 1920x1080',
+      custom: true,
+    },
+  ];
+
+  it('hides custom options that are not the active value', () => {
+    expect(visibleSelectOptions(options, 'hailo_yolov8n_384_640')).toEqual(
+      options.slice(0, 2)
+    );
+  });
+
+  it('keeps the custom option when it is the active value', () => {
+    expect(visibleSelectOptions(options, 'yolov5m_vehicles')).toEqual(options);
+  });
+
+  it('treats an undefined current value as nothing selected', () => {
+    expect(visibleSelectOptions(options, undefined)).toEqual(
+      options.slice(0, 2)
+    );
+  });
+});
+
+describe('suggestPostprocessProfile', () => {
+  const options = [
+    { value: 'hailo_yolov8n_384_640' },
+    { value: 'hailo_yolov8s_384_640' },
+    { value: 'yolov5m_vehicles', custom: true },
+  ];
+
+  it('matches a basename prefix in the vstream tensor names', () => {
+    expect(
+      suggestPostprocessProfile(
+        options,
+        'hailo_yolov8s_384_640/yolov8_nms_postprocess'
+      )
+    ).toBe('hailo_yolov8s_384_640');
+  });
+
+  it('matches the deployment-specific basename, surfacing the custom option', () => {
+    expect(
+      suggestPostprocessProfile(
+        options,
+        'yolov5m_vehicles/yolov5_nms_postprocess'
+      )
+    ).toBe('yolov5m_vehicles');
+  });
+
+  it('returns null without a prefix match or vstream info', () => {
+    expect(suggestPostprocessProfile(options, 'conv21/conv22')).toBeNull();
+    expect(suggestPostprocessProfile(options, undefined)).toBeNull();
+    expect(suggestPostprocessProfile(options, '')).toBeNull();
+  });
+
+  it('does not match a basename appearing outside a tensor-name prefix', () => {
+    // substring without the separating slash must not count as a match
+    expect(
+      suggestPostprocessProfile(options, 'yolov5m_vehicles_conv21')
+    ).toBeNull();
   });
 });

@@ -31,6 +31,7 @@ import {
   modelFormIssueText,
   partitionFields,
   sanitizeModelId,
+  suggestPostprocessProfile,
   validateModelForm,
   variantFormIssue,
   type ModelImportFormState,
@@ -364,6 +365,24 @@ export default function ImportModelDialog({
         const configDefaults = typeOpt
           ? fieldDefaultToState(typeOpt.fields)
           : {};
+        // A tensor-name prefix match means this file IS that profile's
+        // model (standard or custom); package metadata, when present,
+        // still wins. This is also what surfaces a custom option in the
+        // dropdown, which hides custom entries that are not active.
+        const profileField = typeOpt?.fields.find(
+          f => f.key === 'postprocess_profile'
+        );
+        const suggestedProfile = suggestPostprocessProfile(
+          profileField?.options ?? [],
+          result.vstream_info
+        );
+        const seededConfig = { ...configDefaults, ...(pkg?.config ?? {}) };
+        if (
+          suggestedProfile !== null
+          && pkg?.config?.postprocess_profile === undefined
+        ) {
+          seededConfig.postprocess_profile = suggestedProfile;
+        }
 
         setForm(prev => ({
           // Update mode: the model_id is fixed — a swapped file must not
@@ -382,7 +401,7 @@ export default function ImportModelDialog({
           // detection HEFs to raw).
           outputMode: pkg?.output_mode === 'raw' ? 'raw' : 'platform',
           variant: '',
-          config: { ...configDefaults, ...(pkg?.config ?? {}) },
+          config: seededConfig,
         }));
       },
       onError: (error: any) => {

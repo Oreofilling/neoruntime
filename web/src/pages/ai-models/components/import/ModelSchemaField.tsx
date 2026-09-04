@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import type { ModelFieldDef } from '@/hooks/useModels';
+import { visibleSelectOptions } from '../../lib/modelImportFlow';
 
 export interface ModelSchemaFieldProps {
   field: ModelFieldDef;
@@ -100,7 +101,7 @@ export default function ModelSchemaField({
               />
             </SelectTrigger>
             <SelectContent>
-              {(field.options ?? []).map(opt => (
+              {visibleSelectOptions(field.options ?? [], value).map(opt => (
                 <SelectItem key={opt.value} value={opt.value}>
                   {t(`sys.ai_models.form.${field.key}_${opt.value}`, opt.label)}
                 </SelectItem>

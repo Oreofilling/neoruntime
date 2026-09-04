@@ -132,7 +132,7 @@ export interface ModelFieldDef {
   min?: number;
   max?: number;
   step?: number;
-  options?: { value: string; label: string }[];
+  options?: { value: string; label: string; custom?: boolean }[];
 }
 
 export interface ModelTypeDef {

@@ -68,7 +68,9 @@ export default function AIModels() {
   const [updateTarget, setUpdateTarget] = useState<any | null>(null);
   // Concurrent load/unload requests each pin their model here; the pages
   // consume it as an isActionLoading(id) predicate.
-  const [loadingActions, setLoadingActions] = useState<Set<string>>(() => new Set());
+  const [loadingActions, setLoadingActions] = useState<Set<string>>(
+    () => new Set()
+  );
   const [scanning, setScanning] = useState(false);
 
   const { data: models = [], isLoading, error, refetch } = useModels();

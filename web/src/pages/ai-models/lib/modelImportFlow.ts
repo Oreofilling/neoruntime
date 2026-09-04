@@ -214,6 +214,35 @@ export function backendFunctionForProfile(profile: string): string {
   return 'hailo_yolov8n';
 }
 
+/** Select options a schema field should render. Deployment-specific
+ * ("custom") options — e.g. a customer-trained model verified against this
+ * plugin build — surface only when they are already the active value
+ * (auto-suggested from the parsed HEF, or loaded from the row being
+ * updated); users without that deployment's model never see them. */
+export function visibleSelectOptions<
+  T extends { value: string; custom?: boolean },
+>(options: T[], currentValue: unknown): T[] {
+  const current = currentValue === undefined ? '' : String(currentValue);
+  return options.filter(o => !o.custom || o.value === current);
+}
+
+/** Suggest a postprocess profile from the parsed HEF's vstream info: NMS
+ * tensor names are <HEF basename>/…_nms_postprocess, so a schema option
+ * whose value appears as a tensor-name prefix means this file IS that
+ * profile's model. This is also what surfaces a custom option on a fresh
+ * plain-HEF import — the dropdown hides custom entries that are not the
+ * active value. Package metadata, when present, still wins. */
+export function suggestPostprocessProfile(
+  options: { value: string }[],
+  vstreamInfo?: string
+): string | null {
+  if (!vstreamInfo) return null;
+  for (const o of options) {
+    if (vstreamInfo.includes(`${o.value}/`)) return o.value;
+  }
+  return null;
+}
+
 export function fieldDefaultToState(
   fields: ModelFieldDef[]
 ): Record<string, unknown> {

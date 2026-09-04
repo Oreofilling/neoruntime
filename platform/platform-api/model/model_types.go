@@ -13,9 +13,13 @@ const (
 )
 
 // FieldOption defines a selectable option for FieldTypeSelect fields.
+// Custom marks deployment-specific entries (e.g. a customer-trained model
+// verified against this plugin build): the standard UI hides them unless
+// they are already the active value, so generic users never see them.
 type FieldOption struct {
-	Value string `json:"value"`
-	Label string `json:"label"`
+	Value  string `json:"value"`
+	Label  string `json:"label"`
+	Custom bool   `json:"custom,omitempty"`
 }
 
 // ModelFieldDef describes a single configuration field for a model type.
@@ -90,6 +94,7 @@ type DetectionPostprocessProfile struct {
 	Basename        string // HEF filename without extension
 	BackendFunction string // plugin backend function for this basename
 	Label           string // human-readable label for the wizard dropdown
+	Custom          bool   // deployment-specific entry; UI hides it unless active
 }
 
 // DefaultDetectionProfile is the zero-config profile: the plugin's default
@@ -110,7 +115,10 @@ var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
 	// never matches (fire-smoke signature). Device-verified 2026-09-02:
 	// output decodes exactly like the hand-decoded NMS blob, but the label
 	// table is baked ("car") and ignores the JSON labels.
-	{Basename: "yolov5m_vehicles", BackendFunction: "yolov5m_vehicles", Label: "YOLOv5m Vehicles 1920x1080"},
+	// Custom: the wizard suggests it from the parsed vstream info and the
+	// dropdown only surfaces it then (or when updating such a row) — it is
+	// invisible to users without this deployment's HEF.
+	{Basename: "yolov5m_vehicles", BackendFunction: "yolov5m_vehicles", Label: "YOLOv5m Vehicles 1920x1080", Custom: true},
 }
 
 // LookupDetectionProfile returns the profile for a basename; ok is false for
@@ -140,7 +148,7 @@ func LookupDetectionBackendFunction(fn string) (DetectionPostprocessProfile, boo
 func detectionProfileOptions() []FieldOption {
 	opts := make([]FieldOption, 0, len(DetectionPostprocessProfiles))
 	for _, p := range DetectionPostprocessProfiles {
-		opts = append(opts, FieldOption{Value: p.Basename, Label: p.Label})
+		opts = append(opts, FieldOption{Value: p.Basename, Label: p.Label, Custom: p.Custom})
 	}
 	return opts
 }
