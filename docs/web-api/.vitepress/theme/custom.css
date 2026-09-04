@@ -1,9 +1,4 @@
-/* Let the Redoc canvas breathe inside the VitePress content column. */
-.api-reference {
-  margin-top: 8px;
-}
-
-/* Redoc renders its own max-width container; align it with the docs page. */
-.api-reference redoc {
-  display: block;
-}
+/* The API reference page renders via components/ApiReference.vue on a
+   `layout: page` markdown page, outside the .vp-doc container, so VitePress
+   typography cannot clash with Redoc's own styles. Page-level styling lives
+   in the component; nothing global is needed here. */
