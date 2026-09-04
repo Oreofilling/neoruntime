@@ -1,29 +1,26 @@
 /* NeoRuntime docs identity — a cyan/teal accent that stands apart from both
    the Starlight default violet and the VitePress-green family used by other
-   project docs. Starlight exposes its palette as --sl-color-* custom
-   properties; overriding a small core set re-themes the whole site. */
+   project docs.
+
+   IMPORTANT: only override the accent scale here. Starlight's palette
+   anchors (--sl-color-white/--sl-color-black and the gray ramp) are theme
+   swappers — their values flip meaning between light and dark mode and are
+   derived into backgrounds, text, and borders everywhere. Overriding them
+   corrupts both modes (dark-on-dark text in light mode, etc.). */
 
 :root {
   --sl-color-accent: #0e7490;
-  --sl-color-accent-high: #0c637b;
-  --sl-color-accent-low: #d3f1f8;
-  --sl-color-accent-text: #053745;
-  --sl-color-white: #052e3a;
-  --sl-color-gray-6: #eaf6f9;
-  --sl-color-black: #06222b;
+  --sl-color-accent-high: #0a5c73;
+  --sl-color-accent-low: #d2eef6;
 }
 
 :root[data-theme='dark'] {
-  --sl-color-accent: #3fd4e8;
+  --sl-color-accent: #45d3e8;
   --sl-color-accent-high: #7ce3f1;
-  --sl-color-accent-low: #0e3742;
-  --sl-color-accent-text: #032b34;
-  --sl-color-black: #e9fbff;
-  --sl-color-gray-6: #0b2830;
-  --sl-color-white: #06222b;
+  --sl-color-accent-low: #10333d;
 }
 
-/* Slightly rounder cards and hero to soften the docs look. */
+/* Accent gradient for the splash hero. */
 .sl-splash {
-  --sl-gradient-accent: linear-gradient(315deg, #0e7490 0%, #3fd4e8 100%);
+  --sl-gradient-accent: linear-gradient(315deg, #0e7490 0%, #45d3e8 100%);
 }
