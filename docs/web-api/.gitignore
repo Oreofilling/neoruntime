@@ -4,4 +4,5 @@ dist/
 public/swagger.json
 public/swagger.zh.json
 public/redoc.standalone.js
+project/
 src/content/docs/project/
