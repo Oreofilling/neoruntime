@@ -105,7 +105,7 @@ paths:
   /system/info:
     get:
       summary: 获取系统信息
-      description: 返回平台版本与服务可用性状态
+      description: 返回平台版本与各平台服务（ai-runtime、event-bus、device-control、app-manager）的可用性标志
   /system/stats:
     get:
       summary: 获取系统统计信息

@@ -97,7 +97,7 @@ paths:
       tags:
       - System
       summary: Get system information
-      description: Returns platform version and service availability status
+      description: Returns the platform version and the availability flag of each platform service (ai-runtime, event-bus, device-control, app-manager)
       operationId: getSystemInfo
       responses:
         '200':
