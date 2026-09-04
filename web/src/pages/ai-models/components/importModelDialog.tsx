@@ -434,6 +434,10 @@ export default function ImportModelDialog({
   };
 
   const handleSectionChange = (id: string) => {
+    // "Take me to that page": a nav click leaves the read-only JSON
+    // projection — without this the pane stays on JsonPreviewPane and the
+    // click looks dead (nothing to flush here, unlike apps' YAML view).
+    setView('form');
     setActiveSection(id as SectionId);
   };
 
@@ -531,7 +535,7 @@ export default function ImportModelDialog({
         title: modelFormIssueText(issues[0], t),
         variant: 'destructive',
       });
-      setActiveSection(issues[0].section);
+      handleSectionChange(issues[0].section);
       return;
     }
 
