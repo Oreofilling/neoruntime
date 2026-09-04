@@ -38,6 +38,7 @@ import {
 } from 'lucide-react';
 import { getModelTypeLabel, getModelTypeDescription } from '../utils';
 import { getModelIcon } from '../modelIcons';
+import TensorTable from './TensorTable';
 
 interface ModelData {
   model_id: string;
@@ -95,15 +96,6 @@ const formatFileSize = (bytes: number | undefined): string => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-};
-
-const formatIoSummary = (io: unknown): string => {
-  if (!io) return '-';
-  if (Array.isArray(io)) return `${io.length}`;
-  if (typeof io === 'object') {
-    return `${Object.keys(io as Record<string, unknown>).length}`;
-  }
-  return '-';
 };
 
 const hasNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -362,6 +354,12 @@ export default function ModelDetailDialog({
             </>
           )}
 
+          {/* 模型接口：输入/输出张量（无张量数据时整节隐藏） */}
+          <TensorTable
+            inputs={mergedModel.inputs}
+            outputs={mergedModel.outputs}
+          />
+
           {/* 运行状态 */}
           {section(
             t('sys.ai_models.detail.section_runtime', '运行状态'),
@@ -397,20 +395,6 @@ export default function ModelDetailDialog({
                   HardDrive,
                   t('sys.ai_models.detail.estimated_memory', '预估内存'),
                   `${mergedModel.estimated_memory}`
-                )}
-              {mergedModel.inputs !== null
-                && mergedModel.inputs !== undefined
-                && item(
-                  ExternalLink,
-                  t('sys.ai_models.detail.inputs', '输入'),
-                  formatIoSummary(mergedModel.inputs)
-                )}
-              {mergedModel.outputs !== null
-                && mergedModel.outputs !== undefined
-                && item(
-                  ExternalLink,
-                  t('sys.ai_models.detail.outputs', '输出'),
-                  formatIoSummary(mergedModel.outputs)
                 )}
             </>
           )}

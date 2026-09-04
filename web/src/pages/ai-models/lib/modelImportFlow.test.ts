@@ -12,6 +12,7 @@ import {
   MODEL_ID_PATTERN,
   partitionFields,
   sanitizeModelId,
+  suggestModelId,
   suggestPostprocessProfile,
   validateModelForm,
   variantFormIssue,
@@ -77,6 +78,49 @@ describe('sanitizeModelId', () => {
     ['', ''],
   ])('sanitizeModelId(%j) → %j', (input, expected) => {
     expect(sanitizeModelId(input)).toBe(expected);
+  });
+});
+
+describe('suggestModelId', () => {
+  it('prefers the AMPK package model_id over everything', () => {
+    expect(suggestModelId('pkg-id', 'yolov8n', 'file.hef')).toBe('pkg-id');
+  });
+
+  it('uses a distinctive network name when no package id exists', () => {
+    expect(suggestModelId(undefined, 'fire_smoke_net', 'f.hef')).toBe(
+      'fire_smoke_net'
+    );
+  });
+
+  it.each(['model', 'network', 'net', 'Model', 'NETWORK'])(
+    'falls back to the file stem for generic network name %j',
+    generic => {
+      expect(suggestModelId(undefined, generic, 'my_detector_v2.hef')).toBe(
+        'my_detector_v2'
+      );
+    }
+  );
+
+  it('trims whitespace before judging the network name', () => {
+    expect(suggestModelId(undefined, '  net  ', 'x.hef')).toBe('x');
+    expect(suggestModelId(undefined, '  yolov8n  ', 'x.hef')).toBe('yolov8n');
+  });
+
+  it('returns the file stem when nothing else is known', () => {
+    expect(suggestModelId(undefined, undefined, 'detector.hef')).toBe(
+      'detector'
+    );
+  });
+
+  it('yields empty for a truly empty input triple', () => {
+    expect(suggestModelId(undefined, undefined, undefined)).toBe('');
+    expect(suggestModelId(undefined, '', '')).toBe('');
+  });
+
+  it('strips only the last extension from the file stem', () => {
+    expect(suggestModelId(undefined, 'net', 'archive.tar.hef')).toBe(
+      'archive.tar'
+    );
   });
 });
 

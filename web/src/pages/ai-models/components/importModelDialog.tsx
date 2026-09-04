@@ -7,18 +7,30 @@ import {
   useParseModel,
   useRegisterModelV2,
   useUpdateModel,
+  useLoadModel,
   useModels,
   type ModelTypeDef,
 } from '@/hooks/useModels';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogTitle,
 } from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { aiApi } from '@/services/api';
 import SectionNav from '@/pages/apps/components/import/SectionNav';
 import {
@@ -32,18 +44,25 @@ import {
   partitionFields,
   sanitizeModelId,
   suggestPostprocessProfile,
+  suggestModelId,
   validateModelForm,
   variantFormIssue,
   type ModelImportFormState,
   type ModelImportSectionId as SectionId,
   type ModelParseResult,
 } from '../lib/modelImportFlow';
+import {
+  apiErrorText,
+  apiErrorCode,
+  MODEL_LOAD_FAILED_CODE,
+} from '../lib/apiErrors';
 import SourceModelForm from './import/SourceModelForm';
 import BasicInfoSection from './import/BasicInfoSection';
 import OutputSection from './import/OutputSection';
 import AdvancedVariantSection from './import/AdvancedVariantSection';
 import FormJsonSwitch, { type ModelFormView } from './import/FormJsonSwitch';
 import JsonPreviewPane from './import/JsonPreviewPane';
+import WizardStepper from './import/WizardStepper';
 
 /** Existing-model shape needed to prefill the update mode. */
 interface UpdateTargetModel {
@@ -93,6 +112,14 @@ export default function ImportModelDialog({
   const isUpdate = mode === 'update';
 
   const cancelRequestedRef = useRef(false);
+  // Upload-abort marker. cancelRequestedRef is cleared by the render-time
+  // reset while the dialog stays open, which would race a late onSuccess —
+  // this one survives until the next file pick, so a parse that lands after
+  // an abort still abandons its staged blob.
+  const uploadCancelRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
+  // null = idle; 0-99 = uploading; 100 = body sent, server parsing.
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   const [screen, setScreen] = useState<Screen>('source');
   const [activeSection, setActiveSection] = useState<SectionId>('basic_info');
@@ -107,12 +134,22 @@ export default function ImportModelDialog({
   const [touched, setTouched] = useState<Record<string, boolean>>({});
   // Update mode: profile as loaded, to hint when the selection changes.
   const initialProfileRef = useRef<string | null>(null);
+  // Update mode: form as prefilled from the existing row, to detect edits an
+  // accidental close would discard.
+  const initialFormRef = useRef<ModelImportFormState | null>(null);
+  // Esc / header-close confirmation when unsaved work exists.
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
   const { data: capabilities } = useCapabilities();
   const { data: existingModels = [], isSuccess: modelsReady } = useModels();
   const parseMutation = useParseModel();
   const registerMutation = useRegisterModelV2();
   const updateMutation = useUpdateModel();
+  const loadMutation = useLoadModel();
+
+  // Create mode: optionally chain a load right after a successful register,
+  // so the model is inference-ready without a second round-trip.
+  const [loadAfterRegister, setLoadAfterRegister] = useState(false);
 
   // 每次重新打开对话框时，重置取消标记，避免新一轮上传被当作“已取消”而丢弃 parseResult
   if (open && cancelRequestedRef.current) {
@@ -227,13 +264,15 @@ export default function ImportModelDialog({
     const rawProfile = config.postprocess_profile;
     const initialProfile = typeof rawProfile === 'string' ? rawProfile : null;
     initialProfileRef.current = initialProfile;
-    setForm({
+    const prefilled: ModelImportFormState = {
       modelId: model.model_id,
       modelType: model.model_type ?? '',
       outputMode: model.output_mode === 'raw' ? 'raw' : 'platform',
       variant: model.variant ?? '',
       config,
-    });
+    };
+    initialFormRef.current = prefilled;
+    setForm(prefilled);
   }, [open, isUpdate, model, modelTypeOptions]);
 
   const isLoading =    parseMutation.isPending
@@ -312,6 +351,55 @@ export default function ImportModelDialog({
     && form.config.postprocess_profile !== undefined
     && form.config.postprocess_profile !== initialProfileRef.current;
 
+  // Work an accidental close (Esc / header X) would discard: a staged file,
+  // or configure-screen edits that diverge from the prefilled row. A clean
+  // source screen closes without prompting.
+  const isDirty = useMemo(() => {
+    if (parseResult) return true;
+    if (screen !== 'configure') return false;
+    const initial = initialFormRef.current;
+    if (!initial) return true;
+    return (
+      form.modelId !== initial.modelId
+      || form.modelType !== initial.modelType
+      || form.outputMode !== initial.outputMode
+      || form.variant !== initial.variant
+      || JSON.stringify(form.config) !== JSON.stringify(initial.config)
+    );
+  }, [parseResult, screen, form]);
+
+  // Where the user is between upload → parse → configure. Parse is a server
+  // step surfaced through its own chip; in update mode it is optional (a
+  // metadata-only edit skips it).
+  const parsePending = parseMutation.isPending || uploadProgress !== null;
+  const stepperSteps = useMemo(
+    () => [
+      {
+        label: t('sys.ai_models.wizard.step_upload', 'Upload'),
+        status:
+          screen === 'source' && !parseResult
+            ? ('active' as const)
+            : ('done' as const),
+      },
+      {
+        label: t('sys.ai_models.wizard.step_parse', 'Parse'),
+        status: parseResult
+          ? ('done' as const)
+          : parsePending
+            ? ('active' as const)
+            : isUpdate
+              ? ('optional' as const)
+              : ('upcoming' as const),
+      },
+      {
+        label: t('sys.ai_models.wizard.step_configure', 'Configure'),
+        status:
+          screen === 'configure' ? ('active' as const) : ('upcoming' as const),
+      },
+    ],
+    [t, screen, parseResult, parsePending, isUpdate]
+  );
+
   const { basic: basicFields, postprocess: postprocessFields } = useMemo(
     () => partitionFields(currentFields),
     [currentFields]
@@ -348,73 +436,106 @@ export default function ImportModelDialog({
     const formData = new FormData();
     formData.append('model', next);
 
-    parseMutation.mutate(formData, {
-      onSuccess: (data: any) => {
-        const result = data as ModelParseResult;
-        if (cancelRequestedRef.current) {
-          abandonStagedFiles([result]);
-          return;
-        }
-        setParseResult(result);
+    // Fresh attempt: the abort marker belongs to the previous upload.
+    uploadCancelRef.current = false;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setUploadProgress(0);
 
-        // AMPK packages carry their registration metadata; the prefill lets
-        // the user confirm/adjust instead of re-entering everything.
-        const pkg = result.package;
-        const suggestedType = pkg?.model_type || result.suggested_type || '';
-        const typeOpt = modelTypeOptions.find(o => o.value === suggestedType);
-        const configDefaults = typeOpt
-          ? fieldDefaultToState(typeOpt.fields)
-          : {};
-        // A tensor-name prefix match means this file IS that profile's
-        // model (standard or custom); package metadata, when present,
-        // still wins. This is also what surfaces a custom option in the
-        // dropdown, which hides custom entries that are not active.
-        const profileField = typeOpt?.fields.find(
-          f => f.key === 'postprocess_profile'
-        );
-        const suggestedProfile = suggestPostprocessProfile(
-          profileField?.options ?? [],
-          result.vstream_info
-        );
-        const seededConfig = { ...configDefaults, ...(pkg?.config ?? {}) };
-        if (
-          suggestedProfile !== null
-          && pkg?.config?.postprocess_profile === undefined
-        ) {
-          seededConfig.postprocess_profile = suggestedProfile;
-        }
+    parseMutation.mutate(
+      { formData, signal: controller.signal, onProgress: setUploadProgress },
+      {
+        onSuccess: (data: any) => {
+          abortRef.current = null;
+          setUploadProgress(null);
+          const result = data as ModelParseResult;
+          // A cancel/abort that lost the race against the server still
+          // staged a blob — release it instead of keeping it for a wizard
+          // state the user already walked away from.
+          if (cancelRequestedRef.current || uploadCancelRef.current) {
+            abandonStagedFiles([result]);
+            return;
+          }
+          setParseResult(result);
 
-        setForm(prev => ({
-          // Update mode: the model_id is fixed — a swapped file must not
-          // rename the model being edited.
-          modelId: isUpdate
-            ? prev.modelId
-            : sanitizeModelId(
-                pkg?.model_id
-                  || result.network_name
-                  || result.filename?.replace(/\.[^.]+$/, '')
-                  || ''
-              ),
-          modelType: suggestedType,
-          // Package imports keep their delivery mode; plain HEFs start at
-          // platform decode (the auto-switch below corrects feature-map
-          // detection HEFs to raw).
-          outputMode: pkg?.output_mode === 'raw' ? 'raw' : 'platform',
-          variant: '',
-          config: seededConfig,
-        }));
-      },
-      onError: (error: any) => {
-        toast({
-          title: t(
-            'sys.ai_models.wizard.parse_failed',
-            'Failed to parse model'
-          ),
-          description: error?.response?.data?.message || error?.message,
-          variant: 'destructive',
-        });
-      },
-    });
+          // AMPK packages carry their registration metadata; the prefill lets
+          // the user confirm/adjust instead of re-entering everything.
+          const pkg = result.package;
+          const suggestedType = pkg?.model_type || result.suggested_type || '';
+          const typeOpt = modelTypeOptions.find(o => o.value === suggestedType);
+          const configDefaults = typeOpt
+            ? fieldDefaultToState(typeOpt.fields)
+            : {};
+          // A tensor-name prefix match means this file IS that profile's
+          // model (standard or custom); package metadata, when present,
+          // still wins. This is also what surfaces a custom option in the
+          // dropdown, which hides custom entries that are not active.
+          const profileField = typeOpt?.fields.find(
+            f => f.key === 'postprocess_profile'
+          );
+          const suggestedProfile = suggestPostprocessProfile(
+            profileField?.options ?? [],
+            result.vstream_info
+          );
+          const seededConfig = { ...configDefaults, ...(pkg?.config ?? {}) };
+          if (
+            suggestedProfile !== null
+            && pkg?.config?.postprocess_profile === undefined
+          ) {
+            seededConfig.postprocess_profile = suggestedProfile;
+          }
+
+          setForm(prev => ({
+            // Update mode: the model_id is fixed — a swapped file must not
+            // rename the model being edited.
+            modelId: isUpdate
+              ? prev.modelId
+              : sanitizeModelId(
+                  suggestModelId(
+                    pkg?.model_id,
+                    result.network_name,
+                    result.filename
+                  )
+                ),
+            modelType: suggestedType,
+            // Package imports keep their delivery mode; plain HEFs start at
+            // platform decode (the auto-switch below corrects feature-map
+            // detection HEFs to raw).
+            outputMode: pkg?.output_mode === 'raw' ? 'raw' : 'platform',
+            variant: '',
+            config: seededConfig,
+          }));
+        },
+        onError: (error: any) => {
+          abortRef.current = null;
+          setUploadProgress(null);
+          // A user-initiated abort is not a failure — the mutation settles as
+          // CanceledError and the server discards the incomplete body itself.
+          if (controller.signal.aborted || uploadCancelRef.current) {
+            return;
+          }
+          toast({
+            title: t(
+              'sys.ai_models.wizard.parse_failed',
+              'Failed to parse model'
+            ),
+            description: apiErrorText(error),
+            variant: 'destructive',
+          });
+        },
+      }
+    );
+  };
+
+  // Interrupt an in-flight upload/parse from the source screen: abort the
+  // HTTP request, drop the picked file, and stay on the screen for a retry.
+  const handleCancelUpload = () => {
+    uploadCancelRef.current = true;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setUploadProgress(null);
+    setFile(null);
+    setParseResult(null);
   };
 
   const handleContinue = () => {
@@ -579,9 +700,27 @@ export default function ImportModelDialog({
             await onSuccess?.();
           },
           onError: (error: any) => {
+            // 5001 = the row committed but the NPU reload failed: report the
+            // partial success as a warning and land back on the (now
+            // unloaded) list row, instead of a generic error with the
+            // dialog stuck open.
+            if (apiErrorCode(error) === MODEL_LOAD_FAILED_CODE) {
+              toast({
+                title: t(
+                  'sys.ai_models.message.update_reload_failed',
+                  'Updated, but failed to reload on NPU'
+                ),
+                description: apiErrorText(error),
+                variant: 'warning',
+              });
+              handleReset();
+              onOpenChange(false);
+              onSuccess?.();
+              return;
+            }
             toast({
               title: t('common.error', 'Error'),
-              description: error?.response?.data?.message || error?.message,
+              description: apiErrorText(error),
               variant: 'destructive',
             });
           },
@@ -592,10 +731,13 @@ export default function ImportModelDialog({
 
     if (!parseResult) return;
 
+    // Captured before the reset below wipes the form.
+    const modelId = form.modelId.trim();
+
     registerMutation.mutate(
       {
         file_hash: parseResult.file_hash,
-        model_id: form.modelId.trim(),
+        model_id: modelId,
         model_type: form.modelType,
         output_mode: form.outputMode,
         model_variant: form.variant.trim(),
@@ -612,20 +754,47 @@ export default function ImportModelDialog({
       },
       {
         onSuccess: async () => {
-          toast({
-            title: t(
-              'sys.ai_models.message.import_success',
-              'Model imported successfully'
-            ),
-          });
           handleReset();
           onOpenChange(false);
+
+          if (!loadAfterRegister) {
+            toast({
+              title: t(
+                'sys.ai_models.message.import_success',
+                'Model imported successfully'
+              ),
+            });
+            await onSuccess?.();
+            return;
+          }
+
+          // Register and load are reported separately: a load failure must
+          // not read as "the import failed" — the model is registered and
+          // loadable from the list.
+          try {
+            await loadMutation.mutateAsync(modelId);
+            toast({
+              title: t(
+                'sys.ai_models.message.import_load_success',
+                'Model imported and loaded successfully'
+              ),
+            });
+          } catch (error: any) {
+            toast({
+              title: t(
+                'sys.ai_models.message.load_after_register_failed',
+                'Registered, but failed to load'
+              ),
+              description: apiErrorText(error),
+              variant: 'destructive',
+            });
+          }
           await onSuccess?.();
         },
         onError: (error: any) => {
           toast({
             title: t('common.error', 'Error'),
-            description: error?.response?.data?.message || error?.message,
+            description: apiErrorText(error),
             variant: 'destructive',
           });
         },
@@ -639,13 +808,22 @@ export default function ImportModelDialog({
     setView('form');
     setFile(null);
     setParseResult(null);
+    setUploadProgress(null);
     setForm(initialModelImportForm);
     setTouched({});
+    setLoadAfterRegister(false);
     initialProfileRef.current = null;
+    initialFormRef.current = null;
   };
 
   const handleCancel = () => {
     cancelRequestedRef.current = true;
+    // A parse still in flight must not keep running behind a closed dialog —
+    // abort it; if it sneaks through anyway, the marker makes its onSuccess
+    // abandon the staged blob.
+    uploadCancelRef.current = true;
+    abortRef.current?.abort();
+    abortRef.current = null;
     abandonStagedFiles([parseResult]);
     handleReset();
     onOpenChange(false);
@@ -658,16 +836,27 @@ export default function ImportModelDialog({
       onOpenChange(true);
       return;
     }
+    // Esc and the header X land here: with unsaved work, confirm first
+    // instead of silently discarding a staged file or a tuned config.
+    if (isDirty && !isLoading) {
+      setCloseConfirmOpen(true);
+      return;
+    }
+    handleCancel();
+  };
+
+  const handleConfirmDiscard = () => {
+    setCloseConfirmOpen(false);
     handleCancel();
   };
 
   const updating = isUpdate && updateMutation.isPending;
   const submitLabel = updating
-    ? t('common.loading', 'Loading...')
+    ? t('sys.ai_models.wizard.updating', 'Updating...')
     : isUpdate
       ? t('sys.ai_models.wizard.confirm_update', 'Update')
       : registerMutation.isPending
-        ? t('common.loading', 'Loading...')
+        ? t('sys.ai_models.wizard.registering', 'Registering...')
         : t('sys.ai_models.wizard.confirm_register', 'Register');
 
   // Mini-card above the section nav: what is being imported. A picked file
@@ -712,6 +901,8 @@ export default function ImportModelDialog({
           </DialogDescription>
         </div>
 
+        <WizardStepper steps={stepperSteps} />
+
         {screen === 'source' ? (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8">
@@ -729,6 +920,8 @@ export default function ImportModelDialog({
                 onFileChange={handleFileChange}
                 onClear={handleClearFile}
                 isParsing={parseMutation.isPending}
+                uploadProgress={uploadProgress}
+                onCancelUpload={handleCancelUpload}
                 disabled={isLoading}
                 parseResult={parseResult}
                 outputFormat={outputFormat}
@@ -838,6 +1031,25 @@ export default function ImportModelDialog({
               >
                 {t('common.cancel', 'Cancel')}
               </Button>
+              {!isUpdate && (
+                <label
+                  className={`flex cursor-pointer select-none items-center gap-2 text-sm text-muted-foreground${
+                    isLoading ? ' pointer-events-none opacity-50' : ''
+                  }`}
+                >
+                  <Checkbox
+                    checked={loadAfterRegister}
+                    onCheckedChange={checked => setLoadAfterRegister(checked === true)}
+                    disabled={isLoading}
+                  />
+                  <span className="whitespace-nowrap">
+                    {t(
+                      'sys.ai_models.wizard.load_after_register',
+                      'Register and load'
+                    )}
+                  </span>
+                </label>
+              )}
               <Button
                 variant="carbon"
                 onClick={handleRegister}
@@ -850,6 +1062,38 @@ export default function ImportModelDialog({
           )}
         </div>
       </DialogContent>
+
+      {/* Close confirmation — guards Esc / header X against losing a staged
+          file or configure-screen edits. */}
+      <AlertDialog open={closeConfirmOpen} onOpenChange={setCloseConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t(
+                'sys.ai_models.wizard.close_confirm_title',
+                'Discard unsaved changes?'
+              )}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'sys.ai_models.wizard.close_confirm_desc',
+                'Your configuration entries and the staged model file will be discarded.'
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>
+              {t('sys.ai_models.wizard.close_confirm_keep', 'Keep editing')}
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmDiscard}>
+              {t(
+                'sys.ai_models.wizard.close_confirm_discard',
+                'Discard and close'
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }

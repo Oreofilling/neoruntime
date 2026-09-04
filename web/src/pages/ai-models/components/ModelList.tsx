@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
 
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -21,7 +22,7 @@ import {
   Power,
   PowerOff,
   Loader2,
-  RefreshCw,
+  Pencil,
 } from 'lucide-react';
 
 import { Empty } from '@/components/ui/empty';
@@ -358,7 +359,7 @@ export default function ModelList({
                             }}
                             title={t('sys.ai_models.action.update', '更新')}
                           >
-                            <RefreshCw className="w-4 h-4" />
+                            <Pencil className="w-4 h-4" />
                           </Button>
                         )}
                         <Button
@@ -447,7 +448,15 @@ export default function ModelList({
                         key={app}
                         className="font-medium text-foreground text-sm"
                       >
-                        • {app}
+                        {/* Links jump to the apps page so the referencing
+                            app can be located and removed without hunting
+                            for its name by hand. */}
+                        <Link
+                          to="/apps"
+                          className="underline decoration-border underline-offset-2 transition-colors hover:text-primary hover:decoration-primary"
+                        >
+                          {app}
+                        </Link>
                       </li>
                     ))}
                   </ul>

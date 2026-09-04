@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -26,7 +27,7 @@ import {
   Power,
   PowerOff,
   Loader2,
-  RefreshCw,
+  Pencil,
   MoreHorizontal,
   AppWindow,
   SearchX,
@@ -319,7 +320,15 @@ export default function ModelCard({
                       <MoreHorizontal className="w-4 h-4" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-40">
+                  {/* Portal or not, React synthetic events bubble through
+                      the React tree: without this guard every menu item
+                      click also fires the card's onClick and opens the
+                      detail dialog behind the dialog the item opened. */}
+                  <DropdownMenuContent
+                    align="end"
+                    className="w-40"
+                    onClick={e => e.stopPropagation()}
+                  >
                     <DropdownMenuItem onClick={() => setDetailModel(model)}>
                       <Eye className="w-4 h-4 mr-2" />
                       {t('common.detail', '详情')}
@@ -334,7 +343,7 @@ export default function ModelCard({
                           }
                         }}
                       >
-                        <RefreshCw className="w-4 h-4 mr-2" />
+                        <Pencil className="w-4 h-4 mr-2" />
                         {t('sys.ai_models.action.update', '更新')}
                       </DropdownMenuItem>
                     )}
@@ -393,7 +402,15 @@ export default function ModelCard({
                         key={app}
                         className="font-medium text-foreground text-sm"
                       >
-                        • {app}
+                        {/* Links jump to the apps page so the referencing
+                            app can be located and removed without hunting
+                            for its name by hand. */}
+                        <Link
+                          to="/apps"
+                          className="underline decoration-border underline-offset-2 transition-colors hover:text-primary hover:decoration-primary"
+                        >
+                          {app}
+                        </Link>
                       </li>
                     ))}
                   </ul>

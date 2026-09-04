@@ -5,9 +5,26 @@ export const aiApi = {
   // Platform capabilities (supported formats + model types)
   getCapabilities: () => request.get('/api/v1/ai/capabilities'),
 
-  // Parse model file (step 1: upload + extract metadata)
-  parseModel: (formData: FormData) => request.post('/api/v1/ai/models/parse', formData, {
+  // Parse model file (step 1: upload + extract metadata).
+  // onProgress maps to axios onUploadProgress (percent 0-100); signal aborts
+  // the request mid-upload/mid-parse — the server discards an incomplete
+  // multipart body on its own.
+  parseModel: (
+    formData: FormData,
+    options?: {
+      onProgress?: (percent: number) => void;
+      signal?: AbortSignal;
+    }
+  ) => request.post('/api/v1/ai/models/parse', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: progressEvent => {
+        if (options?.onProgress && progressEvent.total) {
+          options.onProgress(
+            Math.round((progressEvent.loaded * 100) / progressEvent.total)
+          );
+        }
+      },
+      signal: options?.signal,
     }),
 
   // Abandon a staged blob when the import wizard is cancelled. Server-side

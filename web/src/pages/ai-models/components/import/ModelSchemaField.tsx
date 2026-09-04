@@ -132,6 +132,9 @@ export default function ModelSchemaField({
     }
     case 'text': {
       const hint = t(`sys.ai_models.form.${field.key}_hint`, '');
+      // Field-specific examples (labels → "smoke,fire") beat the generic
+      // "Please enter" where the expected format is not obvious.
+      const example = t(`sys.ai_models.form.${field.key}_placeholder`, '');
       return (
         <div className="grid gap-2 sm:col-span-2">
           <Label htmlFor={field.key}>{label}</Label>
@@ -140,7 +143,7 @@ export default function ModelSchemaField({
             type="text"
             value={String(value ?? '')}
             onChange={e => onChange(field.key, e.target.value)}
-            placeholder={ph}
+            placeholder={example || ph}
             disabled={disabled}
           />
           {error && <p className="text-sm text-destructive">{error}</p>}

@@ -166,8 +166,21 @@ export const useParseModel = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (formData: FormData) => {
-      const response = await aiApi.parseModel(formData);
+    // onProgress/signal ride along so the wizard can show upload percentage
+    // and abort mid-flight (ai.ts maps them onto axios config).
+    mutationFn: async ({
+      formData,
+      onProgress,
+      signal,
+    }: {
+      formData: FormData;
+      onProgress?: (percent: number) => void;
+      signal?: AbortSignal;
+    }) => {
+      const response = await aiApi.parseModel(formData, {
+        onProgress,
+        signal,
+      });
       return unwrapApiData(response);
     },
     onSuccess: () => {

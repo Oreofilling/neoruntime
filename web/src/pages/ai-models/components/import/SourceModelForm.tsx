@@ -15,6 +15,10 @@ export interface SourceModelFormProps {
   /** drop the picked file and its parse result, back to the empty slot. */
   onClear: () => void;
   isParsing: boolean;
+  /** null = idle; 0-99 = uploading; 100 = body sent, server parsing. */
+  uploadProgress: number | null;
+  /** abort an in-flight upload/parse and return to the empty slot. */
+  onCancelUpload: () => void;
   disabled: boolean;
   parseResult: ModelParseResult | null;
   /** '' | 'nms' | 'feature_map' — derived by the shell. */
@@ -37,6 +41,8 @@ export default function SourceModelForm({
   onFileChange,
   onClear,
   isParsing,
+  uploadProgress,
+  onCancelUpload,
   disabled,
   parseResult,
   outputFormat,
@@ -45,6 +51,10 @@ export default function SourceModelForm({
   isUpdate,
 }: SourceModelFormProps) {
   const { t } = useTranslation();
+
+  // 0-99 → bytes on the wire; 100/null while still pending → server-side
+  // parse (indeterminate), which the bare "Parsing..." line covers.
+  const isUploading = uploadProgress != null && uploadProgress < 100;
 
   return (
     <div className="space-y-4">
@@ -82,9 +92,20 @@ export default function SourceModelForm({
                   {parseResult.network_name || '—'}
                 </span>
                 {parseResult.input_width && parseResult.input_height && (
-                  <span>
+                  <span
+                    title={t(
+                      'sys.ai_models.wizard.measured_input_hint',
+                      'Measured from this compiled artifact; may differ from the network\'s nominal training resolution'
+                    )}
+                  >
                     {t('sys.ai_models.wizard.preview_input', 'Input')}:{' '}
                     {parseResult.input_width}×{parseResult.input_height}
+                    <span className="ml-1 opacity-70">
+                      {t(
+                        'sys.ai_models.wizard.measured_input',
+                        '(measured)'
+                      )}
+                    </span>
                   </span>
                 )}
               </div>
@@ -169,6 +190,8 @@ export default function SourceModelForm({
             loading={isParsing}
             disabled={disabled}
             showFileList
+            showProgress={isUploading}
+            progress={uploadProgress ?? 0}
             accept={acceptFormats}
             placeholder={t(
               'sys.ai_models.form.file_placeholder',
@@ -177,9 +200,21 @@ export default function SourceModelForm({
             hint={formatHint}
           />
           {isParsing && (
-            <p className="animate-pulse text-sm text-muted-foreground">
-              {t('sys.ai_models.wizard.parsing', 'Parsing model...')}
-            </p>
+            <div className="flex items-center gap-3">
+              <p className="flex-1 animate-pulse text-sm text-muted-foreground">
+                {isUploading
+                  ? t('sys.ai_models.wizard.uploading', 'Uploading...')
+                  : t('sys.ai_models.wizard.parsing', 'Parsing model...')}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={onCancelUpload}
+              >
+                {t('common.cancel', 'Cancel')}
+              </Button>
+            </div>
           )}
         </div>
       )}

@@ -126,6 +126,28 @@ export function sanitizeModelId(name: string): string {
     .replace(/^_|_$/g, '');
 }
 
+/** Network names that carry no identity — developer-center HEFs commonly
+ * ship with the network literally named "model", which would pre-fill a
+ * meaningless id. Pre-fill falls through those to the file name. */
+const GENERIC_MODEL_NAMES = new Set(['model', 'network', 'net']);
+
+/** Pre-fill priority for the model id field: an AMPK package's explicit
+ *  model_id always wins, then a distinctive network name, then the file
+ *  name without extension. Generic network names are skipped. */
+export function suggestModelId(
+  pkgModelId: string | undefined,
+  networkName: string | undefined,
+  filename: string | undefined
+): string {
+  if (pkgModelId) return pkgModelId;
+  const fileStem = filename?.replace(/\.[^.]+$/, '') ?? '';
+  const network = networkName?.trim() ?? '';
+  if (network && !GENERIC_MODEL_NAMES.has(network.toLowerCase())) {
+    return network;
+  }
+  return fileStem;
+}
+
 /** Client mirror of the server-side classifier: an output vstream named
  *  *_nms_postprocess means the HEF ships the NMS layer; anything else is a
  *  bare feature map the postprocess plugin cannot decode. */

@@ -30,6 +30,7 @@ import ImportModelDialog from './components/importModelDialog';
 import { toast } from 'sonner';
 import { AIModelsPageSkeleton } from './components/AIModelsSkeleton';
 import { resolveModelType, type ModelTypeKey } from './utils';
+import { apiErrorText } from './lib/apiErrors';
 
 type StatusFilter = 'all' | 'loaded' | 'unloaded';
 type SortBy = 'default' | 'name' | 'size' | 'load_time';
@@ -146,8 +147,7 @@ export default function AIModels() {
       );
     } catch (err: any) {
       toast.error(
-        err?.response?.data?.message
-          || t('sys.ai_models.message.delete_failed', 'Failed to delete model')
+        apiErrorText(err, t('sys.ai_models.message.delete_failed', 'Failed to delete model'))
       );
     }
   };
@@ -161,8 +161,7 @@ export default function AIModels() {
       );
     } catch (err: any) {
       toast.error(
-        err?.response?.data?.message
-          || t('sys.ai_models.message.load_failed', '加载失败')
+        apiErrorText(err, t('sys.ai_models.message.load_failed', '加载失败'))
       );
     } finally {
       setLoadingActions(prev => {
@@ -182,8 +181,7 @@ export default function AIModels() {
       );
     } catch (err: any) {
       toast.error(
-        err?.response?.data?.message
-          || t('sys.ai_models.message.unload_failed', '卸载失败')
+        apiErrorText(err, t('sys.ai_models.message.unload_failed', '卸载失败'))
       );
     } finally {
       setLoadingActions(prev => {
