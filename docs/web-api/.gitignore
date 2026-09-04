@@ -1,8 +1,7 @@
 node_modules/
-.vitepress/dist/
-.vitepress/cache/
-.vitepress/generated/
+dist/
+.astro/
 public/swagger.json
 public/swagger.zh.json
 public/redoc.standalone.js
-project/
+src/content/docs/project/
