@@ -38,6 +38,8 @@ export default defineConfig({
     root: {
       label: 'English',
       lang: 'en',
+      title: 'NeoRuntime Web API',
+      description: 'Bilingual reference for the NeoRuntime platform Web API — REST, WebSocket and SSE for edge AI devices.',
       themeConfig: {
         nav: [
           ...guideEn,
@@ -60,6 +62,8 @@ export default defineConfig({
     zh: {
       label: '简体中文',
       lang: 'zh-CN',
+      title: 'NeoRuntime Web API',
+      description: 'NeoRuntime 平台 Web API 双语参考文档 —— 面向边缘 AI 设备的 REST、WebSocket 与 SSE 接口。',
       themeConfig: {
         nav: [
           ...guideZh,
