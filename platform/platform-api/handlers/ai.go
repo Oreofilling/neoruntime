@@ -992,7 +992,7 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		if loadErr != nil {
 			// The row already reflects the new file as uploaded — report the
 			// reload failure explicitly instead of claiming success.
-			Resp(c).FailMsg(CodeModelLoadFailed, "Model updated but failed to reload on NPU: "+loadErr.Error())
+			Resp(c).FailMsg(CodeModelLoadFailed, "Model updated but failed to reload on NPU: "+humanizeLoadError(loadErr))
 			return
 		}
 		dbModel.Status = "loaded"
@@ -1372,7 +1372,7 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 	// and status persistence live in loadModelCore, shared with the periodic
 	// self-heal loop so a REST load and a heal reload behave identically.
 	if err := h.loadModelCore(ctx, client, dbModel); err != nil {
-		Resp(c).FailMsg(CodeModelLoadFailed, err.Error())
+		Resp(c).FailMsg(CodeModelLoadFailed, humanizeLoadError(err))
 		return
 	}
 
