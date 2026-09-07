@@ -8,6 +8,8 @@
 #include <cstring>
 #include <vector>
 
+#include <hailo/media_library/dma_memory_allocator.hpp>
+
 extern "C" {
 
 static int hailo15_dsp_convert_format_sync(Hailo15DspContext *ctx, const HalDspConvertFormatParams *params);
@@ -344,9 +346,25 @@ static int hailo15_dsp_blend_sync(Hailo15DspContext *ctx, const HalDspBlendParam
      * clamped overlay_count to 50. */
     std::vector<dsp_overlay_properties_t> overlays(params->overlay_count);
     std::vector<dsp_data_plane_t> overlays_planes((size_t)params->overlay_count * HAL_MAX_PLANES);
+
+    /* Blend overlays must live in DSP-reachable dma-heap memory: the firmware's
+     * idma lookup refuses xrp-bounced USERPTR overlay planes for blend (works
+     * for resize sources; blend fails with a base_address remap conflict), and
+     * ARGB32 MediaLibraryBufferPool acquire fails on this vendor stack. Import
+     * overlays arrive as HAL_MEM_MALLOC planes — stage them through the media
+     * library dma-heap allocator, the memory class the vendor OSD blends from. */
+    std::vector<void *> staged;
+    auto free_staged = [&staged]() {
+        DmaMemoryAllocator &dma = DmaMemoryAllocator::get_instance();
+        for (void *buf : staged) {
+            dma.free_dma_buffer(buf);
+        }
+        staged.clear();
+    };
     for (uint32_t i = 0; i < params->overlay_count; ++i) {
         HalDspOverlay *src_ov = &params->overlays[i];
         if (!src_ov->overlay) {
+            free_staged();
             return HAL_ERR_INVALID_ARG;
         }
         dsp_overlay_properties_t *dst_ov = &overlays[i];
@@ -354,10 +372,44 @@ static int hailo15_dsp_blend_sync(Hailo15DspContext *ctx, const HalDspBlendParam
                                &overlays_planes[(size_t)i * HAL_MAX_PLANES], HAL_MAX_PLANES);
         dst_ov->x_offset = src_ov->x_offset;
         dst_ov->y_offset = src_ov->y_offset;
+        if (src_ov->overlay->mem_type != HAL_MEM_MALLOC) {
+            continue; /* dma-buf overlay: pass through zero-copy */
+        }
+        DmaMemoryAllocator &dma = DmaMemoryAllocator::get_instance();
+        bool ok = true;
+        for (uint32_t p = 0; p < dst_ov->overlay.planes_count && ok; ++p) {
+            const size_t sz = src_ov->overlay->sizes[p];
+            void *buf = nullptr;
+            if (sz == 0 || !src_ov->overlay->planes[p] ||
+                dma.allocate_dma_buffer(sz, &buf) != MEDIA_LIBRARY_SUCCESS || !buf) {
+                ok = false;
+                break;
+            }
+            staged.push_back(buf); /* owns buf from here, including get_fd failure below */
+            if (dma.dmabuf_sync_start(buf) == MEDIA_LIBRARY_SUCCESS) {
+                std::memcpy(buf, src_ov->overlay->planes[p], sz);
+                dma.dmabuf_sync_end(buf);
+            } else {
+                std::memcpy(buf, src_ov->overlay->planes[p], sz);
+            }
+            int fd = -1;
+            if (dma.get_fd(buf, fd) != MEDIA_LIBRARY_SUCCESS || fd < 0) {
+                ok = false;
+                break;
+            }
+            overlays_planes[(size_t)i * HAL_MAX_PLANES + p].fd = fd;
+        }
+        if (!ok) {
+            free_staged();
+            return HAL_ERR_NO_MEM;
+        }
+        dst_ov->overlay.memory = DSP_MEMORY_TYPE_DMABUF;
     }
 
     dsp_status st = dsp_blend(ctx->device, &base_image, overlays.data(), params->overlay_count);
-    return dsp_status_to_hal(st);
+    int rc = dsp_status_to_hal(st);
+    free_staged();
+    return rc;
 }
 
 static int hailo15_dsp_flip_rotate_sync(Hailo15DspContext *ctx, const HalDspFlipRotateParams *params)

@@ -65,6 +65,7 @@ class AiOverlaySubscriber;
 class AudioService;
 class DpmWorker;
 class DspService;
+#include "dsp_service.h"
 struct AudioCfg;
 
 #ifdef HAS_GRPC
@@ -161,6 +162,9 @@ struct DaemonConfig {
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+
+    // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
+    DspServiceConfig dsp;
 
     // RTSP
     bool        rtsp_enabled;

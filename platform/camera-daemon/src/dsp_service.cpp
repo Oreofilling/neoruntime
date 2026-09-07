@@ -19,9 +19,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <utility>
-#include <unistd.h> /* dup, close */
+#include <unistd.h> /* dup, close, readlink */
+#include <sys/mman.h> /* mmap/munmap (USERPTR imports) */
 
 #include "common/hal_log.h"
 
@@ -37,6 +39,7 @@ bool format_supported(HalPixelFormat f) {
     case HAL_PIX_FMT_NV12:
     case HAL_PIX_FMT_RGB24:
     case HAL_PIX_FMT_GRAY8:
+    case HAL_PIX_FMT_ARGB32: /* P1: blend overlays */
         return true;
     default:
         return false;
@@ -52,6 +55,7 @@ uint32_t plane_count_of(HalPixelFormat f) {
 /* Minimum sane stride for plane p of a w*h `format` buffer (no padding). */
 uint32_t min_stride_of(HalPixelFormat f, uint32_t w) {
     if (f == HAL_PIX_FMT_RGB24) return w * 3;
+    if (f == HAL_PIX_FMT_ARGB32) return w * 4;
     return w; /* NV12: Y row and interleaved-UV row are both w bytes */
 }
 
@@ -62,13 +66,29 @@ uint32_t plane_rows_of(HalPixelFormat f, uint32_t h, uint32_t plane) {
 }
 
 /* Imported descriptors are plain daemon-owned allocations, not HAL pool
- * buffers: releasing one is close(dup'd fds) + delete. They must never
- * reach fb_ops_->release_frame_buffer. */
+ * buffers: releasing one is close(dup'd fds) + munmap(mapped planes) +
+ * delete. They must never reach fb_ops_->release_frame_buffer. */
 void free_imported_fb(HalFrameBuffer* fb) {
     if (!fb) return;
-    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p)
+    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) {
+        if (fb->mem_type == HAL_MEM_MALLOC && fb->planes[p])
+            munmap(fb->planes[p], fb->sizes[p]);
         if (fb->dma_fds[p] >= 0) close(fb->dma_fds[p]);
+    }
     delete fb;
+}
+
+/* A real dma-buf fd links to an "anon_inode:dmabuf" inode; anything else
+ * (memfd, regular file) is a client-manufactured buffer that rides the
+ * USERPTR plane path instead. */
+bool fd_is_dma_buf(int fd) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    char target[128];
+    ssize_t n = readlink(path, target, sizeof(target) - 1);
+    if (n <= 0) return false;
+    target[n] = '\0';
+    return std::strstr(target, "dmabuf") != nullptr;
 }
 
 } // namespace
@@ -142,6 +162,13 @@ void DspService::stop() {
 
     // Free every remaining registered buffer (no pins can exist now).
     {
+        // P2: drop the async registry — waiters see "unknown job id" from
+        // now on; queued jobs were already failed by the leftover loop.
+        std::lock_guard<std::mutex> lk(done_mu_);
+        jobs_.clear();
+        client_async_jobs_.clear();
+    }
+    {
         std::vector<HalFrameBuffer*> to_free;
         std::vector<HalFrameBuffer*> imported;
         {
@@ -195,7 +222,7 @@ DspService::AllocResult DspService::alloc_buffers(int client_fd, uint32_t width,
     }
     if (!format_supported(format)) {
         out.rc = DSP_SVC_ERR_INVALID;
-        out.message = "unsupported format (NV12/RGB24/GRAY8 in P0)";
+        out.message = "unsupported format (NV12/RGB24/GRAY8/ARGB32)";
         return out;
     }
     const uint64_t px = pixels_of(width, height);
@@ -324,7 +351,7 @@ DspService::ImportResult DspService::import_buffer(
     }
     if (!format_supported(format)) {
         out.rc = DSP_SVC_ERR_INVALID;
-        out.message = "unsupported format (NV12/RGB24/GRAY8 in P0)";
+        out.message = "unsupported format (NV12/RGB24/GRAY8/ARGB32)";
         return out;
     }
     if (pixels_of(width, height) > cfg_.max_pixels_per_op) {
@@ -369,16 +396,55 @@ DspService::ImportResult DspService::import_buffer(
         }
     }
 
+    // Classify the fds. Real dma-bufs (camera keep-fd frames) ride the
+    // zero-copy fd plane path; anything else a client manufactured (the
+    // SDK's blend overlays arrive as memfds) is mapped read-only into our
+    // address space and rides USERPTR — hal_frame_to_dsp_image() takes
+    // planes[] for non-DMABUF descriptors, and the vendor DSP accepts
+    // USERPTR for every op (measured: userptr dsts in E4). Mixed planes
+    // belong to no real buffer — reject.
+    bool all_dma = true;
+    bool any_dma = false;
+    for (uint32_t p = 0; p < planes; ++p) {
+        const bool d = fd_is_dma_buf(dup_fds[p]);
+        all_dma = all_dma && d;
+        any_dma = any_dma || d;
+    }
+    if (any_dma && !all_dma) {
+        for (uint32_t p = 0; p < planes; ++p) close(dup_fds[p]);
+        out.rc = DSP_SVC_ERR_INVALID;
+        out.message = "mixed dma-buf and non-dma-buf planes";
+        return out;
+    }
+
     // A plain descriptor the DSP HAL reads like any pool buffer: geometry +
-    // fds + strides. hal_frame_to_dsp_image() only consumes these fields
-    // (hailo15_dsp_impl.cpp) — refcounts/priv belong to HAL pool buffers and
-    // are deliberately left zero.
+    // fds or mapped planes + strides. hal_frame_to_dsp_image() only consumes
+    // these fields (hailo15_dsp_impl.cpp) — refcounts/priv belong to HAL
+    // pool buffers and are deliberately left zero.
     HalFrameBuffer* fb = new HalFrameBuffer();
     fb->width = width;
     fb->height = height;
     fb->format = format;
-    fb->mem_type = HAL_MEM_DMABUF;
     fb->num_planes = planes;
+    if (all_dma) {
+        fb->mem_type = HAL_MEM_DMABUF;
+    } else {
+        fb->mem_type = HAL_MEM_MALLOC; /* USERPTR planes (see above) */
+        for (uint32_t p = 0; p < planes; ++p) {
+            void* addr = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED,
+                              dup_fds[p], 0);
+            if (addr == MAP_FAILED) {
+                for (uint32_t q = 0; q < p; ++q)
+                    munmap(fb->planes[q], sizes[q]);
+                for (uint32_t q = 0; q < planes; ++q) close(dup_fds[q]);
+                delete fb;
+                out.rc = DSP_SVC_ERR_INVALID;
+                out.message = "import plane not mappable (memfd truncated?)";
+                return out;
+            }
+            fb->planes[p] = addr;
+        }
+    }
     for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) {
         fb->dma_fds[p] = (p < planes) ? dup_fds[p] : -1;
         fb->strides[p] = (p < planes) ? strides[p] : 0;
@@ -481,7 +547,88 @@ void DspService::release_client_buffers(int client_fd) {
     if (!to_free.empty())
         HAL_LOG_INFO("DspService: client %d disconnected, freed %zu buffer(s)",
                      client_fd, to_free.size());
+
+    // P2: the owner is gone — abandon + reap its async jobs. Pins are NOT
+    // touched here: the worker drops them at the execute_job tail, and
+    // unpinning a still-queued job would free buffers it executes against.
+    {
+        size_t reaped = 0;
+        {
+            std::lock_guard<std::mutex> lk(done_mu_);
+            for (auto it = jobs_.begin(); it != jobs_.end();) {
+                if (it->second->owner_fd == client_fd) {
+                    it->second->abandoned = true;
+                    it = jobs_.erase(it);
+                    reaped++;
+                } else {
+                    ++it;
+                }
+            }
+            client_async_jobs_.erase(client_fd);
+        }
+        if (reaped > 0)
+            HAL_LOG_INFO(
+                "DspService: client %d disconnected, reaped %zu async job(s)",
+                client_fd, reaped);
+    }
     quota_forget(client_fd);
+}
+
+/* ------------------------------------------------------------------ */
+/* One-shot ops plane (daemon-internal)                                */
+/* ------------------------------------------------------------------ */
+
+void DspService::BufferPin::release_pin() {
+    if (!svc_ || !entry_) return;
+    svc_->unpin_entries({static_cast<BufferEntry*>(entry_)});
+    svc_ = nullptr;
+    entry_ = nullptr;
+    fb_ = nullptr;
+}
+
+DspService::BufferPin::~BufferPin() { release_pin(); }
+
+DspService::BufferPin::BufferPin(BufferPin&& other) noexcept
+    : svc_(other.svc_), entry_(other.entry_), fb_(other.fb_),
+      owner_fd_(other.owner_fd_), rc_(other.rc_) {
+    other.svc_ = nullptr;
+    other.entry_ = nullptr;
+    other.fb_ = nullptr;
+    other.owner_fd_ = -1;
+    other.rc_ = DSP_SVC_ERR_NO_BUFFER;
+}
+
+DspService::BufferPin& DspService::BufferPin::operator=(BufferPin&& other) noexcept {
+    if (this != &other) {
+        release_pin();
+        svc_ = other.svc_;
+        entry_ = other.entry_;
+        fb_ = other.fb_;
+        owner_fd_ = other.owner_fd_;
+        rc_ = other.rc_;
+        other.svc_ = nullptr;
+        other.entry_ = nullptr;
+        other.fb_ = nullptr;
+        other.owner_fd_ = -1;
+        other.rc_ = DSP_SVC_ERR_NO_BUFFER;
+    }
+    return *this;
+}
+
+DspService::BufferPin DspService::pin_buffer(uint64_t buffer_id) {
+    BufferPin pin;
+    BufferEntry* entry = nullptr;
+    int owner = -1;
+    {
+        std::lock_guard<std::mutex> lk(buffers_mu_);
+        if (!resolve_pin_buffer(buffer_id, owner, entry)) return pin;
+    }
+    pin.svc_ = this;
+    pin.entry_ = entry;
+    pin.fb_ = entry->fb;
+    pin.owner_fd_ = owner;
+    pin.rc_ = DSP_SVC_OK;
+    return pin;
 }
 
 /* ------------------------------------------------------------------ */
@@ -529,7 +676,8 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
     }
 
     const bool wants_rects = desc.op == HAL_DSP_OP_CROP_RESIZE ||
-                             desc.op == HAL_DSP_OP_MULTI_CROP_RESIZE;
+                             desc.op == HAL_DSP_OP_MULTI_CROP_RESIZE ||
+                             desc.op == HAL_DSP_OP_BLEND;
     if (wants_rects && desc.rects.empty()) {
         why = "op requires >= 1 rect";
         return DSP_SVC_ERR_INVALID;
@@ -542,20 +690,25 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
         why = "no dst buffers";
         return DSP_SVC_ERR_INVALID;
     }
-    if (desc.op == HAL_DSP_OP_MULTI_CROP_RESIZE &&
-        (desc.dst_ids.size() > cfg_.max_batch ||
-         desc.rects.size() != desc.dst_ids.size())) {
-        why = "MULTI_CROP requires dst_ids.size() == rects.size() <= max_batch";
+    const bool multi_dst = desc.op == HAL_DSP_OP_MULTI_CROP_RESIZE ||
+                           desc.op == HAL_DSP_OP_BLEND;
+    if (multi_dst && (desc.dst_ids.size() > cfg_.max_batch ||
+                      desc.rects.size() != desc.dst_ids.size())) {
+        why = "op requires dst_ids.size() == rects.size() <= max_batch";
         return DSP_SVC_ERR_INVALID;
     }
-    if (desc.op != HAL_DSP_OP_MULTI_CROP_RESIZE && desc.dst_ids.size() != 1) {
+    if (!multi_dst && desc.dst_ids.size() != 1) {
         why = "op requires exactly 1 dst buffer";
         return DSP_SVC_ERR_INVALID;
     }
     if (desc.op != HAL_DSP_OP_RESIZE && desc.op != HAL_DSP_OP_CROP_RESIZE &&
         desc.op != HAL_DSP_OP_MULTI_CROP_RESIZE &&
-        desc.op != HAL_DSP_OP_CONVERT_FORMAT) {
-        why = "op not available in P0";
+        desc.op != HAL_DSP_OP_CONVERT_FORMAT && desc.op != HAL_DSP_OP_BLEND) {
+        why = "op not available";
+        return DSP_SVC_ERR_INVALID;
+    }
+    if (desc.op == HAL_DSP_OP_BLEND && desc.src_id == 0) {
+        why = "BLEND needs a base buffer";
         return DSP_SVC_ERR_INVALID;
     }
 
@@ -581,6 +734,19 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
             const HalFrameBuffer* sfb = src->fb;
             uint64_t dst_px_sum = 0;
 
+            if (job->desc.op == HAL_DSP_OP_BLEND) {
+                if (sfb->format != HAL_PIX_FMT_NV12) {
+                    vrc = DSP_SVC_ERR_INVALID;
+                    why = "BLEND base must be NV12 (composited in place)";
+                } else if (src->imported) {
+                    /* the vendor op writes the base — an imported frame
+                     * belongs to the app, mutating it corrupts the source */
+                    vrc = DSP_SVC_ERR_INVALID;
+                    why = "BLEND composites the base in place; imported "
+                          "frames cannot be the base";
+                }
+            }
+
             for (size_t i = 0; vrc == DSP_SVC_OK && i < job->desc.dst_ids.size();
                  ++i) {
                 int dst_owner = -1;
@@ -593,21 +759,34 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
                 job->pinned.push_back(dst);
                 const HalFrameBuffer* dfb = dst->fb;
 
-                if (dst->imported) {
+                if (dst->imported && job->desc.op != HAL_DSP_OP_BLEND) {
+                    /* written outputs must be daemon pool buffers; the one
+                     * exception is BLEND, whose dst slots are the ARGB32
+                     * overlays — read-only inputs (the SDK ships them as
+                     * memfd imports because the deployed HAL refuses
+                     * ARGB32 pool allocation on some devices) */
                     vrc = DSP_SVC_ERR_INVALID;
-                    why = "imported buffers are source-only (P0)";
+                    why = "imported buffers are source-only";
                     break;
                 }
                 if (dfb->format != sfb->format &&
-                    job->desc.op != HAL_DSP_OP_CONVERT_FORMAT) {
+                    job->desc.op != HAL_DSP_OP_CONVERT_FORMAT &&
+                    job->desc.op != HAL_DSP_OP_BLEND) {
                     vrc = DSP_SVC_ERR_INVALID;
-                    why = "src/dst format mismatch (only CONVERT_FORMAT allows it)";
+                    why = "src/dst format mismatch (only CONVERT_FORMAT and "
+                          "BLEND allow it)";
                     break;
                 }
                 if (dfb->format == sfb->format &&
                     job->desc.op == HAL_DSP_OP_CONVERT_FORMAT) {
                     vrc = DSP_SVC_ERR_INVALID;
                     why = "CONVERT_FORMAT requires differing formats";
+                    break;
+                }
+                if (job->desc.op == HAL_DSP_OP_BLEND &&
+                    dfb->format != HAL_PIX_FMT_ARGB32) {
+                    vrc = DSP_SVC_ERR_INVALID;
+                    why = "BLEND overlays must be ARGB32";
                     break;
                 }
 
@@ -629,6 +808,13 @@ int DspService::validate_and_pin(DspJobDesc desc, JobRef& job_out,
                     if (r.dst_width != dfb->width || r.dst_height != dfb->height) {
                         vrc = DSP_SVC_ERR_INVALID;
                         why = "rect dst dims must match dst buffer dims";
+                        break;
+                    }
+                    if (job->desc.op == HAL_DSP_OP_BLEND &&
+                        (r.width != dfb->width || r.height != dfb->height)) {
+                        vrc = DSP_SVC_ERR_INVALID;
+                        why = "BLEND pastes overlays 1:1 — rect w/h must "
+                              "equal the overlay dims";
                         break;
                     }
                 } else if (job->desc.op == HAL_DSP_OP_CONVERT_FORMAT &&
@@ -711,6 +897,48 @@ void DspService::quota_forget(int owner_fd) {
 }
 
 DspJobResult DspService::submit_job(const DspJobDesc& desc) {
+    /* P2: the synchronous form is the async form plus one bounded wait —
+     * one code path for validation, quota and queueing. */
+    uint64_t job_id = 0;
+    DspJobResult res = submit_job_async(desc, job_id);
+    if (res.rc != DSP_SVC_OK) return res;
+
+    bool done = false;
+    res = wait_job(job_id, cfg_.job_timeout_ms, done);
+    if (done) return res;
+
+    // Watchdog: a vendor op in flight cannot be cancelled — the worker
+    // finishes it and discards the result (jobs_timed_out). Pins already
+    // dropped at the execute_job tail; reap the registry entry here.
+    {
+        std::lock_guard<std::mutex> lk(done_mu_);
+        auto it = jobs_.find(job_id);
+        if (it != jobs_.end()) {
+            JobRef job = it->second;
+            const int owner = job->owner_fd;
+            job->abandoned = true;
+            jobs_.erase(it);
+            auto cnt = client_async_jobs_.find(owner);
+            if (cnt != client_async_jobs_.end() && cnt->second > 0) cnt->second--;
+        }
+    }
+    done_cv_.notify_all();
+    res.rc = DSP_SVC_ERR_TIMEOUT;
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "job timed out after %ums (dst undefined)",
+                  cfg_.job_timeout_ms);
+    res.message = msg;
+    {
+        std::lock_guard<std::mutex> lk(stats_mu_);
+        stats_.jobs_timed_out++;
+    }
+    HAL_LOG_WARNING("DspService: %s", msg);
+    return res;
+}
+
+DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
+                                          uint64_t& job_id_out) {
+    job_id_out = 0;
     DspJobResult res;
     if (!running_.load() || !dsp_ctx_) {
         res.rc = DSP_SVC_ERR_UNAVAILABLE;
@@ -734,8 +962,30 @@ DspJobResult DspService::submit_job(const DspJobDesc& desc) {
     std::string quota_why;
     if (!quota_try_consume(job->owner_fd, job->charge_mpix, quota_why)) {
         unpin_entries(job->pinned);
+        job->pinned.clear();
         res.rc = DSP_SVC_ERR_QUOTA;
         res.message = quota_why;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            stats_.jobs_rejected++;
+        }
+        return res;
+    }
+
+    // P2: bound outstanding jobs per owner — each registry entry holds a
+    // JobItem and keeps its buffers pinned until completed and reaped.
+    // Applies to sync submitters too (they are async jobs waited at once),
+    // so in-flight jobs per connection cap at the same limit either way.
+    {
+        std::lock_guard<std::mutex> lk(done_mu_);
+        if (client_async_jobs_[job->owner_fd] >= cfg_.max_async_jobs_per_client) {
+            res.rc = DSP_SVC_ERR_QUOTA;
+            res.message = "too many outstanding jobs for this client";
+        }
+    }
+    if (res.rc != DSP_SVC_OK) {
+        unpin_entries(job->pinned);
+        job->pinned.clear();
         {
             std::lock_guard<std::mutex> lk(stats_mu_);
             stats_.jobs_rejected++;
@@ -751,30 +1001,49 @@ DspJobResult DspService::submit_job(const DspJobDesc& desc) {
     }
     q_cv_.notify_one();
 
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.job_timeout_ms);
-    bool completed;
+    job_id_out = next_job_id_.fetch_add(1);
     {
-        std::unique_lock<std::mutex> lk(done_mu_);
-        completed = done_cv_.wait_until(lk, deadline, [&] { return job->done; });
-        if (!completed && !job->done) {
-            // Watchdog: a vendor op in flight cannot be cancelled — the
-            // worker finishes it and discards the result (jobs_timed_out).
-            job->abandoned = true;
-        }
+        std::lock_guard<std::mutex> lk(done_mu_);
+        jobs_[job_id_out] = job;
+        client_async_jobs_[job->owner_fd]++;
     }
-    if (job->done) return job->result;
+    res.rc = DSP_SVC_OK;
+    res.message = "submitted";
+    return res;
+}
 
-    res.rc = DSP_SVC_ERR_TIMEOUT;
-    char msg[128];
-    std::snprintf(msg, sizeof(msg), "job timed out after %ums (dst undefined)",
-                  cfg_.job_timeout_ms);
-    res.message = msg;
-    {
-        std::lock_guard<std::mutex> lk(stats_mu_);
-        stats_.jobs_timed_out++;
+DspJobResult DspService::wait_job(uint64_t job_id, uint32_t timeout_ms,
+                                  bool& done_out) {
+    done_out = false;
+    DspJobResult res;
+    std::unique_lock<std::mutex> lk(done_mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        res.rc = DSP_SVC_ERR_NO_BUFFER;
+        res.message = "unknown or reaped job id";
+        return res;
     }
-    HAL_LOG_WARNING("DspService: %s", msg);
+    JobRef job = it->second;
+    if (timeout_ms > 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        done_cv_.wait_until(lk, deadline, [&] { return job->done; });
+    } /* timeout_ms == 0: non-blocking poll (HAL wait() convention) */
+    if (!job->done) {
+        // Entry stays valid — the caller may re-wait later.
+        res.rc = DSP_SVC_ERR_TIMEOUT;
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "job %lu not done after %ums",
+                      static_cast<unsigned long>(job_id), timeout_ms);
+        res.message = msg;
+        return res;
+    }
+    res = job->result;
+    const int owner = job->owner_fd;
+    jobs_.erase(it);
+    auto cnt = client_async_jobs_.find(owner);
+    if (cnt != client_async_jobs_.end() && cnt->second > 0) cnt->second--;
+    done_out = true;
     return res;
 }
 
@@ -863,6 +1132,25 @@ int DspService::build_convert(const JobRef& job, HalDspConvertFormatParams& p) {
     return DSP_SVC_OK;
 }
 
+int DspService::build_blend(const JobRef& job,
+                            std::vector<HalDspOverlay>& overlays,
+                            HalDspBlendParams& p) {
+    /* pinned[0] is the NV12 base (composited in place); pinned[1+i] are
+     * the ARGB32 overlays, placed by rects[i]. Vector storage per call —
+     * a shared static was the aliasing bug fixed in 4c65a595. */
+    p.base = job->pinned[0]->fb;
+    overlays.resize(job->desc.rects.size());
+    for (size_t i = 0; i < job->desc.rects.size(); ++i) {
+        const DspRect& r = job->desc.rects[i];
+        overlays[i].overlay = job->pinned[1 + i]->fb;
+        overlays[i].x_offset = static_cast<int32_t>(r.x);
+        overlays[i].y_offset = static_cast<int32_t>(r.y);
+    }
+    p.overlays = overlays.data();
+    p.overlay_count = static_cast<uint32_t>(overlays.size());
+    return DSP_SVC_OK;
+}
+
 void DspService::execute_job(const JobRef& job) {
     const auto t0 = std::chrono::steady_clock::now();
     int rc = DSP_SVC_ERR_INVALID;
@@ -873,6 +1161,8 @@ void DspService::execute_job(const JobRef& job) {
     HalDspConvertFormatParams cfp{};
     std::vector<HalDspMultiCropOutput> outs;
     HalDspMultiCropResizeParams mcp{};
+    std::vector<HalDspOverlay> ovs;
+    HalDspBlendParams blp{};
 
     switch (job->desc.op) {
     case HAL_DSP_OP_RESIZE:
@@ -899,8 +1189,14 @@ void DspService::execute_job(const JobRef& job) {
             rc = dsp_ops_->convert_format(dsp_ctx_, &cfp);
         }
         break;
+    case HAL_DSP_OP_BLEND:
+        if (build_blend(job, ovs, blp) == DSP_SVC_OK) {
+            what = "blend";
+            rc = dsp_ops_->blend(dsp_ctx_, &blp);
+        }
+        break;
     default:
-        break; /* BLEND etc. land in P1 */
+        break; /* unreachable — validate_and_pin gates the op set */
     }
 
     const auto t1 = std::chrono::steady_clock::now();

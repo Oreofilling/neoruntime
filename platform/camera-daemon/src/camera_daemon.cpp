@@ -468,7 +468,9 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     // UDS DSP_ALLOC can never race service startup; the publisher dispatches
     // DSP_ALLOC/DSP_BUF_RELEASE to it (set_dsp_service wires the pointer).
     if (hal_loader_ && hal_loader_->has_dsp() && hal_loader_->has_frame_buffer()) {
-        DspServiceConfig dsp_cfg;
+        // P2: knobs come from the `dsp:` YAML section (defaults in
+        // dsp_service.h) — quota applies per owning client connection.
+        const DspServiceConfig dsp_cfg = config_.dsp;
         dsp_service_ = std::make_unique<DspService>(hal_loader_->dsp(),
                                                     hal_loader_->frame_buffer(),
                                                     dsp_cfg);

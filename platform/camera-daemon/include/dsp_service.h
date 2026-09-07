@@ -13,8 +13,8 @@
  * Transport split:
  *  - Buffer plane (FdPublisher UDS, fds via SCM_RIGHTS):
  *      alloc_buffers / release_buffer / release_client_buffers
- *  - Job plane (gRPC SubmitDspJob, buffers referenced by id):
- *      submit_job
+ *  - Job plane (gRPC SubmitDspJob[/Async/WaitDspJob], buffers by id):
+ *      submit_job / submit_job_async / wait_job
  *
  * Scheduling (PLAT-4): single serialized worker thread; NORMAL jobs drain
  * before BACKGROUND; per-owner token-bucket quota (jobs/s + MPix/s); size
@@ -75,6 +75,9 @@ struct DspServiceConfig {
      * daemon pixel budget — the memory is the client's own — but each one
      * pins a descriptor and dup'd fds, so cap them separately. */
     uint32_t max_imports_per_client = 64;
+    /* P2: outstanding SubmitDspJobAsync jobs per owner. Bounds the jobs_
+     * registry (each entry holds a JobItem + pins until waited/reaped). */
+    uint32_t max_async_jobs_per_client = 32;
 };
 
 /** Job priority. P0 has two levels; platform (daemon-internal) jobs are
@@ -168,6 +171,46 @@ public:
     /** UDS disconnect hook: detach every buffer owned by the client. */
     void release_client_buffers(int client_fd);
 
+    /* ---------------- One-shot ops plane (daemon-internal) ----------- */
+
+    /**
+     * RAII pin of one registered buffer, for daemon-internal one-shot ops
+     * (EncodeImage). Same lifecycle semantics as job pins: a concurrent
+     * release detaches the id; the HAL buffer stays alive until this pin
+     * drops. Move-only.
+     */
+    class BufferPin {
+    public:
+        BufferPin() = default;
+        ~BufferPin();
+        BufferPin(BufferPin&& other) noexcept;
+        BufferPin& operator=(BufferPin&& other) noexcept;
+        BufferPin(const BufferPin&) = delete;
+        BufferPin& operator=(const BufferPin&) = delete;
+
+        bool ok() const { return rc_ == DSP_SVC_OK; }
+        int rc() const { return rc_; }             /* DspServiceError */
+        HalFrameBuffer* fb() const { return fb_; } /* valid while held */
+        int owner_fd() const { return owner_fd_; } /* quota owner     */
+
+    private:
+        friend class DspService;
+        void release_pin();
+
+        DspService* svc_ = nullptr;
+        void* entry_ = nullptr; /* BufferEntry* — opaque outside the .cpp */
+        HalFrameBuffer* fb_ = nullptr;
+        int owner_fd_ = -1;
+        int rc_ = DSP_SVC_ERR_NO_BUFFER;
+    };
+
+    /**
+     * Pin one buffer id for a daemon-internal op. Returns a handle whose
+     * fb() is the registered HalFrameBuffer (valid until the handle is
+     * destroyed) or rc() == DSP_SVC_ERR_NO_BUFFER.
+     */
+    BufferPin pin_buffer(uint64_t buffer_id);
+
     /* ---------------- Job plane (gRPC worker thread) ------------------ */
 
     /**
@@ -176,6 +219,23 @@ public:
      * must be considered undefined until a later successful job.
      */
     DspJobResult submit_job(const DspJobDesc& desc);
+
+    /**
+     * P2 async form: validate, enqueue and return immediately. On success
+     * `job_id_out` receives the registry id for wait_job(). The job pins
+     * its buffers until it completes AND is waited (or is reaped below);
+     * the per-owner outstanding count is capped by
+     * cfg.max_async_jobs_per_client.
+     */
+    DspJobResult submit_job_async(const DspJobDesc& desc, uint64_t& job_id_out);
+
+    /**
+     * Wait for an async job. timeout_ms 0 = non-blocking poll. On done the
+     * result is returned and the registry entry reaped; on timeout the
+     * entry stays valid (re-wait later) and rc is DSP_SVC_ERR_TIMEOUT with
+     * *done_out = false. Unknown/reaped ids return DSP_SVC_ERR_NO_BUFFER.
+     */
+    DspJobResult wait_job(uint64_t job_id, uint32_t timeout_ms, bool& done_out);
 
     DspServiceStats stats() const;
 
@@ -230,6 +290,9 @@ private:
                          std::vector<HalDspMultiCropOutput>& outputs,
                          HalDspMultiCropResizeParams& p);
     int build_convert(const JobRef& job, HalDspConvertFormatParams& p);
+    int build_blend(const JobRef& job,
+                    std::vector<HalDspOverlay>& overlays,
+                    HalDspBlendParams& p);
 
     static uint64_t pixels_of(uint32_t w, uint32_t h) {
         return static_cast<uint64_t>(w) * static_cast<uint64_t>(h);
@@ -249,9 +312,14 @@ private:
     std::deque<JobRef> q_normal_;
     std::deque<JobRef> q_background_;
 
-    // Completion signalling for in-flight submit_job callers.
+    // Completion signalling for in-flight submit_job callers and the P2
+    // async job registry (jobs_ keyed by job_id; entries hold pins until
+    // waited-to-completion or reaped on owner disconnect / stop).
     std::mutex done_mu_;
     std::condition_variable done_cv_;
+    std::unordered_map<uint64_t, JobRef> jobs_;
+    std::unordered_map<int, uint32_t> client_async_jobs_;
+    std::atomic<uint64_t> next_job_id_{1}; /* starts at 1; 0 = never valid */
 
     // Buffer registry.
     std::mutex buffers_mu_;
