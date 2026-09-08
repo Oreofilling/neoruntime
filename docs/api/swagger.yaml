@@ -455,6 +455,72 @@ paths:
                       $ref: '#/components/schemas/ModelInfo'
         '404':
           description: Model not found
+    put:
+      tags:
+      - AI Runtime
+      summary: Update model metadata
+      description: Applies a partial update — absent fields keep their current values.
+        Config-only edits on a loaded model (threshold, postprocess_profile, ...)
+        trigger a reload so the NPU serves the new settings immediately.
+      operationId: updateModel
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                file_hash:
+                  type: string
+                  description: Replaces the model file (must be a staged parse blob)
+                model_type:
+                  type: string
+                output_mode:
+                  type: string
+                  enum:
+                  - platform
+                  - raw
+                model_variant:
+                  type: string
+                config:
+                  type: object
+                  additionalProperties: true
+                file_size:
+                  type: integer
+                  format: int64
+                network_name:
+                  type: string
+                vstream_info:
+                  type: string
+                input_width:
+                  type: integer
+                input_height:
+                  type: integer
+      responses:
+        '200':
+          description: Model updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        model_id:
+                          type: string
+                        status:
+                          type: string
+        '404':
+          description: Model not found
     delete:
       tags:
       - AI Runtime
@@ -6782,6 +6848,163 @@ paths:
                             type: object
                         failed_count:
                           type: integer
+
+  /ai/models/parse/abandon:
+    post:
+      tags:
+      - AI Runtime
+      summary: Abandon a staged parse blob
+      description: Deletes a model file staged by /ai/models/parse when no registered
+        model references it. file_path must match the staged blob path returned by
+        parse for file_hash — the equality check doubles as a path jail.
+      operationId: abandonStagedModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - file_hash
+              - file_path
+              properties:
+                file_hash:
+                  type: string
+                  description: Hex sha256 returned by parse
+                file_path:
+                  type: string
+                  description: Staged blob path returned by parse
+      responses:
+        '200':
+          description: Abandon result (deleted=false with referenced_by when the
+            blob is still in use)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        file_hash:
+                          type: string
+                        deleted:
+                          type: boolean
+                        referenced_by:
+                          type: integer
+  /ai/models/{model_id}/export:
+    get:
+      tags:
+      - AI Runtime
+      summary: Export a model as a portable package
+      description: Streams the model file wrapped in the platform package format with
+        its metadata and sha256 digest embedded. The body is a binary attachment
+        (<model_id>.bin), not the JSON envelope.
+      operationId: exportModel
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Binary package stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Model not found
+  /apps/manifest:
+    patch:
+      tags: [App Manager]
+      summary: Patch fields of a stored app manifest
+      description: Applies field-level edits while preserving comments, unknown fields
+        and key order. Only whitelisted paths are patchable (metadata.name/version/
+        description, spec.resources.cpu/memory, spec.autostart, spec.restart_policy,
+        spec.models, spec.permissions.*); any other field rejects the whole request.
+      operationId: patchManifest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest_path, fields]
+              properties:
+                manifest_path:
+                  type: string
+                  description: Manifest path relative to the manifests root
+                fields:
+                  type: object
+                  additionalProperties: true
+                  description: Field path to new value
+      responses:
+        '200':
+          description: Patched manifest
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        manifest:
+                          type: object
+                        multi_container:
+                          type: boolean
+        '404':
+          description: Manifest not found
+  /apps/upload-package:
+    post:
+      tags: [App Manager]
+      summary: Upload a single-file app package
+      description: Uploads a .neoapp package (multipart field "file"; tar.gz format
+        only — zip is rejected) and extracts the embedded manifest and container
+        image in one step. Response fields mirror upload-manifest and upload-image
+        so the import wizard hydrates the same way.
+      operationId: uploadPackage
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: .neoapp package (tar.gz)
+      responses:
+        '200':
+          description: Package uploaded (manifest and image staged)
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        metadata:
+                          type: object
+                          description: App manifest metadata (id, name, ...)
+                        image:
+                          type: string
 
 components:
   securitySchemes:
