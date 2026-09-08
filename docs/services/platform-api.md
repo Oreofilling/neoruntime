@@ -369,9 +369,15 @@ graph TD
 | POST | `/apps` | Install application |
 | POST | `/apps/wizard` | Wizard install |
 | POST | `/apps/upload-image` | Upload image |
+| POST | `/apps/upload-manifest` | Upload app.yaml manifest |
+| POST | `/apps/upload-package` | Upload .neoapp app package (server-side unpack) |
+| POST | `/apps/install-package` | Install from uploaded manifest + image |
+| GET | `/apps/install-progress/{task_id}` | Async install progress |
 | GET | `/apps/{id}` | Application details |
+| GET | `/apps/{id}/permissions` | Application permissions |
 | POST | `/apps/{id}/start` | Start |
 | POST | `/apps/{id}/stop` | Stop |
+| POST | `/apps/{id}/restart` | Restart |
 | DELETE | `/apps/{id}` | Uninstall |
 | GET | `/apps/{id}/stats` | Statistics |
 | GET | `/apps/{id}/logs` | Logs |
