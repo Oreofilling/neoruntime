@@ -313,15 +313,15 @@ private:
     std::deque<JobRef> q_background_;
 
     // Completion signalling for in-flight submit_job callers and the P2
-    // async job registry (jobs_ keyed by job_id; entries hold pins until
+    // async job registry (jobs_ keyed by unpredictable random job ids — see
+    // fresh_random_id in dsp_service.cpp; entries hold pins until
     // waited-to-completion or reaped on owner disconnect / stop).
     std::mutex done_mu_;
     std::condition_variable done_cv_;
     std::unordered_map<uint64_t, JobRef> jobs_;
     std::unordered_map<int, uint32_t> client_async_jobs_;
-    std::atomic<uint64_t> next_job_id_{1}; /* starts at 1; 0 = never valid */
 
-    // Buffer registry.
+    // Buffer registry (keys are unpredictable random ids; 0 is never valid).
     std::mutex buffers_mu_;
     std::unordered_map<uint64_t, BufferEntry*> buffers_;
     std::unordered_map<int, uint32_t> client_buffer_count_;

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <utility>
 #include <unistd.h> /* dup, close, readlink */
 #include <sys/mman.h> /* mmap/munmap (USERPTR imports) */
@@ -33,6 +34,18 @@ constexpr uint32_t kMinDim = 16;
 constexpr uint32_t kMaxDim = 8192;
 /* SCM_RIGHTS wire cap on the UDS alloc response: count*num_planes fds. */
 constexpr uint32_t kMaxAllocFds = 64;
+
+/* Unpredictable 64-bit id draw for buffer/job handles. Clients address
+ * buffers and jobs by id over camera.sock, and pin/blend/encode act on
+ * whatever an id resolves to, so a guessable sequential id would let one
+ * connected client reach another client's buffers (per-caller binding is a
+ * tracked follow-up; the socket carries no identity). Seeded from
+ * random_device like RtspServer's session ids; callers re-draw on the
+ * (2^-64) collision with a live id. */
+uint64_t fresh_random_id() {
+    static std::mt19937_64 rng(std::random_device{}());
+    return rng();
+}
 
 bool format_supported(HalPixelFormat f) {
     switch (f) {
@@ -308,7 +321,8 @@ DspService::AllocResult DspService::alloc_buffers(int client_fd, uint32_t width,
             out.fds.reserve(static_cast<size_t>(count) * out.num_planes);
             for (HalFrameBuffer* fb : fbs) {
                 auto* e = new BufferEntry();
-                e->id = next_buffer_id_++;
+                do { e->id = fresh_random_id(); }
+                while (e->id == 0 || buffers_.count(e->id));
                 e->client_fd = client_fd;
                 e->fb = fb;
                 buffers_[e->id] = e;
@@ -462,7 +476,8 @@ DspService::ImportResult DspService::import_buffer(
         }
         client_import_count_[client_fd] = have + 1;
         auto* e = new BufferEntry();
-        e->id = next_buffer_id_++;
+        do { e->id = fresh_random_id(); }
+        while (e->id == 0 || buffers_.count(e->id));
         e->client_fd = client_fd;
         e->fb = fb;
         e->imported = true;
@@ -1001,9 +1016,13 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
     }
     q_cv_.notify_one();
 
-    job_id_out = next_job_id_.fetch_add(1);
     {
         std::lock_guard<std::mutex> lk(done_mu_);
+        /* Same unpredictable-id rule as buffers: wait/poll act on whatever
+         * job id resolves to, so ids must not be a guessable sequence. The
+         * draw and the jobs_ collision check share the lock. */
+        do { job_id_out = fresh_random_id(); }
+        while (job_id_out == 0 || jobs_.count(job_id_out));
         jobs_[job_id_out] = job;
         client_async_jobs_[job->owner_fd]++;
     }
