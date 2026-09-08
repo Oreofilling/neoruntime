@@ -356,7 +356,12 @@ func (h *APIHandlers) syncRuntimeModelsToDB(ctx context.Context, runtimeMap map[
 
 	// 1. Upsert: runtime models → DB
 	for modelID, rt := range runtimeMap {
-		if rt.Transient || rt.OwnerId != "" {
+		// The runtime normalizes an omitted owner to "<system>" before it
+		// stores and returns it, so ownerless device-level registrations
+		// arrive here as systemOwnerID, never "". Classify through
+		// isSystemOwned or runtime-only device models vanish from the
+		// model page as pseudo app-origin rows.
+		if rt.Transient || !isSystemOwned(rt.OwnerId) {
 			// App-bundled and app-registered models serve only the app that
 			// shipped them: never persisted, never listed on the model page.
 			continue
@@ -690,7 +695,7 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			FileSize:      req.FileSize,
 			ModelType:     req.ModelType,
 			OutputMode:    outputMode,
-			Variant:       req.Variant,
+			Variant:       strings.TrimSpace(req.Variant),
 			Threshold:     threshold,
 			MaxDetections: maxDet,
 			NetworkName:   req.NetworkName,
@@ -834,7 +839,10 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	staged.ModelType = newModelType
 	staged.OutputMode = newOutputMode
 	if req.Variant != nil {
-		staged.Variant = *req.Variant
+		// Store what validation saw: it trims before parsing, and the
+		// runtime's variant parsers require the leading '{' — an accepted
+		// but untrimmed blob would fail (or misparse) at load time.
+		staged.Variant = strings.TrimSpace(*req.Variant)
 	}
 	if req.FileSize != nil {
 		staged.FileSize = *req.FileSize
@@ -934,8 +942,19 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 				return
 			}
 		}
-		if _, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID}); err != nil {
+		// The runtime reports logical failures (a racing session kept the
+		// model in use, a co-owner kept the registration) as OK transport
+		// status with success=false — proceeding anyway would commit the
+		// new row while the NPU keeps serving the old weights under the
+		// same ID, so the response status gates the update too.
+		unloadStatus, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+		if err != nil {
 			Resp(c).FailMsg(CodeOperationFailed, "Failed to unload model before update: "+err.Error())
+			return
+		}
+		if unloadStatus != nil && !unloadStatus.Success {
+			Resp(c).FailMsg(CodeOperationFailed,
+				"Failed to unload model before update: "+unloadStatus.Message)
 			return
 		}
 	}
@@ -1162,7 +1181,7 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 			FileSize:      fileSize,
 			FileHash:      fileHash,
 			ModelType:     modelType,
-			Variant:       variant,
+			Variant:       strings.TrimSpace(variant),
 			Threshold:     threshold,
 			MaxDetections: maxDetections,
 			VStreamInfo:   vstreamInfoJSON,

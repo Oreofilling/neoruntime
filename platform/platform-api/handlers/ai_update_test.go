@@ -41,6 +41,10 @@ type fakeAIRuntime struct {
 	live        map[string]bool
 	liveInfos   map[string]*inferencepb.ModelInfo
 	loadFail    bool
+	// unloadFail makes UnregisterModel answer OK transport status with
+	// success=false — the runtime's real "logically refused" shape (a racing
+	// session kept the model in use, a co-owner kept it live).
+	unloadFail bool
 	// smokeSpec, when set, is attached as the single input of entries created
 	// by RegisterModel, so a load-time smoke test gets a real tensor spec to
 	// build a zero input from instead of skipping on empty Inputs.
@@ -54,6 +58,11 @@ func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.Model
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "unload:"+in.ModelId)
+	if f.unloadFail {
+		// Keep the entry live: a refused unload means the runtime is still
+		// serving this model.
+		return &inferencepb.Status{Success: false, Message: "model in use"}, nil
+	}
 	delete(f.live, in.ModelId)
 	delete(f.liveInfos, in.ModelId)
 	return &inferencepb.Status{Success: true}, nil
@@ -373,6 +382,37 @@ func TestUpdateModelLoadedFileSwapReloads(t *testing.T) {
 	}
 	if row.FilePath != newBlob {
 		t.Errorf("DB file path must track the swapped blob, got %q want %q", row.FilePath, newBlob)
+	}
+}
+
+func TestUpdateModelUnloadRefusedAbortsUpdate(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	seedBlob(t, store, "h2")
+	// Row loaded + runtime serves it, but the unload is logically refused —
+	// a racing session kept the model in use. The runtime reports that as OK
+	// transport status with success=false; proceeding would commit the new
+	// row while the NPU keeps serving the old weights under the same id, so
+	// the refusal must veto the update.
+	fake.markLive("busy_det")
+	fake.unloadFail = true
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "busy_det", Name: "busy_det", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: "/blobs/h1.hef", FileHash: "h1",
+	})
+	w := putUpdate(t, h, "busy_det", `{"file_hash":"h2","model_type":"detection"}`)
+	if respCode(t, w) != CodeOperationFailed {
+		t.Fatalf("code = %d body=%s, want %d (refused unload must abort)", respCode(t, w), w.Body.String(), CodeOperationFailed)
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 1 || calls[0] != "unload:busy_det" {
+		t.Fatalf("refused unload must abort before any reload, got %v", calls)
+	}
+	row, err := h.aiModelRepo.GetByModelID("busy_det")
+	if err != nil || row == nil {
+		t.Fatalf("row missing: %v", err)
+	}
+	if row.FileHash != "h1" || row.Status != "loaded" {
+		t.Errorf("row must keep its pre-update state, got hash=%q status=%q", row.FileHash, row.Status)
 	}
 }
 

@@ -146,6 +146,29 @@ func TestSyncRuntimeModelsToDBSkipsOwnerTaggedRegistrations(t *testing.T) {
 	}
 }
 
+func TestSyncRuntimeModelsToDBTreatsSystemOwnerAsDeviceLevel(t *testing.T) {
+	h := newAISyncTestHandler(t)
+	// The runtime normalizes an omitted owner to "<system>" before storing
+	// (grpc_service/model_manager), so this is how ownerless device-level
+	// registrations actually arrive. Testing "" alone would miss the bug.
+	runtimeMap := map[string]*inferencepb.ModelInfo{
+		"runtime_det": {ModelId: "runtime_det", Name: "Runtime Detector", OwnerId: "<system>"},
+		"tool_det":    {ModelId: "tool_det", Name: "Tool Detector", OwnerId: ""},
+	}
+
+	h.syncRuntimeModelsToDB(context.Background(), runtimeMap, true)
+
+	for _, id := range []string{"runtime_det", "tool_det"} {
+		row, err := h.aiModelRepo.GetByModelID(id)
+		if err != nil || row == nil {
+			t.Fatalf("%s missing from DB after sync — system-owned registrations are device-level (err=%v)", id, err)
+		}
+		if row.Status != "loaded" {
+			t.Errorf("%s status = %q, want loaded", id, row.Status)
+		}
+	}
+}
+
 func TestSyncRuntimeModelsToDBHealsLegacyOwnerStamps(t *testing.T) {
 	h := newAISyncTestHandler(t)
 	// Disk model mislabeled as app-owned by the legacy backfill.
