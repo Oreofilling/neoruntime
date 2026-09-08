@@ -230,3 +230,22 @@ func TestExtractImageNameFromTar_PlainAndGzip(t *testing.T) {
 		t.Errorf("gzip tar image name = %q, want e2e/test-image:0.1.0", got)
 	}
 }
+
+func TestManifestJSONSizeCap(t *testing.T) {
+	// A "manifest.json" larger than the cap is a crafted archive trying to
+	// balloon memory, not an image: the validator must reject it and the
+	// tag reader must return "" — without reading the whole entry.
+	dir := t.TempDir()
+	bloat := bytes.Repeat([]byte("a"), int(maxDockerManifestBytes)+1)
+	path := writeTar(t, dir, "bloat.tar", func(tw *tar.Writer) {
+		writeTarMember(t, tw, "manifest.json", bloat)
+	})
+
+	err := ValidateDockerSaveTar(path)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ValidateDockerSaveTar error = %v, want size-cap rejection", err)
+	}
+	if got := ExtractImageNameFromTar(path); got != "" {
+		t.Errorf("ExtractImageNameFromTar = %q, want \"\" for oversized manifest", got)
+	}
+}

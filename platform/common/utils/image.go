@@ -20,6 +20,13 @@ type dockerSaveManifest struct {
 	Layers   []string `json:"Layers"`
 }
 
+// maxDockerManifestBytes caps the manifest.json entry read out of an
+// untrusted image archive (both readers below parse uploaded files, never
+// files the platform produced). Real docker-save manifests are a few KB of
+// config/layers references; a larger entry is a crafted archive trying to
+// balloon daemon memory, not an image.
+const maxDockerManifestBytes int64 = 1 << 20
+
 // openTarStream opens tarPath and returns a tar.Reader over it, transparently
 // decompressing gzip archives (uploads of .tar.gz / .tgz). The returned closer
 // releases every resource opened here.
@@ -63,6 +70,8 @@ func (m multiCloser) Close() error {
 // image archive the containerd importer can actually consume:
 //
 //   - the root manifest.json exists and parses as a JSON array;
+//   - that entry is capped at maxDockerManifestBytes — an oversized
+//     "manifest" is a crafted archive, not an image;
 //   - every entry's Config and Layers[] reference members that exist in the
 //     archive. Digest-style references ("sha256:<digest>") fail here with a
 //     "not found in archive" error — the importer resolves layers by member
@@ -95,9 +104,12 @@ func ValidateDockerSaveTar(path string) error {
 		if name != "manifest.json" {
 			continue
 		}
-		data, err := io.ReadAll(tr)
+		data, err := io.ReadAll(io.LimitReader(tr, maxDockerManifestBytes+1))
 		if err != nil {
 			return fmt.Errorf("read manifest.json: %w", err)
+		}
+		if int64(len(data)) > maxDockerManifestBytes {
+			return fmt.Errorf("manifest.json exceeds %dMB (not a docker-save archive)", maxDockerManifestBytes>>20)
 		}
 		if err := json.Unmarshal(data, &manifests); err != nil {
 			return fmt.Errorf("parse manifest.json: %w", err)
@@ -159,8 +171,8 @@ func ExtractImageNameFromTar(tarPath string) string {
 		if strings.TrimPrefix(hdr.Name, "./") != "manifest.json" {
 			continue
 		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
+		data, err := io.ReadAll(io.LimitReader(tr, maxDockerManifestBytes+1))
+		if err != nil || int64(len(data)) > maxDockerManifestBytes {
 			return ""
 		}
 		// manifest.json is an array of objects.
