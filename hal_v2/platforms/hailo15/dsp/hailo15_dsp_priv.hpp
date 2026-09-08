@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
+#include <thread>
 
 #include "dsp/hal_dsp.h"
 #include <hailo/hailodsp.h>
@@ -22,6 +23,15 @@ struct HalDspJobTag {
 
     /* Opaque pointer to operation-specific params (copied by implementation). */
     void            *params_copy;
+
+    /* Ownership handoff between the worker thread and job_release():
+     * - worker_done: set by the worker under mtx once it no longer touches the job.
+     * - release_requested: set by job_release() under mtx when the caller released
+     *   the handle before the worker finished. Exactly one side (whoever observes
+     *   both flags) deletes the job, preventing use-after-free on cancel+release
+     *   while an operation is executing. */
+    std::atomic<bool> worker_done{false};
+    std::atomic<bool> release_requested{false};
 };
 
 struct Hailo15DspJobItem {
