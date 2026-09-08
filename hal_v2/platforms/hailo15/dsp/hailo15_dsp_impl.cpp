@@ -153,10 +153,14 @@ static void hailo15_dsp_finish_job(HalDspJobHandle job, HalDspJobStatus status, 
         job->result.status = status;
         job->result.result_code = result_code;
         job->completed.store(true);
+        /* Notify before publishing worker_done: once that flag is visible, a racing
+         * job_release() may delete the job, so nothing (including the cv) may be
+         * touched after it. Notifying under the lock is legal and keeps the job
+         * guaranteed alive here. */
+        job->cv.notify_all();
         delete_job = job->release_requested.load();
-        job->worker_done.store(true);
+        job->worker_done.store(true); /* final access to the job by the worker */
     }
-    job->cv.notify_all();
     std::free(params_copy);
     if (delete_job) {
         delete job;
@@ -167,22 +171,16 @@ static void hailo15_dsp_worker_thread(Hailo15DspContext *ctx)
 {
     for (;;) {
         Hailo15DspJobItem item{};
-        bool have_item = false;
         {
             std::unique_lock<std::mutex> lock(ctx->queue_mtx);
             ctx->queue_cv.wait(lock, [&] {
                 return ctx->stop_flag.load() || !ctx->job_queue.empty();
             });
-            if (ctx->job_queue.empty()) {
-                break; /* stop requested and queue drained */
+            if (ctx->stop_flag.load()) {
+                break; /* stop requested: leave queued jobs to the fail-drain below */
             }
             item = ctx->job_queue.front();
             ctx->job_queue.pop();
-            have_item = true;
-        }
-
-        if (!have_item) {
-            continue;
         }
 
         HalDspJobHandle job = item.job;
@@ -846,6 +844,13 @@ static int hailo15_dsp_submit(void *dsp_ctx, HalDspOpType op_type, const void *p
 
     {
         std::lock_guard<std::mutex> lock(ctx->queue_mtx);
+        if (ctx->stop_flag.load()) {
+            /* Shutting down: a job queued now could outlive the worker's fail-drain
+             * (it would never complete and its handle would leak). */
+            std::free(copy);
+            delete job;
+            return HAL_ERR_INVALID_STATE;
+        }
         ctx->job_queue.push(Hailo15DspJobItem{job});
     }
     ctx->queue_cv.notify_one();
