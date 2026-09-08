@@ -2581,6 +2581,18 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 		return nil
 	}
 
+	// Path safety precedes everything else: the app ID and model aliases
+	// become directory names under the data root, and this runs before
+	// canonicalizeManifest (the install step that rejects unsafe IDs).
+	if err := requireSafePathSegment("app id", appID); err != nil {
+		return err
+	}
+	for _, p := range pending {
+		if err := requireSafePathSegment("model alias", p.alias); err != nil {
+			return err
+		}
+	}
+
 	s.aiRuntimeMutex.RLock()
 	client := s.aiRuntimeClient
 	s.aiRuntimeMutex.RUnlock()
@@ -2961,7 +2973,12 @@ func (s *AppManagerServer) UnloadModels(ctx context.Context, appID string, manif
 	// the only caller and reinstall recreates the directory, so this is safe
 	// and idempotent. Runs before the ai-runtime guards: the files must go
 	// even when the runtime is unreachable.
-	if err := os.RemoveAll(appModelsDir(appID)); err != nil {
+	if err := requireSafePathSegment("app id", appID); err != nil {
+		// Install rejects unsafe IDs long before any files exist, so there is
+		// nothing to remove — and RemoveAll on the derived path could act far
+		// outside this app's own tree.
+		logger.Warn("Skipping extracted-model cleanup for app %s: %v", appID, err)
+	} else if err := os.RemoveAll(appModelsDir(appID)); err != nil {
 		logger.Warn("Failed to remove extracted model files for app %s: %v", appID, err)
 	}
 

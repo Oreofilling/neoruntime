@@ -464,6 +464,49 @@ func TestExtractImageModels(t *testing.T) {
 		}
 	})
 
+	t.Run("hostile_app_id_is_rejected_before_any_path_use", func(t *testing.T) {
+		// An app id like ".." makes appModelsDir resolve to the data root
+		// itself; the failure rollback's RemoveAll would then wipe it. The
+		// guard must fire before any directory is created — install otherwise
+		// runs extraction before canonicalizeManifest rejects the id.
+		root := withTempRoot(t)
+		sentinel := filepath.Join(root, "do-not-delete")
+		if err := os.WriteFile(sentinel, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		client := &stubInferenceClient{}
+		s := newExtractionServer(t, client, fakeExtractor(nil, nil))
+		m := bundledImageManifest()
+
+		if err := s.extractImageModels(context.Background(), "..", m, pendingFor(m, "detector"), nil); err == nil {
+			t.Fatal("extractImageModels() expected error for hostile app id")
+		}
+		if _, err := os.Stat(sentinel); err != nil {
+			t.Fatalf("sentinel under the data root must survive: %v", err)
+		}
+		if len(client.registrations) != 0 {
+			t.Errorf("registrations = %+v, want none", client.registrations)
+		}
+	})
+
+	t.Run("hostile_alias_is_rejected", func(t *testing.T) {
+		// Model aliases are directory segments too: "../escape" would unpack
+		// (and on rollback, RemoveAll) outside the app's own tree.
+		withTempRoot(t)
+		client := &stubInferenceClient{}
+		s := newExtractionServer(t, client, fakeExtractor(nil, nil))
+		m := bundledImageManifest()
+		m.Spec.Models["../escape"] = manifest.ModelMapping{ID: "evil_det", Path: "/app/models/evil.bin", Required: true}
+
+		pending := append(pendingFor(m, "detector"), pendingFor(m, "../escape")...)
+		if err := s.extractImageModels(context.Background(), "app-x", m, pending, nil); err == nil {
+			t.Fatal("extractImageModels() expected error for hostile alias")
+		}
+		if len(client.registrations) != 0 {
+			t.Errorf("registrations = %+v, want none", client.registrations)
+		}
+	})
+
 	t.Run("required_extract_failure_rolls_back", func(t *testing.T) {
 		withTempRoot(t)
 		client := &stubInferenceClient{}

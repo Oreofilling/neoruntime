@@ -16,6 +16,19 @@ import (
 // into a path.
 var safeAppIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// requireSafePathSegment guards app IDs and model aliases before they become
+// directory names under the data root (appModelsDir/<alias>). Install runs
+// bundled-model extraction before canonicalizeManifest — the step that
+// otherwise rejects unsafe IDs — and extraction's failure rollback
+// RemoveAlls the derived directory, so a value like ".." or "../.." would
+// resolve outside the app's own tree, up to the data root itself.
+func requireSafePathSegment(kind, value string) error {
+	if !safeAppIDPattern.MatchString(value) {
+		return fmt.Errorf("%s %q is not usable as a directory name", kind, value)
+	}
+	return nil
+}
+
 func managedManifestsRoot() string {
 	// Derived from the shared root rather than Apps.ManifestsPath config:
 	// that field is declared but unused on this side, and its value on

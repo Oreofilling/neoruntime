@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,4 +163,24 @@ func TestCanonicalizeManifest(t *testing.T) {
 			t.Fatal("missing source should be an error")
 		}
 	})
+}
+
+func TestUnloadModelsRefusesUnsafeAppID(t *testing.T) {
+	// Uninstall removes appModelsDir(appID) wholesale; an id like ".." would
+	// resolve to the data root's parent. Install can never create such an
+	// app (extraction rejects the id first), so the only correct behavior on
+	// encountering one is to refuse the removal.
+	root := t.TempDir()
+	withRoot(t, root)
+	sentinel := filepath.Join(root, "do-not-delete")
+	if err := os.WriteFile(sentinel, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &AppManagerServer{}
+	s.UnloadModels(context.Background(), "..", "/gone/app.yaml")
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("sentinel under the data root must survive: %v", err)
+	}
 }
