@@ -102,10 +102,11 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     // postprocess type later — this registration is the only chance to get it.
     // An empty model_type means raw-tensor-only output: the model would load
     // fine and then silently return nothing useful to apps expecting
-    // structured results (the DPM failure mode). Fail loudly instead. Apps
-    // that genuinely want raw tensors can still set raw_output_only per
-    // request on a post-configured model, so nothing is lost.
-    if (req->transient() && req->model_type().empty()) {
+    // structured results (the DPM failure mode). Fail loudly instead — unless
+    // the registration explicitly opts into raw output (raw_output_only), which
+    // is how bundled packages declare output_mode=raw: the app decodes the
+    // tensors itself, so no postprocess session is wanted.
+    if (req->transient() && req->model_type().empty() && !req->raw_output_only()) {
         LOG_ERROR("RegisterModel: transient model '%s' registered without "
                   "model_type — post-processing would be unavailable "
                   "(raw tensors only). Rejecting.",

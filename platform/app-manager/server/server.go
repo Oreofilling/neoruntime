@@ -2643,12 +2643,13 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 		}
 		hefPath := filepath.Join(aliasDir, reg.HEF)
 		regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-			ModelId:      p.id,
-			ModelPath:    hefPath,
-			OwnerId:      appID,
-			ModelType:    reg.ModelType,
-			ModelVariant: reg.ModelVariant,
-			Transient:    true,
+			ModelId:       p.id,
+			ModelPath:     hefPath,
+			OwnerId:       appID,
+			ModelType:     reg.ModelType,
+			ModelVariant:  reg.ModelVariant,
+			Transient:     true,
+			RawOutputOnly: reg.RawOutputOnly,
 		})
 		if err != nil {
 			fail("registering unpacked model at %s failed: %v", hefPath, err)
@@ -2868,12 +2869,13 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 				continue
 			}
 			_, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-				ModelId:      modelID,
-				ModelPath:    hefPath,
-				OwnerId:      appID,
-				ModelType:    reg.ModelType,
-				ModelVariant: reg.ModelVariant,
-				Transient:    true,
+				ModelId:       modelID,
+				ModelPath:     hefPath,
+				OwnerId:       appID,
+				ModelType:     reg.ModelType,
+				ModelVariant:  reg.ModelVariant,
+				Transient:     true,
+				RawOutputOnly: reg.RawOutputOnly,
 			})
 			if err != nil {
 				logger.Warn("Failed to restore bundled model %s for app %s: %v", modelID, appID, err)

@@ -513,6 +513,47 @@ func TestExtractImageModels(t *testing.T) {
 		}
 	})
 
+	t.Run("raw_output_package_registers_with_explicit_optin", func(t *testing.T) {
+		// output_mode=raw packages compose an empty grpc type. The runtime's
+		// transient gate rejects typeless registrations unless they carry the
+		// explicit raw_output_only opt-in — without it, installing a raw
+		// bundled package always fails at the RegisterModel step.
+		root := withTempRoot(t)
+		client := &stubInferenceClient{}
+		rawMeta := detectionPackageMeta("bundled_det")
+		rawMeta.OutputMode = "raw"
+		s := newExtractionServer(t, client, fakeExtractor(map[string]*storage.PackageMeta{
+			"/app/models/det.bin": rawMeta,
+		}, nil))
+		m := bundledImageManifest()
+
+		if err := s.extractImageModels(context.Background(), "app-x", m, pendingFor(m, "detector"), nil); err != nil {
+			t.Fatalf("extractImageModels() unexpected error: %v", err)
+		}
+
+		if len(client.registrations) != 1 {
+			t.Fatalf("registrations = %d, want 1", len(client.registrations))
+		}
+		reg := client.registrations[0]
+		if reg.ModelId != "bundled_det" || reg.OwnerId != "app-x" || !reg.Transient {
+			t.Fatalf("registration = %+v, want bundled_det/app-x/transient", reg)
+		}
+		if reg.ModelType != "" || reg.ModelVariant != "" {
+			t.Errorf("registration = %+v, want empty type/variant for raw output", reg)
+		}
+		if !reg.RawOutputOnly {
+			t.Error("registration must carry raw_output_only=true (the transient gate's explicit opt-in)")
+		}
+		// The sidecar must persist the flag for the reboot restore path.
+		loaded, err := loadBundledRegistration(filepath.Join(root, "app-models", "app-x", "detector"))
+		if err != nil {
+			t.Fatalf("loadBundledRegistration() error: %v", err)
+		}
+		if !loaded.RawOutputOnly {
+			t.Error("sidecar RawOutputOnly = false, want true")
+		}
+	})
+
 	t.Run("register_status_failure_fails_required", func(t *testing.T) {
 		withTempRoot(t)
 		client := &stubInferenceClient{regStatus: map[string]*inferencepb.Status{

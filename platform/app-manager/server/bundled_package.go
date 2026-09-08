@@ -26,12 +26,16 @@ const bundledRegistrationFile = "registration.json"
 
 // bundledRegistration is the durable record of one unpacked bundled model.
 // ModelType/ModelVariant are the gRPC registration values modelload composed
-// at install time (empty ModelType = raw output, no postprocess session).
+// at install time (empty ModelType = raw output, no postprocess session);
+// RawOutputOnly records that the emptiness is the package's declared
+// output_mode=raw choice, not a missing type — the runtime's transient gate
+// wants the explicit opt-in before accepting a typeless registration.
 type bundledRegistration struct {
-	ModelID      string `json:"model_id"`
-	HEF          string `json:"hef"` // basename, inside app-models/<app>/<alias>/
-	ModelType    string `json:"model_type"`
-	ModelVariant string `json:"model_variant,omitempty"`
+	ModelID       string `json:"model_id"`
+	HEF           string `json:"hef"` // basename, inside app-models/<app>/<alias>/
+	ModelType     string `json:"model_type"`
+	ModelVariant  string `json:"model_variant,omitempty"`
+	RawOutputOnly bool   `json:"raw_output_only,omitempty"`
 }
 
 // unpackBundledPackage opens the AMPK package at binPath, verifies it, stages
@@ -118,10 +122,11 @@ func unpackBundledPackage(binPath, aliasDir, modelID string) (*bundledRegistrati
 	}
 
 	reg := &bundledRegistration{
-		ModelID:      modelID,
-		HEF:          filepath.Base(hefPath),
-		ModelType:    grpcType,
-		ModelVariant: variant,
+		ModelID:       modelID,
+		HEF:           filepath.Base(hefPath),
+		ModelType:     grpcType,
+		ModelVariant:  variant,
+		RawOutputOnly: grpcType == "" && outputMode == model.OutputModeRaw,
 	}
 	blob, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {

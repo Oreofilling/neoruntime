@@ -226,3 +226,44 @@ func TestPreloadModelsCompositionFailureSkipsRegistration(t *testing.T) {
 		t.Errorf("inferCalls=%v unregistered=%v, want neither", client.inferCalls, client.unregistered)
 	}
 }
+
+func TestPreloadModelsRestoresRawBundledModelWithOptIn(t *testing.T) {
+	// Reboot restore of a bundled output_mode=raw package: the sidecar's
+	// empty ModelType must reach the runtime together with the explicit
+	// raw_output_only opt-in, or the transient gate rejects the restore and
+	// the app's model silently never comes back after a reboot.
+	client := &stubInferenceClient{}
+	s, root := newPreloadEnv(t, client, nil)
+
+	aliasDir := filepath.Join(root, "app-models", "app-x", "rawdet")
+	if err := os.MkdirAll(aliasDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(aliasDir, "raw.hef"), []byte("hef-bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	sidecar, err := json.Marshal(bundledRegistration{ModelID: "bundled_raw", HEF: "raw.hef", RawOutputOnly: true})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(aliasDir, bundledRegistrationFile), sidecar, 0o644); err != nil {
+		t.Fatalf("WriteFile sidecar: %v", err)
+	}
+
+	m := preloadManifest("bundled_raw")
+	m.Spec.Models = map[string]manifest.ModelMapping{
+		"rawdet": {ID: "bundled_raw", Path: "/app/models/raw.bin"},
+	}
+	s.PreloadModels(context.Background(), "app-x", m)
+
+	if len(client.registrations) != 1 {
+		t.Fatalf("registrations = %+v, want one bundled restore", client.registrations)
+	}
+	reg := client.registrations[0]
+	if reg.ModelId != "bundled_raw" || reg.OwnerId != "app-x" || !reg.Transient {
+		t.Errorf("registration = %+v, want bundled_raw/app-x/transient", reg)
+	}
+	if reg.ModelType != "" || !reg.RawOutputOnly {
+		t.Errorf("registration = %+v, want empty type with raw_output_only=true", reg)
+	}
+}

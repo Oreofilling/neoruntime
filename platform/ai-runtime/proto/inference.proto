@@ -67,6 +67,12 @@ message ModelRegisterRequest {
   string model_variant = 14;    // Variant: yolov8n, yolov8s, etc. (for detection models)
 
   bool transient = 15;          // App-bundled model (extracted from an app image): hidden from the model page, never persisted to platform.db
+
+  // Explicit opt-in for transient registrations that intentionally carry no
+  // model_type: the app wants raw tensors (no postprocess session) and will
+  // decode them itself. Distinguishes "package forgot the type" (rejected)
+  // from "package chose raw output" (allowed).
+  bool raw_output_only = 16;
 }
 
 message ModelRegisterResponse {

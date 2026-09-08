@@ -272,6 +272,19 @@ func TestUnpackBundledPackageRawOutputMode(t *testing.T) {
 	if reg.ModelVariant != "" {
 		t.Errorf("ModelVariant = %q, want empty for raw output", reg.ModelVariant)
 	}
+	// The typeless registration must carry the explicit opt-in — the runtime's
+	// transient gate rejects typeless registrations without it.
+	if !reg.RawOutputOnly {
+		t.Error("RawOutputOnly = false, want true for a raw-output package")
+	}
+	// And the sidecar must round-trip it for the reboot restore path.
+	loaded, err := loadBundledRegistration(dir)
+	if err != nil {
+		t.Fatalf("loadBundledRegistration() error: %v", err)
+	}
+	if !loaded.RawOutputOnly {
+		t.Error("sidecar round-trip lost RawOutputOnly")
+	}
 }
 
 func TestLoadBundledRegistrationRejectsBadRecords(t *testing.T) {
