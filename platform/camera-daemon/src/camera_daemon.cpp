@@ -2078,7 +2078,8 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
 
     // Update existing AI overlay config
     if (ai_overlay_) {
-        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness);
+        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness,
+                                   config_.ai_overlay_enable_face_blur);
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;

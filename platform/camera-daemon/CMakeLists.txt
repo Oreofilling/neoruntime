@@ -287,6 +287,21 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(daynight-policy-test PRIVATE pthread)
     add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
 
+    add_executable(ai-overlay-face-blur-test
+        tests/ai_overlay_face_blur_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(ai-overlay-face-blur-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(ai-overlay-face-blur-test PRIVATE pthread)
+    add_test(NAME ai-overlay-face-blur-test COMMAND ai-overlay-face-blur-test)
+
     add_executable(fg2009-position-test
         tests/fg2009_position_test.cpp
         ${HAL_COMMON_DIR}/devices/hal_lens_fg2009.c

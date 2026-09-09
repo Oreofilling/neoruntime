@@ -33,12 +33,23 @@ struct AiOverlayConfig {
     bool     draw_confidence  = true;
     bool     draw_landmarks   = true;
     bool     enable_face_blur = false;
+    uint32_t face_blur_block_size = 8;   // mosaic cell size (px); 0 = blur
     uint32_t box_thickness    = 2;
 
     std::unordered_map<std::string, std::string> stream_map;
 
     const HalDrawOps* draw_ops = nullptr;
 };
+
+// Collects pixel-space mosaic rects for detections labeled "face"
+// (case-insensitive). Normalized bboxes are scaled to the frame and clipped to
+// its bounds (hal_bbox_to_rect semantics); degenerate rects are skipped.
+// Returns the number of rects written to out, at most cap. Free function so
+// the geometry is unit-testable without a live subscriber or frame.
+size_t collect_face_mosaic_rects(const HalPostprocessResult& result,
+                                 uint32_t frame_width, uint32_t frame_height,
+                                 uint32_t block_size,
+                                 HalDrawMosaic* out, size_t cap);
 
 class AiOverlaySubscriber {
 public:
@@ -55,7 +66,8 @@ public:
 
     bool is_running() const { return running_.load(); }
 
-    void update_config(bool draw_labels, bool draw_confidence, uint32_t box_thickness);
+    void update_config(bool draw_labels, bool draw_confidence, uint32_t box_thickness,
+                       bool enable_face_blur);
 
 private:
     struct StreamResult {
@@ -69,13 +81,15 @@ private:
     void subscriber_loop();
 
     void draw_with_primitives(const HalPostprocessResult& result, HalFrameBuffer* frame,
-                              bool draw_labels, bool draw_confidence, uint32_t box_thickness);
+                              bool draw_labels, bool draw_confidence, uint32_t box_thickness,
+                              bool enable_face_blur, uint32_t face_blur_block_size);
     bool parse_json_result(const std::string& payload, const std::string& stream_id,
                            HalPostprocessResult* out);
 
     AiOverlayConfig config_;
 
-    // Protects mutable config fields (draw_labels, draw_confidence, box_thickness)
+    // Protects mutable config fields (draw_labels, draw_confidence, box_thickness,
+    // enable_face_blur)
     mutable std::mutex config_mu_;
 
     HalDrawConfig default_draw_cfg_{};

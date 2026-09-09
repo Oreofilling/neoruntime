@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <sstream>
 #include <cmath>
+#include <algorithm>
+#include <strings.h>
 
 extern "C" {
     #include "hal_log.h"
@@ -73,34 +75,94 @@ void AiOverlaySubscriber::stop() {
     HAL_LOG_INFO("AiOverlaySubscriber: stopped");
 }
 
-void AiOverlaySubscriber::update_config(bool draw_labels, bool draw_confidence, uint32_t box_thickness) {
+void AiOverlaySubscriber::update_config(bool draw_labels, bool draw_confidence,
+                                        uint32_t box_thickness, bool enable_face_blur) {
     {
         std::lock_guard<std::mutex> lock(config_mu_);
         config_.draw_labels = draw_labels;
         config_.draw_confidence = draw_confidence;
         config_.box_thickness = box_thickness;
+        config_.enable_face_blur = enable_face_blur;
     }
 
-    HAL_LOG_INFO("AiOverlaySubscriber: config updated (labels=%s, confidence=%s, thickness=%u)",
+    HAL_LOG_INFO("AiOverlaySubscriber: config updated (labels=%s, confidence=%s, thickness=%u, face_blur=%s)",
                  draw_labels ? "on" : "off",
                  draw_confidence ? "on" : "off",
-                 box_thickness);
+                 box_thickness,
+                 enable_face_blur ? "on" : "off");
 }
 
 static constexpr auto RESULT_TTL = std::chrono::milliseconds(500);
+
+// Face-blur label match: exact "face" in any case ("FACE", "Face").
+// Substrings like "facial" or "face_mask" do not match — only a detector that
+// labels the region class itself as face gets blurred.
+static bool is_face_label(const char* label) {
+    return label != nullptr && strcasecmp(label, "face") == 0;
+}
+
+size_t collect_face_mosaic_rects(const HalPostprocessResult& result,
+                                 uint32_t frame_width, uint32_t frame_height,
+                                 uint32_t block_size,
+                                 HalDrawMosaic* out, size_t cap) {
+    if (out == nullptr || cap == 0) return 0;
+    if (result.type != HAL_POST_TYPE_DETECTION) return 0;
+    if (frame_width == 0 || frame_height == 0) return 0;
+
+    // num_detections comes from the event payload; parse_json_result clamps
+    // writes but not the count, so bound reads to the array too.
+    const auto& det = result.result.detection;
+    uint32_t n = std::min(det.num_detections, (uint32_t)HAL_MAX_DETECTIONS);
+
+    size_t count = 0;
+    for (uint32_t i = 0; i < n && count < cap; i++) {
+        const auto& d = det.detections[i];
+        if (!is_face_label(d.label)) continue;
+
+        // Reuse hal_bbox_to_rect for the normalized→pixel mapping: sanitize,
+        // order, scale, and clip to frame bounds in one place.
+        HalDrawRect rect{};
+        hal_bbox_to_rect(&d.bbox, frame_width, frame_height, &rect);
+        if (rect.width <= 0 || rect.height <= 0) continue;  // fully outside
+
+        HalDrawMosaic mosaic{};
+        mosaic.x = rect.x;
+        mosaic.y = rect.y;
+        mosaic.width = rect.width;
+        mosaic.height = rect.height;
+        mosaic.block_size = static_cast<int32_t>(block_size);  // 0 = blur
+        out[count++] = mosaic;
+    }
+    return count;
+}
+
+// Draws face mosaics for a (possibly fresh) result using the snapshotted
+// config. Shared by the unified draw_result path and the primitives fallback.
+static void draw_face_mosaics(const HalPostprocessResult& result, HalFrameBuffer* frame,
+                              const HalDrawOps* ops,
+                              uint32_t block_size) {
+    HalDrawMosaic mosaics[HAL_MAX_DETECTIONS];
+    size_t n = collect_face_mosaic_rects(result, frame->width, frame->height,
+                                         block_size, mosaics, HAL_MAX_DETECTIONS);
+    for (size_t i = 0; i < n; i++) {
+        ops->draw_mosaic(frame, &mosaics[i]);
+    }
+}
 
 void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
                                         HalFrameBuffer* frame) {
     if (!config_.enabled || !frame) return;
 
     // Snapshot mutable config fields under lock
-    bool draw_labels, draw_confidence;
-    uint32_t box_thickness;
+    bool draw_labels, draw_confidence, enable_face_blur;
+    uint32_t box_thickness, face_blur_block_size;
     {
         std::lock_guard<std::mutex> lock(config_mu_);
         draw_labels = config_.draw_labels;
         draw_confidence = config_.draw_confidence;
         box_thickness = config_.box_thickness;
+        enable_face_blur = config_.enable_face_blur;
+        face_blur_block_size = config_.face_blur_block_size;
     }
 
     std::lock_guard<std::mutex> lock(results_mu_);
@@ -141,8 +203,15 @@ void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
         sr.draw_cfg.draw_detection_confidence = draw_confidence;
         sr.draw_cfg.default_box_thickness = static_cast<int32_t>(box_thickness);
         config_.draw_ops->draw_result(&sr.result, frame, &sr.draw_cfg);
+
+        // Face blur rides on top of the unified draw pass so boxes/labels
+        // stay under HAL control; the mosaic covers them.
+        if (enable_face_blur && config_.draw_ops->draw_mosaic) {
+            draw_face_mosaics(sr.result, frame, config_.draw_ops, face_blur_block_size);
+        }
     } else {
-        draw_with_primitives(sr.result, frame, draw_labels, draw_confidence, box_thickness);
+        draw_with_primitives(sr.result, frame, draw_labels, draw_confidence,
+                             box_thickness, enable_face_blur, face_blur_block_size);
     }
 }
 
@@ -150,7 +219,9 @@ void AiOverlaySubscriber::draw_with_primitives(const HalPostprocessResult& resul
                                                 HalFrameBuffer* frame,
                                                 bool draw_labels,
                                                 bool draw_confidence,
-                                                uint32_t box_thickness) {
+                                                uint32_t box_thickness,
+                                                bool enable_face_blur,
+                                                uint32_t face_blur_block_size) {
     const auto* ops = config_.draw_ops;
     if (!ops || !frame) return;
 
@@ -191,6 +262,12 @@ void AiOverlaySubscriber::draw_with_primitives(const HalPostprocessResult& resul
                 txt.thickness = 1;
                 ops->draw_text(frame, &txt);
             }
+        }
+
+        // Parity with the unified draw_result path: mosaic face detections on
+        // top of the boxes/labels drawn above.
+        if (enable_face_blur && ops->draw_mosaic) {
+            draw_face_mosaics(result, frame, ops, face_blur_block_size);
         }
         return;
     }
