@@ -1590,6 +1590,24 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
         }
     }
 
+    // AI overlay: same bake point as DPM. The frontend bridge invokes this
+    // callback BEFORE auto-feeding the encoder (hailo15_ml_frontend_bridge
+    // runs cb() ahead of add_buffer() on the same buffer), so pixels drawn
+    // here reach the encoded stream in BOTH auto_feed and manual mode.
+    // ai_overlay_ is swapped under op_mu_ (update_ai_overlay_config resets
+    // it under the write lock), so take the read lock around the call.
+    // Semantics mirror DPM: the overlay is baked into the shared pipeline
+    // buffer, so zero-copy subscribers of an overlaid stream see it too —
+    // apps that need clean inference input should subscribe a stream that
+    // is not an overlay target (ai_overlay.stream_map models that split).
+    // apply_overlay no-ops in O(1) when no fresh result matches the stream.
+    {
+        std::shared_lock<std::shared_mutex> lk(op_mu_);
+        if (ai_overlay_) {
+            ai_overlay_->apply_overlay(dispatch_name, frame);
+        }
+    }
+
     if (frame_router_) {
         frame_router_->on_frame_arrived(dispatch_name, frame);
     }
@@ -3648,6 +3666,8 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
     // init_from_context clears callbacks and running flags. Rebind the frame
     // router before subscribing to the refreshed contexts.
+    // Route through handle_video_frame_for_routing (not straight into the
+    // router) so the DPM bake and AI overlay keep applying after the refresh.
     for (auto& slot : video_source_->streams()) {
         std::string dispatch_name = slot.name;
         auto it = video_name_map_.find(slot.name);
@@ -3655,7 +3675,7 @@ void* CameraDaemon::refresh_autofocus_video_context() {
 
         video_source_->set_frame_callback(slot.name,
             [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                frame_router_->on_frame_arrived(dispatch_name, frame);
+                handle_video_frame_for_routing(dispatch_name, frame);
             });
     }
     for (auto& slot : video_source_->streams()) {
@@ -4172,8 +4192,11 @@ void CameraDaemon::register_subscribers() {
                 });
         }
 
-        // --- Priority 2: Encoder subscriber (AI overlay → OSD → encode → FPS update) ---
-        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly
+        // --- Priority 2: Encoder subscriber (OSD → encode → FPS update) ---
+        // Skip in media pipeline auto_feed mode — encoder gets frames from pipeline directly.
+        // AI overlay is NOT drawn here anymore: it bakes at the frontend callback
+        // (handle_video_frame_for_routing) so it reaches the encoded stream in
+        // auto_feed mode too; drawing here as well would double-render in manual mode.
         if (!auto_feed && has_encoder && encoder_mgr_) {
             std::string sname = s.name;
             std::string enc_name = s.name;
@@ -4186,9 +4209,6 @@ void CameraDaemon::register_subscribers() {
             fps_trackers_[sname] = FpsTracker{};
             frame_router_->subscribe(s.name, "encoder_" + s.name,
                 [this, sname, enc_name](ManagedFrame* mf) {
-                    if (ai_overlay_) {
-                        ai_overlay_->apply_overlay(sname, &mf->frame);
-                    }
                     encoder_mgr_->encode_frame(enc_name, &mf->frame);
                     frame_router_->release(mf);
 
@@ -6053,6 +6073,9 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                 // init_from_context clears the old stream slots and callbacks.
                 // Rebind them before restarting frame delivery.
+                // Same as the AF-refresh rebind: go through
+                // handle_video_frame_for_routing so DPM bake and AI overlay
+                // survive the profile switch.
                 for (auto& slot : video_source_->streams()) {
                     std::string dispatch_name = slot.name;
                     auto vnit = video_name_map_.find(slot.name);
@@ -6060,7 +6083,7 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 
                     video_source_->set_frame_callback(slot.name,
                         [this, dispatch_name](const std::string&, HalFrameBuffer* frame) {
-                            frame_router_->on_frame_arrived(dispatch_name, frame);
+                            handle_video_frame_for_routing(dispatch_name, frame);
                         });
                 }
                 for (auto& slot : video_source_->streams()) {
