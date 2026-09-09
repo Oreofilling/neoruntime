@@ -2052,8 +2052,13 @@ bool CameraDaemon::set_rtsp_enabled(bool enabled) {
     return true;
 }
 
-bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence, uint32_t box_thickness) {
+bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
+                                            uint32_t box_thickness,
+                                            std::optional<bool> enable_face_blur) {
     std::unique_lock<std::shared_mutex> lock(op_mu_);
+    // Absent flag keeps the current face-blur state (yaml value until first set).
+    const bool face_blur = enable_face_blur.value_or(config_.ai_overlay_enable_face_blur);
+
     if (enabled && !ai_overlay_) {
         if (!hal_loader_ || !hal_loader_->has_draw()) {
             HAL_LOG_ERROR("CameraDaemon: Cannot enable AI overlay without HAL draw ops");
@@ -2064,6 +2069,7 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
 
         return init_ai_overlay();
     }
@@ -2078,11 +2084,11 @@ bool CameraDaemon::update_ai_overlay_config(bool enabled, bool draw_labels, bool
 
     // Update existing AI overlay config
     if (ai_overlay_) {
-        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness,
-                                   config_.ai_overlay_enable_face_blur);
+        ai_overlay_->update_config(draw_labels, draw_confidence, box_thickness, face_blur);
         config_.ai_overlay_draw_labels = draw_labels;
         config_.ai_overlay_draw_confidence = draw_confidence;
         config_.ai_overlay_box_thickness = box_thickness;
+        config_.ai_overlay_enable_face_blur = face_blur;
     }
 
     return true;
@@ -4126,6 +4132,7 @@ bool CameraDaemon::init_ai_overlay() {
     cfg.draw_confidence     = config_.ai_overlay_draw_confidence;
     cfg.draw_landmarks      = config_.ai_overlay_draw_landmarks;
     cfg.enable_face_blur    = config_.ai_overlay_enable_face_blur;
+    cfg.face_blur_block_size = config_.ai_overlay_face_blur_block_size;
     cfg.box_thickness       = config_.ai_overlay_box_thickness;
     cfg.draw_ops            = hal_loader_->draw();
 

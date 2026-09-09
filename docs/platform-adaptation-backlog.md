@@ -65,7 +65,7 @@ cost/benefit order:
 | # | Contract | Content | Cost |
 |---|----------|---------|------|
 | F1 | **ai-overlay-extended** (cheapest) | `AiOverlayConfig` v2: polygons, tracks, per-class colors, per-app overlay sources. Its blend dependency is already hardware-validated (HAL-2: alpha=0 passthrough exact, ~129 µs/overlay marginal on dma-buf, ~0.67 ms single). | renderer extension only |
-| F2 | **frame-injection** | `PushFrame`: app-composed frames / OSD into the encoded main stream. The injection node exists and sits idle on the target device (`/dev/video10`, `hailo-vid-out-mcm-in`, memory-injection). | media-graph wiring + dma-buf import contract + geometry/format constraints + EOS/flush semantics |
+| F2 | **frame-injection** | `PushFrame`: app-composed frames / OSD into the encoded main stream. The injection node exists and sits idle on the target device (`/dev/video10`, `hailo-vid-out-mcm-in`, memory-injection). Note: the AI-overlay use case no longer needs F2 — the overlay is baked into the pipeline buffer at the frontend-callback site (`handle_video_frame_for_routing`), upstream of the encoder in both auto_feed and manual mode. F2 remains for general app-composed frame push only. | media-graph wiring + dma-buf import contract + geometry/format constraints + EOS/flush semantics |
 | F3 | **web-stream-url** | `GetWebStreamUrl`: apps ask the platform console for a video endpoint (HLS/MJPEG reverse-proxied by the platform) instead of opening their own ports. | RPC + nginx; no dependencies |
 
 ## G. Telemetry / quota operations

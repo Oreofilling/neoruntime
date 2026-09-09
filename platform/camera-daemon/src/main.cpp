@@ -450,6 +450,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.ai_overlay_draw_landmarks = (val == "true" || val == "1");
             else if (trimmed.find("enable_face_blur:") != std::string::npos)
                 cfg.ai_overlay_enable_face_blur = (val == "true" || val == "1");
+            else if (trimmed.find("face_blur_block_size:") != std::string::npos)
+                cfg.ai_overlay_face_blur_block_size = parse_u32_config(val, "ai_overlay.face_blur_block_size");
             else if (trimmed.find("box_thickness:") != std::string::npos)
                 cfg.ai_overlay_box_thickness = parse_u32_config(val, "ai_overlay.box_thickness");
             else if (trimmed.find("overlay_library:") != std::string::npos)

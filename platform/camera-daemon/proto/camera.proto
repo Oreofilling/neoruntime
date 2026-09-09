@@ -94,6 +94,8 @@ message AiOverlayConfig {
   bool show_confidence = 6;
   // Show label
   bool show_label = 7;
+  // Mosaic detections labeled "face" (subscriber-level face blur)
+  optional bool enable_face_blur = 8;
 }
 
 // OSD Text Overlay Configuration

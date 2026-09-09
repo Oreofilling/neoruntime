@@ -28,6 +28,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <cstdint>
+#include <optional>
 #include <ctime>
 #include <chrono>
 #include <optional>
@@ -183,6 +184,7 @@ struct DaemonConfig {
     bool        ai_overlay_draw_confidence = true;
     bool        ai_overlay_draw_landmarks = true;
     bool        ai_overlay_enable_face_blur = false;
+    uint32_t    ai_overlay_face_blur_block_size = 8;   // mosaic cell size (px); 0 = blur
     uint32_t    ai_overlay_box_thickness = 2;
     // Stream mapping: inference_stream_id → display_encoder_stream
     // e.g. "third" → "main" means results from stream_id="third" drawn on "main" encoder.
@@ -377,7 +379,8 @@ public:
      * @brief Update AI overlay configuration - hot reload
      */
     bool update_ai_overlay_config(bool enabled, bool draw_labels, bool draw_confidence,
-                                   uint32_t box_thickness);
+                                   uint32_t box_thickness,
+                                   std::optional<bool> enable_face_blur = {});
 
 #ifdef HAS_GRPC
     /**

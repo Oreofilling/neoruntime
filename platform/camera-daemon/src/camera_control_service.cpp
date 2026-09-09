@@ -274,17 +274,22 @@ grpc::Status CameraControlServiceImpl::UpdateAiOverlay(
         return grpc::Status(grpc::StatusCode::INTERNAL, "Daemon missing");
     }
 
-    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u",
+    HAL_LOG_INFO("[CameraControl] Update AI Overlay: enabled=%s labels=%s confidence=%s thickness=%u face_blur=%s",
                  request->enabled() ? "true" : "false",
                  request->show_label() ? "true" : "false",
                  request->show_confidence() ? "true" : "false",
-                 request->line_thickness());
+                 request->line_thickness(),
+                 request->has_enable_face_blur()
+                     ? (request->enable_face_blur() ? "true" : "false") : "keep");
 
     bool success = daemon_->update_ai_overlay_config(
         request->enabled(),
         request->show_label(),
         request->show_confidence(),
-        request->line_thickness()
+        request->line_thickness(),
+        request->has_enable_face_blur()
+            ? std::optional<bool>(request->enable_face_blur())
+            : std::optional<bool>{}
     );
 
     response->set_success(success);
