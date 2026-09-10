@@ -250,6 +250,12 @@ func TestLoadModelDoesNotHealTransientRegistration(t *testing.T) {
 // stale session and report a heal that never happened.
 func TestLoadModelHealUnloadRefusedAbortsReload(t *testing.T) {
 	h, fake, store := newAIUpdateTestEnv(t)
+	// The heal compares against the composed runtime path, which
+	// materializes under RootPath — isolate it so the composition succeeds
+	// (and writes nothing real) on machines without a writable /data/aipc.
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
 	blob := seedBlob(t, store, "h1")
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "stale_det", Name: "stale_det", Status: "uploaded", Source: "web",
