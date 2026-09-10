@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	inferencepb "aipc/platform/ai-runtime/proto"
@@ -266,4 +267,56 @@ func TestPreloadModelsRestoresRawBundledModelWithOptIn(t *testing.T) {
 	if reg.ModelType != "" || !reg.RawOutputOnly {
 		t.Errorf("registration = %+v, want empty type with raw_output_only=true", reg)
 	}
+}
+
+func TestPreloadModelsBundledLogicalFailureHonorsRequired(t *testing.T) {
+	setup := func(t *testing.T, required bool) (*AppManagerServer, *stubInferenceClient, *manifest.AppManifest) {
+		t.Helper()
+		client := &stubInferenceClient{regStatus: map[string]*inferencepb.Status{
+			"bundled_det": {Success: false, Message: "model id collision: different configuration"},
+		}}
+		s, root := newPreloadEnv(t, client, nil)
+		aliasDir := filepath.Join(root, "app-models", "app-x", "detector")
+		if err := os.MkdirAll(aliasDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(aliasDir, "det.hef"), []byte("hef"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sidecar, err := json.Marshal(bundledRegistration{
+			ModelID: "bundled_det", HEF: "det.hef", ModelType: "detection",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(aliasDir, bundledRegistrationFile), sidecar, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m := preloadManifest("bundled_det")
+		m.Spec.Models = map[string]manifest.ModelMapping{
+			"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: required},
+		}
+		return s, client, m
+	}
+
+	t.Run("required_refusal_aborts_start_precondition", func(t *testing.T) {
+		s, client, m := setup(t, true)
+		err := s.PreloadModels(context.Background(), "app-x", m)
+		if err == nil || !strings.Contains(err.Error(), "different configuration") {
+			t.Fatalf("PreloadModels error = %v, want logical refusal", err)
+		}
+		if len(client.inferCalls) != 0 {
+			t.Errorf("refused registration must not be smoke-probed, got %v", client.inferCalls)
+		}
+	})
+
+	t.Run("optional_refusal_warns_but_does_not_abort", func(t *testing.T) {
+		s, client, m := setup(t, false)
+		if err := s.PreloadModels(context.Background(), "app-x", m); err != nil {
+			t.Fatalf("optional refusal must not abort: %v", err)
+		}
+		if len(client.inferCalls) != 0 {
+			t.Errorf("refused optional registration must not be probed, got %v", client.inferCalls)
+		}
+	})
 }

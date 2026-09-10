@@ -127,7 +127,8 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     std::string why;
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
                                         owner_id, req->transient(),
-                                        req->model_variant(), &why);
+                                        req->model_variant(),
+                                        req->model_type(), &why);
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message(
@@ -136,8 +137,11 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         return grpc::Status::OK;
     }
 
-    // Initialize post-processing if model_type is provided
-    if (!req->model_type().empty() && model_mgr_->has_post_ops()) {
+    // Initialize post-processing only for a fresh entry. rc==1 is an
+    // identical same-id/path/config co-owner: its shared postprocess session
+    // is already initialized, and replacing it during an active inference is
+    // unnecessary even though the requested configuration is equivalent.
+    if (rc == 0 && !req->model_type().empty() && model_mgr_->has_post_ops()) {
         int post_rc = model_mgr_->init_post_process(
             req->model_id(), req->model_type(), req->model_variant());
         if (post_rc != 0 && req->transient()) {

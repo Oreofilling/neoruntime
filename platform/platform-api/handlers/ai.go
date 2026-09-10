@@ -726,7 +726,12 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			Resp(c).FailMsg(CodeInvalidRequest, "Model file not found. Please re-parse the model first.")
 			return
 		}
-		createErr := h.aiModelRepo.Create(dbModel)
+		var createErr error
+		if model.ResolveModelType(dbModel.ModelType) == "detection" && dbModel.Threshold == 0 {
+			createErr = h.aiModelRepo.CreatePreservingZeroThreshold(dbModel)
+		} else {
+			createErr = h.aiModelRepo.Create(dbModel)
+		}
 		h.blobRefMu.Unlock()
 		if createErr != nil {
 			Resp(c).FailMsg(CodeServiceError, "Failed to persist model to DB: "+createErr.Error())
@@ -1209,6 +1214,23 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 		}
 	}
 
+	// Detection uploads persist a schema-default config like RegisterModel
+	// does. The config's threshold key is what lets the composed runtime
+	// variant tell an explicit threshold: 0 (retain every detection — a
+	// legal schema value) apart from a legacy row's never-set column.
+	var configJSON string
+	if model.ResolveModelType(modelType) == "detection" {
+		merged := model.GetFieldDefaults("detection")
+		if merged != nil {
+			merged["threshold"] = threshold
+			merged["max_detections"] = maxDetections
+			if blob, err := json.Marshal(merged); err == nil {
+
+				configJSON = string(blob)
+			}
+		}
+	}
+
 	// Save to DB as "uploaded" — not loaded to NPU yet
 	if h.aiModelRepo != nil {
 		dbModel := &model.AIModel{
@@ -1221,6 +1243,7 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 			Variant:       strings.TrimSpace(variant),
 			Threshold:     threshold,
 			MaxDetections: maxDetections,
+			Config:        configJSON,
 			VStreamInfo:   vstreamInfoJSON,
 			NetworkName:   networkName,
 			InputWidth:    inputWidth,
@@ -1243,7 +1266,12 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 			Resp(c).FailMsg(CodeInvalidRequest, "Model file vanished during upload (reclaimed by storage cleanup); please retry")
 			return
 		}
-		createErr := h.aiModelRepo.Create(dbModel)
+		var createErr error
+		if model.ResolveModelType(dbModel.ModelType) == "detection" && dbModel.Threshold == 0 {
+			createErr = h.aiModelRepo.CreatePreservingZeroThreshold(dbModel)
+		} else {
+			createErr = h.aiModelRepo.Create(dbModel)
+		}
 		h.blobRefMu.Unlock()
 		if createErr != nil {
 			h.cleanupStagedBlob(fileHash, ext, blobExisted)

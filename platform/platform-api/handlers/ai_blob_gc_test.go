@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -288,6 +289,13 @@ func TestUploadModelHappyPathCreatesRow(t *testing.T) {
 		t.Errorf("row fields = type:%q thr:%v max:%d status:%q, want detection/0.5/32/uploaded",
 			row.ModelType, row.Threshold, row.MaxDetections, row.Status)
 	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(row.Config), &cfg); err != nil {
+		t.Fatalf("uploaded detection config must be JSON: %v (%q)", err, row.Config)
+	}
+	if cfg["threshold"] != 0.5 || cfg["nms_threshold"] != 0.45 {
+		t.Errorf("uploaded config = %v, want threshold=0.5 and schema nms default=0.45", cfg)
+	}
 	if row.DesiredState != "unloaded" {
 		t.Errorf("uploaded row desired_state = %q, want unloaded — upload is not a load promise", row.DesiredState)
 	}
@@ -474,5 +482,33 @@ func TestSweepOrphanBlobsWaitsForAdmission(t *testing.T) {
 	<-done
 	if store.Exists(staleHash, ".hef") {
 		t.Error("sweep must collect the orphan once admission released the lock")
+	}
+}
+
+func TestUploadModelPersistsExplicitZeroDetectionThreshold(t *testing.T) {
+	h, _, _, _ := newBlobGCTestEnv(t)
+	fakeHailortcli(t)
+
+	w := postUploadMultipart(t, h, "zero.hef", []byte("zero-hef"), map[string]string{
+		"model_id":   "zero_det",
+		"model_type": "detection",
+		"threshold":  "0",
+	})
+	if respCode(t, w) != 0 {
+		t.Fatalf("upload failed: %s", w.Body.String())
+	}
+	row, err := h.aiModelRepo.GetByModelID("zero_det")
+	if err != nil || row == nil {
+		t.Fatalf("uploaded row missing: %v", err)
+	}
+	if row.Threshold != 0 {
+		t.Fatalf("row threshold = %v, want explicit 0", row.Threshold)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(row.Config), &cfg); err != nil {
+		t.Fatalf("uploaded config is not JSON: %v (%q)", err, row.Config)
+	}
+	if v, ok := cfg["threshold"]; !ok || v != float64(0) {
+		t.Fatalf("uploaded config threshold = %v (present=%v), want explicit 0 presence signal", v, ok)
 	}
 }

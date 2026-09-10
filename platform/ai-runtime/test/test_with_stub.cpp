@@ -148,13 +148,36 @@ void test_model_manager() {
 
     ModelManager mgr(loader.infer_ops(), loader.post_ops(), loader.draw_ops(), &loader);
 
-    // Register
-    int rc = mgr.register_model("yolo_test", "/fake/model.hef");
+    // Register with the full identity used by the gRPC path.
+    const std::string variant =
+        R"({"backend_function":"hailo_yolov8n","detection_threshold":0.25})";
+    int rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-a",
+                                true, variant, "detection");
     ASSERT_EQ(rc, 0, "register_model failed");
 
-    // Duplicate register should fail
-    rc = mgr.register_model("yolo_test", "/fake/model.hef");
-    ASSERT_TRUE(rc != 0, "duplicate register should fail");
+    // Same id/path/config from another owner is legitimate co-ownership.
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-b",
+                            true, variant, "detection");
+    ASSERT_EQ(rc, 1, "same-config co-ownership should return existing-entry status");
+
+    // Same id/path but a different decoder identity must collide: accepting
+    // either request would let the gRPC layer rewire the incumbent's shared
+    // postprocess session after register_model returns.
+    std::string why;
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-c",
+                            true, variant, "classification", &why);
+    ASSERT_TRUE(rc != 0, "different model_type should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "type collision should carry a useful reason");
+
+    why.clear();
+    rc = mgr.register_model(
+        "yolo_test", "/fake/model.hef", "app-d", true,
+        R"({"backend_function":"hailo_yolov8s","detection_threshold":0.25})",
+        "detection", &why);
+    ASSERT_TRUE(rc != 0, "different variant should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "variant collision should carry a useful reason");
 
     // Get model via snapshot (rehash-safe)
     auto snap = mgr.acquire_model_snapshot("yolo_test");

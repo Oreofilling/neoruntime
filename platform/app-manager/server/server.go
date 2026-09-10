@@ -1171,8 +1171,17 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 	}
 	// Create and start container via containerd
 	if s.runtime != nil {
-		// Preload models before creating container
-		s.PreloadModels(ctx, appID, appManifest)
+		// Preload required models before creating the container. A logical
+		// registration refusal (including an id/path/config collision) must
+		// stop the start — otherwise the app launches against no model or
+		// somebody else's incumbent registration.
+		if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
+			return &proto.Status{
+				Success: false,
+				Message: "Required model preload failed: " + err.Error(),
+				Code:    412,
+			}, nil
+		}
 
 		// Ensure namespace is set in context for containerd operations
 		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
@@ -1340,8 +1349,17 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
 
-	// Preload models
-	s.PreloadModels(ctx, appID, appManifest)
+	// Preload required models before touching the existing multi-container
+	// instance. A failed restore leaves the currently running instance alone
+	// instead of tearing it down and then discovering the replacement cannot
+	// infer.
+	if err := s.PreloadModels(ctx, appID, appManifest); err != nil {
+		return &proto.Status{
+			Success: false,
+			Message: "Required model preload failed: " + err.Error(),
+			Code:    412,
+		}, nil
+	}
 
 	// Check if there's an existing instance
 	s.multiContainerMutex.Lock()
@@ -2954,16 +2972,35 @@ func (s *AppManagerServer) checkShadowedModels(ctx context.Context, appManifest 
 // at install time (restored e.g. after a device reboot, where the runtime
 // lost the registration but the unpacked files survived). Registering an
 // already-loaded model adds co-ownership, so repeated starts are safe.
-func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appManifest *manifest.AppManifest) {
+func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appManifest *manifest.AppManifest) error {
 	s.aiRuntimeMutex.RLock()
 	client := s.aiRuntimeClient
 	s.aiRuntimeMutex.RUnlock()
 	if client == nil || !s.config.AIRuntime.Enabled {
-		return
+		return nil
 	}
 
 	if appManifest == nil || len(appManifest.Spec.Permissions.Inference.Models) == 0 {
-		return
+		return nil
+	}
+
+	// Legacy permissions.inference.models entries have no optional bit and
+	// are therefore required. spec.models entries carry Required explicitly;
+	// optional restore failures remain warnings, while a required model must
+	// veto StartApp rather than launch a container that cannot infer.
+	requiredByID := make(map[string]bool, len(appManifest.Spec.Models))
+	for _, mapping := range appManifest.Spec.Models {
+		requiredByID[mapping.ID] = requiredByID[mapping.ID] || mapping.Required
+	}
+	var requiredErrs []string
+	recordFailure := func(modelID, message string) {
+		required, declared := requiredByID[modelID]
+		if !declared || required {
+			requiredErrs = append(requiredErrs, message)
+			logger.Error("%s", message)
+		} else {
+			logger.Warn("Optional %s", message)
+		}
 	}
 
 	// Bundled (path-declared) mappings by model id, for the platform.db-miss
@@ -2997,24 +3034,26 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 
 	for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
 		if meta := s.getModelMeta(modelID); meta != nil {
-			s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID])
+			if err := s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID]); err != nil {
+				recordFailure(modelID, fmt.Sprintf("failed to preload model %s for app %s: %v", modelID, appID, err))
+			}
 			continue
 		}
 		if alias, ok := bundled[modelID]; ok {
 			aliasDir := filepath.Join(appModelsDir(appID), alias)
 			reg, regErr := loadBundledRegistration(aliasDir)
 			if regErr != nil {
-				logger.Warn("App %s declares bundled model %s (alias %q), but its unpack record is unreadable (reinstall the app): %v",
-					appID, modelID, alias, regErr)
+				recordFailure(modelID, fmt.Sprintf("app %s declares bundled model %s (alias %q), but its unpack record is unreadable (reinstall the app): %v",
+					appID, modelID, alias, regErr))
 				continue
 			}
 			hefPath := filepath.Join(aliasDir, reg.HEF)
 			if _, statErr := os.Stat(hefPath); statErr != nil {
-				logger.Warn("App %s declares bundled model %s, but the unpacked file %s is missing (was the app reinstalled?): %v",
-					appID, modelID, hefPath, statErr)
+				recordFailure(modelID, fmt.Sprintf("app %s declares bundled model %s, but the unpacked file %s is missing (reinstall the app): %v",
+					appID, modelID, hefPath, statErr))
 				continue
 			}
-			_, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+			regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
 				ModelId:       modelID,
 				ModelPath:     hefPath,
 				OwnerId:       appID,
@@ -3024,7 +3063,17 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 				RawOutputOnly: reg.RawOutputOnly,
 			})
 			if err != nil {
-				logger.Warn("Failed to restore bundled model %s for app %s: %v", modelID, appID, err)
+				recordFailure(modelID, fmt.Sprintf("failed to restore bundled model %s for app %s: %v", modelID, appID, err))
+				continue
+			}
+			// Same refusal shape as preloadPlatformModel: a collision with
+			// another registration under this id (different path or variant)
+			// or a postprocess init failure answers success=false over an OK
+			// transport status. Logging "restored" and probing anyway would
+			// start the container against somebody else's weights.
+			if regResp != nil && regResp.Status != nil && !regResp.Status.Success {
+				recordFailure(modelID, fmt.Sprintf("restore of bundled model %s for app %s was refused: %s (another registration under this id wins; stop the owning app or reinstall with a unique model id)",
+					modelID, appID, regResp.Status.Message))
 				continue
 			}
 			logger.Info("Restored bundled model %s (path: %s, type: %s) for app %s (transient)", modelID, hefPath, reg.ModelType, appID)
@@ -3033,12 +3082,18 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 			// only reinstall rewrites them), but a known-broken registration
 			// is not left behind for the app to infer against.
 			if !preexisting[modelID] && reg.ModelType == "detection" {
-				s.probeFreshRegistration(ctx, client, appID, modelID)
+				if err := s.probeFreshRegistration(ctx, client, appID, modelID); err != nil {
+					recordFailure(modelID, fmt.Sprintf("restored bundled model %s for app %s failed its postprocess smoke test: %v", modelID, appID, err))
+				}
 			}
 			continue
 		}
-		logger.Warn("App %s requires model %s, but it is neither in platform.db nor bundled in the app image", appID, modelID)
+		recordFailure(modelID, fmt.Sprintf("app %s requires model %s, but it is neither in platform.db nor bundled in the app image", appID, modelID))
 	}
+	if len(requiredErrs) > 0 {
+		return fmt.Errorf("%s", strings.Join(requiredErrs, "; "))
+	}
+	return nil
 }
 
 // preloadPlatformModel registers a platform.db model with ai-runtime through
@@ -3050,13 +3105,12 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 // surface only as per-frame infer failures once the app is running — and the
 // registration is rolled back on failure with an Error log, since the app
 // cannot work without this model either way.
-func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string, meta *model.AIModel, fresh bool) {
+func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string, meta *model.AIModel, fresh bool) error {
 	path, variant, grpcType, err := modelload.RuntimeRegistration(meta)
 	if err != nil {
-		logger.Warn("Failed to compose runtime registration for model %s (app %s): %v", modelID, appID, err)
-		return
+		return fmt.Errorf("compose runtime registration: %w", err)
 	}
-	_, err = client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
+	regResp, err := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
 		ModelId:      modelID,
 		ModelPath:    path,
 		OwnerId:      appID,
@@ -3064,17 +3118,24 @@ func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client infe
 		ModelVariant: variant,
 	})
 	if err != nil {
-		logger.Warn("Failed to preload model %s for app %s: %v", modelID, appID, err)
-		return
+		return fmt.Errorf("register with ai-runtime: %w", err)
+	}
+	// The runtime reports logical refusals as OK transport status with
+	// success=false — e.g. the same id registered from a different path
+	// (another app's bundled model won the race), or this variant conflicts
+	// with the incumbent. Treating that as restored would start the app's
+	// container against a registration that is not this model.
+	if regResp != nil && regResp.Status != nil && !regResp.Status.Success {
+		return fmt.Errorf("runtime refused registration: %s", regResp.Status.Message)
 	}
 	logger.Info("Preloaded model %s (path: %s, type: %s) for app %s", modelID, path, grpcType, appID)
 
 	if !fresh || model.ResolveModelType(meta.ModelType) != "detection" {
-		return
+		return nil
 	}
 	// The stored file stays (the platform row owns it); only this freshly
 	// created registration is rolled back on failure.
-	s.probeFreshRegistration(ctx, client, appID, modelID)
+	return s.probeFreshRegistration(ctx, client, appID, modelID)
 }
 
 // probeFreshRegistration smoke-tests a registration this app just created and

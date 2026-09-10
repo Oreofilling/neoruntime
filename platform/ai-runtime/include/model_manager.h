@@ -24,6 +24,14 @@ struct ModelEntry {
     std::string  name;                  // Display name for the model
     std::string  path;
 
+    // Registration identity (model_type + variant exactly as registered).
+    // Co-ownership of the same id+path is only valid while these match: a
+    // differing re-registration would have the gRPC layer's
+    // init_post_process rewire the shared postprocess session to the new
+    // configuration, corrupting decode for the incumbent owner(s).
+    std::string  model_type;
+    std::string  variant;
+
     // App-bundled model (extracted from an app image by app-manager).
     // Transient models are hidden from the model page: platform-api's
     // syncRuntimeModelsToDB skips them, so they never reach platform.db.
@@ -64,17 +72,22 @@ public:
     /// If the model is already loaded by another owner from the SAME path,
     /// this just adds co-ownership; the same id under a different path is a
     /// collision and is refused (the incumbent's weights must not silently
-    /// serve the new registrant).
+    /// serve the new registrant). So is the same id+path with a different
+    /// registration identity (model_type/variant): re-initializing the
+    /// shared postprocess session to the new configuration would corrupt
+    /// decode for the incumbent owner(s).
     /// transient marks an app-bundled model (hidden from the model page).
     /// variant is the model's postprocess variant blob; for detections its
     /// backend_function is forwarded to the HAL inference session so NMS output
     /// tensors are named after the selected vendor function, not the file path.
-    /// Returns 0 on success, <0 on error; why (optional) carries the
-    /// human-readable refusal reason.
+    /// Returns 0 for a fresh registration, 1 when the identical entry was
+    /// already loaded and only ownership changed, <0 on error; why (optional)
+    /// carries the human-readable refusal reason.
     int register_model(const std::string& model_id, const std::string& model_path,
                        const std::string& owner_id = "",
                        bool transient = false,
                        const std::string& variant = "",
+                       const std::string& model_type = "",
                        std::string* why = nullptr);
 
     /// Unregister (unload) a model. If owner_id is given, only removes that owner.

@@ -99,6 +99,7 @@ int ModelManager::register_model(const std::string& model_id,
                                  const std::string& owner_id,
                                  bool transient,
                                  const std::string& variant,
+                                 const std::string& model_type,
                                  std::string* why) {
     std::unique_lock lock(mu_);
 
@@ -121,6 +122,29 @@ int ModelManager::register_model(const std::string& model_id,
             }
             return -1;
         }
+        if (models_[model_id].model_type != model_type ||
+            models_[model_id].variant != variant) {
+            // Same id and file but a different decoding configuration is
+            // equally a collision: accepting it as co-ownership would let
+            // the gRPC layer's init_post_process rewire the shared
+            // postprocess session to this variant/type — at least one owner
+            // would then read mis-decoded output. The refusal names both
+            // configurations so the operator can see what clashed.
+            LOG_ERROR("Model %s: refusing registration from owner '%s' — "
+                      "already registered with a different configuration "
+                      "(type='%s' variant='%s' vs type='%s' variant='%s')",
+                      model_id.c_str(), owner_id.c_str(),
+                      models_[model_id].model_type.c_str(),
+                      models_[model_id].variant.c_str(),
+                      model_type.c_str(), variant.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered with a different "
+                       "configuration (type='" + models_[model_id].model_type +
+                       "' variant='" + models_[model_id].variant + "')";
+            }
+            return -1;
+        }
         // Model already loaded — add co-ownership if owner_id is provided.
         // The stored transient flag wins: a model already registered under a
         // visibility contract (e.g. system-visible) keeps it even when a
@@ -134,11 +158,11 @@ int ModelManager::register_model(const std::string& model_id,
             owners_[model_id].insert(owner_id);
             LOG_INFO("Model %s: added co-owner '%s' (total owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), owners_[model_id].size());
-            return 0;
+            return 1;  // existing entry: gRPC must not reinitialize postprocess
         }
 
         LOG_INFO("Model %s already loaded, skipping", model_id.c_str());
-        return 0;
+        return 1;  // existing entry: gRPC must not reinitialize postprocess
     }
 
     // Check if the same file is already loaded under a different model_id
@@ -155,6 +179,8 @@ int ModelManager::register_model(const std::string& model_id,
             alias.id        = model_id;   // alias must carry its own id, not the original's
             alias.name      = model_id;   // display name must match the alias id
             alias.transient = transient;  // visibility is per-id, follows this registration
+            alias.model_type = model_type; // decoding identity is per-id too: init_post_process
+            alias.variant    = variant;    // gives the alias its own postprocess session
             models_.emplace(model_id, alias);
             add_infer_locked(shared_infer);
             add_post_locked(shared_post);
@@ -221,12 +247,14 @@ int ModelManager::register_model(const std::string& model_id,
 
     // Get model info and create entry
     ModelEntry entry;
-    entry.id        = model_id;
-    entry.name      = model_id;
-    entry.path      = model_path;
-    entry.transient = transient;
-    entry.ref_count = 0;
-    entry.load_time = std::time(nullptr);
+    entry.id         = model_id;
+    entry.name       = model_id;
+    entry.path       = model_path;
+    entry.transient  = transient;
+    entry.model_type = model_type;
+    entry.variant    = variant;
+    entry.ref_count  = 0;
+    entry.load_time  = std::time(nullptr);
 
     entry.infer_session = session;
     if (infer_ops_->get_model_info) {
