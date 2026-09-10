@@ -991,11 +991,18 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
     // JobItem and keeps its buffers pinned until completed and reaped.
     // Applies to sync submitters too (they are async jobs waited at once),
     // so in-flight jobs per connection cap at the same limit either way.
+    // The slot is reserved atomically with the check: releasing the lock
+    // between a check-only pass and a later increment let concurrent
+    // submissions each observe count == cap-1, both pass, and overshoot.
+    // Nothing between this reservation and the registry insert below can
+    // fail, so the reservation cannot leak.
     {
         std::lock_guard<std::mutex> lk(done_mu_);
         if (client_async_jobs_[job->owner_fd] >= cfg_.max_async_jobs_per_client) {
             res.rc = DSP_SVC_ERR_QUOTA;
             res.message = "too many outstanding jobs for this client";
+        } else {
+            client_async_jobs_[job->owner_fd]++;
         }
     }
     if (res.rc != DSP_SVC_OK) {
@@ -1024,7 +1031,6 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
         do { job_id_out = fresh_random_id(); }
         while (job_id_out == 0 || jobs_.count(job_id_out));
         jobs_[job_id_out] = job;
-        client_async_jobs_[job->owner_fd]++;
     }
     res.rc = DSP_SVC_OK;
     res.message = "submitted";
@@ -1223,8 +1229,10 @@ void DspService::execute_job(const JobRef& job) {
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
     if (!job->abandoned) {
-        // job->abandoned is written under done_mu_; this read races benignly
-        // (worst case a discarded result is also counted as failed).
+        // job->abandoned is written under done_mu_ from another thread
+        // (submitter timeout / owner disconnect); it is atomic, so this
+        // unlocked read is race-free (worst case a result that was about
+        // to be discarded is also counted as failed).
         if (rc == 0) {
             job->result.rc = DSP_SVC_OK;
             job->result.message = what;

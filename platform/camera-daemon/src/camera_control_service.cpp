@@ -1693,9 +1693,12 @@ grpc::Status CameraControlServiceImpl::WaitDspJob(
     response->set_error_code(result.rc);
     response->set_elapsed_ms(result.elapsed_ms);
     response->set_job_id(request->job_id());
-    /* false = still pending (timeout / poll) or unknown id — the error_code
-     * separates those two cases. */
-    response->set_done(ok);
+    /* done tracks the job's lifecycle, not its outcome: a completed job
+     * with a nonzero HAL rc is done too, and reporting it as pending would
+     * send the client back to a poll that can only answer "unknown or
+     * reaped job id" (the entry is dropped at reap). false = still pending
+     * (timeout / poll) or unknown id — error_code separates those two. */
+    response->set_done(done);
     return grpc::Status::OK;
 }
 

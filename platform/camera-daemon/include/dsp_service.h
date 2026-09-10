@@ -257,7 +257,11 @@ private:
         std::vector<BufferEntry*> pinned; /* resolved at validation       */
         DspJobResult result;
         bool done = false;
-        bool abandoned = false;    /* submitter timed out; discard result */
+        /* Set by another thread (submitter timeout / owner disconnect)
+         * while the worker may be reading it at the execute_job tail —
+         * atomic because a plain bool read there is a data race, however
+         * "benign" the outcome looks. */
+        std::atomic<bool> abandoned{false};
     };
     using JobRef = std::shared_ptr<JobItem>;
 
