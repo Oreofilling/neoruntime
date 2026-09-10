@@ -244,6 +244,35 @@ func TestLoadModelDoesNotHealTransientRegistration(t *testing.T) {
 	}
 }
 
+// A heal whose unload is logically refused (the runtime answers OK transport
+// status with success=false because a session is mid-inference) must abort
+// instead of re-registering: the same-id RegisterModel would only co-own the
+// stale session and report a heal that never happened.
+func TestLoadModelHealUnloadRefusedAbortsReload(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	blob := seedBlob(t, store, "h1")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "stale_det", Name: "stale_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1",
+	})
+	// System-owned entry parked on a path composition would never produce —
+	// the heal shape — while the unload is refused underneath.
+	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "stale_det", ModelPath: "/elsewhere/old.hef", OwnerId: systemOwnerID})
+	fake.unloadFail = true
+
+	w := postModelAction(t, h, "load", "stale_det")
+	if respCode(t, w) != CodeOperationFailed || !strings.Contains(w.Body.String(), "Failed to unload stale model registration") {
+		t.Fatalf("refused unload must abort the heal, got: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 1 || calls[0] != "unload:stale_det" {
+		t.Fatalf("refused unload must abort before any reload, got %v", calls)
+	}
+	if fake.registeredPath("stale_det") != "" {
+		t.Error("no re-registration may happen after a refused heal unload")
+	}
+}
+
 // Startup reconciliation: rows claiming loaded while the runtime is empty
 // flip to uploaded, with DesiredState preserved for recovery.
 func TestReconcileRuntimeModelsHealsStaleRows(t *testing.T) {

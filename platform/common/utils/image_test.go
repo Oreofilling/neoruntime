@@ -249,3 +249,70 @@ func TestManifestJSONSizeCap(t *testing.T) {
 		t.Errorf("ExtractImageNameFromTar = %q, want \"\" for oversized manifest", got)
 	}
 }
+
+// buildMultiImageTar writes a docker-save archive carrying two images — the
+// shape `docker save img1 img2 -o bundle.tar` produces, with one manifest
+// entry (and RepoTag set) per image.
+func buildMultiImageTar(t *testing.T, dir, name string, tags ...[]string) string {
+	t.Helper()
+	layer := []byte("layer-bytes")
+	configBytes := mustJSON(t, map[string]any{"architecture": "arm64", "os": "linux"})
+	configName := hex.EncodeToString(sha256Sum(configBytes)) + ".json"
+
+	var manifest []map[string]any
+	for _, tagSet := range tags {
+		manifest = append(manifest, map[string]any{
+			"Config":   configName,
+			"RepoTags": tagSet,
+			"Layers":   []string{"layer.tar"},
+		})
+	}
+	return writeTar(t, dir, name, func(tw *tar.Writer) {
+		writeTarMember(t, tw, "layer.tar", layer)
+		writeTarMember(t, tw, configName, configBytes)
+		writeTarMember(t, tw, "manifest.json", mustJSON(t, manifest))
+	})
+}
+
+func TestExtractAllImageNamesFromTar(t *testing.T) {
+	t.Run("multi_image_archive_lists_every_tag_in_order", func(t *testing.T) {
+		dir := t.TempDir()
+		path := buildMultiImageTar(t, dir, "bundle.tar",
+			[]string{"app:1.0.0"}, []string{"sidecar:2.0", "registry.local/sidecar:2.0"})
+
+		want := []string{"app:1.0.0", "sidecar:2.0", "registry.local/sidecar:2.0"}
+		got := ExtractAllImageNamesFromTar(path)
+		if len(got) != len(want) {
+			t.Fatalf("tags = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("tags = %v, want %v (order follows the archive)", got, want)
+			}
+		}
+	})
+
+	t.Run("single_image_archive_and_gzip", func(t *testing.T) {
+		dir := t.TempDir()
+		plain := buildLegacyTar(t, dir, "plain.tar", []byte("layer-bytes"))
+		if got := ExtractAllImageNamesFromTar(plain); len(got) != 1 || got[0] != "e2e/test-image:0.1.0" {
+			t.Errorf("plain tar tags = %v, want [e2e/test-image:0.1.0]", got)
+		}
+		gz := gzipFile(t, plain, filepath.Join(dir, "image.tar.gz"))
+		if got := ExtractAllImageNamesFromTar(gz); len(got) != 1 || got[0] != "e2e/test-image:0.1.0" {
+			t.Errorf("gzip tar tags = %v, want [e2e/test-image:0.1.0]", got)
+		}
+	})
+
+	t.Run("untagged_and_missing_manifest_return_nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		untagged := buildMultiImageTar(t, dir, "untagged.tar", nil)
+		if got := ExtractAllImageNamesFromTar(untagged); len(got) != 0 {
+			t.Errorf("untagged archive tags = %v, want none", got)
+		}
+		noManifest := buildNoManifestTar(t, dir, "nomanifest.tar")
+		if got := ExtractAllImageNamesFromTar(noManifest); got != nil {
+			t.Errorf("archive without manifest tags = %v, want nil", got)
+		}
+	})
+}

@@ -591,6 +591,31 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}, nil
 	}
 
+	// Same rollback contract as runAsyncInstall for fresh installs: from
+	// here until the install is committed, a failure rolls the extracted
+	// models back (and undoes a registry entry saved by a later step) —
+	// nothing of a failed install survives. Updates keep their artifacts:
+	// the registry entry (old or new) owns them and UninstallApp cleans up.
+	var registeredFresh bool
+	committed := false
+	if !isUpdate {
+		defer func() {
+			if committed {
+				return
+			}
+			if registeredFresh {
+				if unErr := s.registry.Unregister(appID); unErr != nil {
+					logger.Warn("Rollback: failed to unregister app %s: %v", appID, unErr)
+				}
+			}
+			ids := make([]string, 0, len(resolution.pathPending))
+			for _, p := range resolution.pathPending {
+				ids = append(ids, p.id)
+			}
+			s.rollbackBundledModels(ctx, appID, ids)
+		}()
+	}
+
 	// Warn when a shadowed bundled copy differs from the platform copy that
 	// won resolution (best-effort, never fails the install).
 	s.checkShadowedModels(ctx, appManifest, resolution.shadowed, nil)
@@ -669,6 +694,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 				},
 			}, nil
 		}
+		registeredFresh = true
 	}
 
 	// Create instance directory
@@ -694,6 +720,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	if err := s.registerAppPermissions(ctx, appInfo.ID, appManifest); err != nil {
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
+
+	// The install is committed from here: cleanup of the models and any
+	// registry entry becomes UninstallApp's job.
+	committed = true
 
 	// Publish event
 	eventType := "installed"
@@ -862,12 +892,16 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			logger.Info("Image imported: %s", importedName)
 			task.Update("pulling", 80, "Image import complete")
 
-			// Reconcile the tar's true RepoTag against the primary manifest
-			// reference and verify every image reference the app needs is now
-			// resolvable in containerd. This catches the "tar tag !=
+			// Reconcile the tar's true RepoTags against the manifest
+			// references and verify every image reference the app needs is
+			// now resolvable in containerd. This catches the "tar tag !=
 			// manifest image" failure mode at install time instead of letting
 			// StartApp fail later (and auto-uninstall on offline devices).
-			tarRepoTag := utils.ExtractImageNameFromTar(imagePath)
+			tarRepoTags := utils.ExtractAllImageNamesFromTar(imagePath)
+			tarRepoTag := ""
+			if len(tarRepoTags) > 0 {
+				tarRepoTag = tarRepoTags[0]
+			}
 			tarNormalized := manifest.NormalizeImageName(tarRepoTag)
 			if tarRepoTag == "" {
 				logger.Warn("Install reconcile: could not read RepoTag from tar %s (primary ref=%s)", imagePath, imageName)
@@ -876,10 +910,24 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			} else {
 				logger.Info("Install reconcile: tar RepoTag %q matches primary ref %q", tarRepoTag, imageName)
 			}
-			// Multi-container manifests reference one image per container while
-			// a single tar was uploaded: the tar is the payload for all of
-			// them. References that already exist on the device are left
-			// untouched; missing ones are retagged from the imported image.
+			// docker save can bundle several images in one archive, and the
+			// containerd import above brings in every entry under its own
+			// archived tag. A non-primary reference the manifest needs is
+			// therefore satisfied when the archive carries it (its own image
+			// is retagged to the manifest's normalized ref and unpacked —
+			// ImportImage only unpacks the first entry) or when it already
+			// exists on the device. A reference the archive does not carry
+			// used to be retagged from the imported primary image, silently
+			// launching that image for a container whose manifest named
+			// another one; it now fails the install instead.
+			tarTagsByRef := make(map[string]string, len(tarRepoTags)) // normalized ref -> archived tag
+			for _, tag := range tarRepoTags {
+				if n := manifest.NormalizeImageName(tag); n != "" {
+					if _, ok := tarTagsByRef[n]; !ok {
+						tarTagsByRef[n] = tag
+					}
+				}
+			}
 			for _, ref := range imageRefs {
 				if ref == imageName {
 					continue
@@ -888,15 +936,26 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 					logger.Info("Install reconcile: image %s already present, left untouched", ref)
 					continue
 				}
-				if tagErr := s.client.TagImage(ctx, importedName, ref); tagErr != nil {
-					task.Fail(fmt.Sprintf("Install verify failed: image %s could not be retagged from imported %s (tar RepoTag=%q). Error: %v", ref, importedName, tarRepoTag, tagErr))
+				archivedTag, inArchive := tarTagsByRef[ref]
+				if !inArchive {
+					task.Fail(fmt.Sprintf("Install verify failed: image %s is referenced by the manifest but is neither in the uploaded archive (RepoTags: %v) nor present on the device. Bundle every image the app needs into the archive (docker save <image1> <image2> ... -o app.tar) or pre-install the missing image.", ref, tarRepoTags))
 					return
 				}
-				logger.Info("Retagged imported image %s -> %s (container image)", importedName, ref)
+				if archivedTag != ref {
+					if tagErr := s.client.TagImage(ctx, archivedTag, ref); tagErr != nil {
+						task.Fail(fmt.Sprintf("Install verify failed: image %s could not be retagged from its archived tag %s. Error: %v", ref, archivedTag, tagErr))
+						return
+					}
+					logger.Info("Retagged imported image %s -> %s (container image)", archivedTag, ref)
+				}
+				if unErr := s.client.EnsureImageUnpacked(ctx, ref); unErr != nil {
+					task.Fail(fmt.Sprintf("Install verify failed: image %s could not be prepared after import. Error: %v", ref, unErr))
+					return
+				}
 			}
 			for _, ref := range imageRefs {
 				if _, verifyErr := s.client.GetImage(ctx, ref); verifyErr != nil {
-					task.Fail(fmt.Sprintf("Install verify failed: image %s is not resolvable after import (retag may have failed). tar RepoTag=%q. Error: %v", ref, tarRepoTag, verifyErr))
+					task.Fail(fmt.Sprintf("Install verify failed: image %s is not resolvable after import. tar RepoTags: %v. Error: %v", ref, tarRepoTags, verifyErr))
 					return
 				}
 			}
@@ -935,6 +994,31 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		task.Fail(fmt.Sprintf("Bundled model extraction failed: %v", extrErr))
 		return
 	}
+
+	// extractImageModels only cleans up after ITS OWN failures. From here
+	// until the install is committed, every later failure (manifest storage,
+	// registry save, instance dir) must roll the extracted models back too —
+	// the transient registrations and <root>/app-models/<app_id> live outside
+	// the app registry, and a failed install never runs UninstallApp for
+	// them. A registry entry saved before a later failure is unregistered as
+	// well: an app without its instance dir is half-installed.
+	var registeredApp *registry.AppInfo
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if registeredApp != nil {
+			if unErr := s.registry.Unregister(registeredApp.ID); unErr != nil {
+				logger.Warn("Rollback: failed to unregister app %s: %v", registeredApp.ID, unErr)
+			}
+		}
+		ids := make([]string, 0, len(resolution.pathPending))
+		for _, p := range resolution.pathPending {
+			ids = append(ids, p.id)
+		}
+		s.rollbackBundledModels(ctx, appManifest.Metadata.ID, ids)
+	}()
 
 	// Warn when a shadowed bundled copy differs from the platform copy that
 	// won resolution (best-effort, never fails the install).
@@ -978,6 +1062,7 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		task.Fail(fmt.Sprintf("Failed to register app: %v", err))
 		return
 	}
+	registeredApp = appInfo
 
 	// Create instance directory
 	if err := os.MkdirAll(appInfo.InstancePath, 0755); err != nil {
@@ -989,6 +1074,11 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 	if err := s.registerAppPermissions(ctx, appInfo.ID, appManifest); err != nil {
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
+
+	// The install is committed from here: cleanup of the models and the
+	// registry entry becomes UninstallApp's job (explicit uninstall or the
+	// self-heal loop).
+	committed = true
 
 	// Publish event
 	s.publishAppEvent("installed", appInfo.ID, map[string]interface{}{
@@ -2487,6 +2577,19 @@ func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appMani
 			if runtimeUp {
 				info, runtimeHit = loaded[ref.mapping.ID]
 			}
+			// But only a durable runtime entry resolves a dependency: this
+			// install must keep working after a reboot and when other apps
+			// come and go. Transient registrations are another app's
+			// bundled models — PreloadModels can neither restore them (no
+			// platform.db row, no bundled fallback for this app) nor keep
+			// them alive (uninstalling the owner removes them) — and
+			// app-owned non-transient entries share that fragility. Such
+			// hits fall through to the platform.db lookup, this app's own
+			// bundled path, or the missing-model report instead of
+			// silently passing validation.
+			if runtimeHit && (info.GetTransient() || !isRuntimeSystemOwner(info.GetOwnerId())) {
+				runtimeHit = false
+			}
 			platformPath := ""
 			if runtimeHit {
 				platformPath = info.ModelPath
@@ -2551,6 +2654,19 @@ func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appMani
 	}
 	return res, classify(true, loaded, "")
 }
+
+// isRuntimeSystemOwner reports whether a runtime registration owner denotes
+// the platform itself rather than an app. grpc_service.cpp normalizes
+// ownerless registrations to "<system>" before storing, so both spellings
+// count (tests seed raw gRPC shapes with "").
+func isRuntimeSystemOwner(owner string) bool {
+	return owner == "" || owner == systemOwnerMarker
+}
+
+// systemOwnerMarker mirrors AIRuntimeServiceImpl's owner normalization
+// (platform-api's systemOwnerID); duplicated here so app-manager does not
+// import platform-api internals.
+const systemOwnerMarker = "<system>"
 
 // appModelsDir is where bundled models unpacked from app images live:
 // {RootPath}/app-models/<app_id>/<alias>/ holding the extracted HEF plus its
@@ -2622,7 +2738,7 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 	}
 
 	var requiredErrs, warnings []string
-	registered := make([]string, 0, len(pending))
+	registered := make([]string, 0, len(pending)) // ids this call registered; rolled back on failure
 	baseDir := appModelsDir(appID)
 	for _, p := range pending {
 		if task != nil {
@@ -2689,16 +2805,34 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 
 	err := reportModelValidationAt("registering", 82, requiredErrs, warnings, task)
 	if err != nil {
-		for _, id := range registered {
+		s.rollbackBundledModels(ctx, appID, registered)
+	}
+	return err
+}
+
+// rollbackBundledModels undoes a (possibly partial) extractImageModels run:
+// transient registrations are released and the unpack dir is removed, so a
+// failed install leaves nothing behind (the app is never registered on this
+// path, so UninstallApp would not run for it). The dir removal runs even
+// with no registrations to release — extracted files can outlive a
+// registration that already rolled itself back. Best-effort and idempotent:
+// unregistering with OwnerId set only releases this app's ownership (a
+// never-owned id is a no-op at the runtime), and RemoveAll on a missing
+// directory succeeds.
+func (s *AppManagerServer) rollbackBundledModels(ctx context.Context, appID string, modelIDs []string) {
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	if client != nil {
+		for _, id := range modelIDs {
 			if _, unErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: id, OwnerId: appID}); unErr != nil {
 				logger.Warn("Rollback: failed to unregister model %s for app %s: %v", id, appID, unErr)
 			}
 		}
-		if rmErr := os.RemoveAll(baseDir); rmErr != nil {
-			logger.Warn("Rollback: failed to remove %s: %v", baseDir, rmErr)
-		}
 	}
-	return err
+	if rmErr := os.RemoveAll(appModelsDir(appID)); rmErr != nil {
+		logger.Warn("Rollback: failed to remove %s: %v", appModelsDir(appID), rmErr)
+	}
 }
 
 // reportModelValidation turns collected per-model errors/warnings into the

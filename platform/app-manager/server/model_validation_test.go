@@ -16,6 +16,7 @@ import (
 
 	inferencepb "aipc/platform/ai-runtime/proto"
 	"aipc/platform/app-manager/manifest"
+	"aipc/platform/app-manager/registry"
 	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
 	"aipc/platform/platform-api/storage"
@@ -215,6 +216,63 @@ func TestResolveModelDependencies(t *testing.T) {
 			enabled: true,
 			models: map[string]manifest.ModelMapping{
 				"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: true},
+			},
+		},
+		{
+			// Another app's bundled model occupies the id in the runtime, but
+			// nothing durable backs it for this app: no platform.db row, no
+			// bundled fallback, and PreloadModels cannot restore or keep it
+			// alive. The hit must not satisfy a required dependency.
+			name: "transient_runtime_hit_does_not_resolve",
+			client: &stubInferenceClient{models: []*inferencepb.ModelInfo{
+				{ModelId: "bundled_det", OwnerId: "app-1", Transient: true},
+			}},
+			enabled: true,
+			models: map[string]manifest.ModelMapping{
+				"detector": {ID: "bundled_det", Required: true},
+			},
+			wantErr: `required model "bundled_det" (alias "detector") is not available on the device and no bundled path is declared`,
+		},
+		{
+			// App-owned non-transient registrations are equally runtime-only:
+			// their lifetime is tied to the owning app, not to the platform.
+			name: "app_owned_runtime_hit_does_not_resolve",
+			client: &stubInferenceClient{models: []*inferencepb.ModelInfo{
+				{ModelId: "yolo_world_540", OwnerId: "app-1"},
+			}},
+			enabled: true,
+			models: map[string]manifest.ModelMapping{
+				"detector": {ID: "yolo_world_540", Required: true},
+			},
+			wantErr: `required model "yolo_world_540" (alias "detector") is not available on the device and no bundled path is declared`,
+		},
+		{
+			// A transient hit with a declared path falls back to the bundled
+			// copy: extraction owns the dependency instead of another app's
+			// registration.
+			name: "transient_hit_with_declared_path_becomes_pending",
+			client: &stubInferenceClient{models: []*inferencepb.ModelInfo{
+				{ModelId: "bundled_det", OwnerId: "app-1", Transient: true},
+			}},
+			enabled: true,
+			models: map[string]manifest.ModelMapping{
+				"detector": {ID: "bundled_det", Path: "/app/models/det.bin", Required: true},
+			},
+			wantPending: []string{"detector"},
+		},
+		{
+			// A transient runtime id backed by platform.db still resolves:
+			// the durable source is the row, not the foreign registration.
+			name: "transient_hit_with_db_row_still_resolves",
+			client: &stubInferenceClient{models: []*inferencepb.ModelInfo{
+				{ModelId: "yolo_world_540", OwnerId: "app-1", Transient: true},
+			}},
+			enabled: true,
+			models: map[string]manifest.ModelMapping{
+				"detector": {ID: "yolo_world_540", Required: true},
+			},
+			dbRows: map[string]model.AIModel{
+				"yolo_world_540": {FilePath: "/data/aipc/models/yolo.hef", ModelType: "detection"},
 			},
 		},
 		{
@@ -971,6 +1029,122 @@ func TestCheckShadowedModels(t *testing.T) {
 
 		if task.Message != "" {
 			t.Errorf("task.Message = %q, want no warning without containerd extraction", task.Message)
+		}
+	})
+}
+
+// newInstallServer builds the minimal runAsyncInstall harness on top of the
+// extraction stubs: a real registry and task store, a fake extractor, and a
+// seccomp profile file so early validation passes. containerd stays nil —
+// with no uploaded tar the install flow takes the "no image to pull" branch
+// and extraction runs entirely through the injected extractor.
+func newInstallServer(t *testing.T, client *stubInferenceClient, instancesPath string) *AppManagerServer {
+	t.Helper()
+	s := newExtractionServer(t, client, fakeExtractor(nil, nil))
+	reg, err := registry.NewRegistry(filepath.Join(t.TempDir(), "registry"))
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	s.registry = reg
+	s.taskStore = NewInstallTaskStore()
+	seccomp := filepath.Join(t.TempDir(), "seccomp.json")
+	if err := os.WriteFile(seccomp, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.config.Security.SeccompProfile = seccomp
+	s.config.Apps.InstancesPath = instancesPath
+	return s
+}
+
+func writeBundledAppManifest(t *testing.T) string {
+	t.Helper()
+	yml := `apiVersion: v1
+kind: Application
+metadata:
+  id: app-x
+  name: App X
+  version: 1.0.0
+spec:
+  image: docker.io/library/app-x:1.0.0
+  models:
+    detector:
+      id: bundled_det
+      path: /app/models/det.bin
+      required: true
+`
+	p := filepath.Join(t.TempDir(), "app.yaml")
+	if err := os.WriteFile(p, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Failures AFTER extractImageModels succeeds used to leak its side effects:
+// the transient registrations and <root>/app-models/<app_id> survived a
+// failed install (and a registry entry saved just before a later failure
+// became a half-installed app). Every failure until the install is committed
+// must roll all of it back.
+func TestRunAsyncInstallPostExtractionFailureRollsBack(t *testing.T) {
+	t.Run("manifest_storage_failure_unregisters_extracted_models", func(t *testing.T) {
+		root := withTempRoot(t)
+		// A regular file where the managed manifests root would go makes
+		// canonicalizeManifest's MkdirAll fail — after extraction succeeded.
+		if err := os.MkdirAll(filepath.Join(root, "apps"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "apps", "manifests"), []byte("blocked"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		client := &stubInferenceClient{}
+		s := newInstallServer(t, client, filepath.Join(t.TempDir(), "instances"))
+
+		task := s.taskStore.Create()
+		s.runAsyncInstall(task.ID, writeBundledAppManifest(t), "", false)
+
+		phase, _, _, _, errMsg := task.Snapshot()
+		if phase != "error" || !strings.Contains(errMsg, "Failed to store manifest") {
+			t.Fatalf("task = (%q, %q), want manifest-storage failure", phase, errMsg)
+		}
+		if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "bundled_det" ||
+			client.unregistered[0].OwnerId != "app-x" {
+			t.Errorf("unregistered = %+v, want the extracted bundled_det released for app-x", client.unregistered)
+		}
+		if _, statErr := os.Stat(appModelsDir("app-x")); !os.IsNotExist(statErr) {
+			t.Errorf("app-models dir must be removed after the failed install (stat err=%v)", statErr)
+		}
+		if s.registry.Exists("app-x") {
+			t.Error("app must not stay registered when the install failed before registry save")
+		}
+	})
+
+	t.Run("instance_dir_failure_unregisters_app_and_models", func(t *testing.T) {
+		withTempRoot(t)
+		client := &stubInferenceClient{}
+		// A regular file where the instances root would go makes the
+		// post-registry MkdirAll fail.
+		instances := filepath.Join(t.TempDir(), "instances")
+		if err := os.WriteFile(instances, []byte("blocked"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := newInstallServer(t, client, instances)
+
+		task := s.taskStore.Create()
+		s.runAsyncInstall(task.ID, writeBundledAppManifest(t), "", false)
+
+		phase, _, _, _, errMsg := task.Snapshot()
+		if phase != "error" || !strings.Contains(errMsg, "Failed to create instance directory") {
+			t.Fatalf("task = (%q, %q), want instance-dir failure", phase, errMsg)
+		}
+		// The canonical manifest proves the install got past manifest
+		// storage; the registry must have been undone along with the models.
+		if s.registry.Exists("app-x") {
+			t.Error("app must be unregistered when a later step fails")
+		}
+		if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "bundled_det" {
+			t.Errorf("unregistered = %+v, want bundled_det rolled back", client.unregistered)
+		}
+		if _, statErr := os.Stat(appModelsDir("app-x")); !os.IsNotExist(statErr) {
+			t.Errorf("app-models dir must be removed after the failed install (stat err=%v)", statErr)
 		}
 	})
 }

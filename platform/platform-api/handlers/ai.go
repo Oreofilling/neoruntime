@@ -1352,8 +1352,19 @@ func (h *APIHandlers) LoadModel(c *gin.Context) {
 			if expectedPath, _, _, err := modelload.RuntimeRegistration(dbModel); err == nil && expectedPath != rt.GetModelPath() {
 				stale = true
 				logger.Info("Healing stale runtime registration for %s (path %q differs from composed %q), reloading", modelID, rt.GetModelPath(), expectedPath)
-				if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID}); unregErr != nil {
+				// The runtime reports a refused unload (a racing session
+				// kept the model in use) as OK transport status with
+				// success=false. Proceeding would re-register the same id
+				// and merely co-own the stale session — reporting a heal
+				// that never happened — so the response status gates the
+				// reload exactly like UpdateModel's swap path.
+				unregStatus, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+				if unregErr != nil {
 					Resp(c).FailMsg(CodeOperationFailed, "Failed to unload stale model registration: "+unregErr.Error())
+					return
+				}
+				if unregStatus != nil && !unregStatus.Success {
+					Resp(c).FailMsg(CodeOperationFailed, "Failed to unload stale model registration: "+unregStatus.Message)
 					return
 				}
 			}
