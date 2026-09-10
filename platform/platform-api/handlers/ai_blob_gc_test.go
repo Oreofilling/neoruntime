@@ -438,3 +438,38 @@ func TestSelfHealPassSweepsOrphanBlobs(t *testing.T) {
 		t.Error("heal pass must collect stale orphan blobs")
 	}
 }
+
+// Admission (register/update/upload committing a referencing row) and the
+// sweep serialize on blobRefMu: while an admission holds the lock, the
+// sweep must not collect — even an aged, unreferenced blob survives until
+// the lock is released, and collects right after.
+func TestSweepOrphanBlobsWaitsForAdmission(t *testing.T) {
+	h, _, store, _ := newBlobGCTestEnv(t)
+	staleHash := contentHash(t, []byte("admission-raced"))
+	stalePath := store.BlobPath(staleHash, ".hef")
+	if err := os.WriteFile(stalePath, []byte("admission-raced"), 0644); err != nil {
+		t.Fatalf("seed aged orphan: %v", err)
+	}
+	backdate(t, stalePath, 2*time.Hour)
+
+	done := make(chan struct{})
+	h.blobRefMu.Lock()
+	go func() {
+		h.sweepOrphanBlobs(time.Hour)
+		close(done)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("sweep must block while an admission holds blobRefMu")
+	default:
+	}
+	if !store.Exists(staleHash, ".hef") {
+		t.Fatal("aged orphan must survive while admission holds the lock")
+	}
+	h.blobRefMu.Unlock()
+	<-done
+	if store.Exists(staleHash, ".hef") {
+		t.Error("sweep must collect the orphan once admission released the lock")
+	}
+}

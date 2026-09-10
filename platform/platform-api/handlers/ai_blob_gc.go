@@ -130,9 +130,21 @@ func (h *APIHandlers) sweepOrphanBlobs(grace time.Duration) {
 		if err != nil || count > 0 {
 			continue
 		}
-		if err := h.modelStore.Delete(b.Hash, b.Ext); err == nil {
-			removed++
+		// Reference count and delete must be atomic against admission
+		// (blobRefMu): a register/update/upload mid-flight could be holding
+		// an Exists proof for this very blob and commit its referencing row
+		// right after this count — deleting then would leave a registered
+		// model pointing at a missing HEF. The recount inside the lock is
+		// the authoritative one; the pre-check above only skips lock-free
+		// work for referenced blobs.
+		h.blobRefMu.Lock()
+		count, err = h.aiModelRepo.CountByFileHash(b.Hash)
+		if err == nil && count == 0 {
+			if err := h.modelStore.Delete(b.Hash, b.Ext); err == nil {
+				removed++
+			}
 		}
+		h.blobRefMu.Unlock()
 	}
 	if removed+removedTemp > 0 {
 		logger.Info("Model blob sweep reclaimed %d orphan blob(s) and %d stale temp file(s)", removed, removedTemp)

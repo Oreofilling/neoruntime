@@ -25,6 +25,7 @@
 #include <utility>
 #include <unistd.h> /* dup, close, readlink */
 #include <sys/mman.h> /* mmap/munmap (USERPTR imports) */
+#include <sys/stat.h>  /* fstat backing-size check for USERPTR imports */
 
 #include "common/hal_log.h"
 
@@ -41,9 +42,14 @@ constexpr uint32_t kMaxAllocFds = 64;
  * connected client reach another client's buffers (per-caller binding is a
  * tracked follow-up; the socket carries no identity). Seeded from
  * random_device like RtspServer's session ids; callers re-draw on the
- * (2^-64) collision with a live id. */
+ * (2^-64) collision with a live id. Drawn from two lock domains (buffer
+ * ids under buffers_mu_, job ids under done_mu_), so the generator guards
+ * itself — mt19937_64::operator() mutates shared state and an unsynchronized
+ * cross-domain call pair is a data race. */
 uint64_t fresh_random_id() {
+    static std::mutex rng_mu;
     static std::mt19937_64 rng(std::random_device{}());
+    std::lock_guard<std::mutex> lk(rng_mu);
     return rng();
 }
 
@@ -445,6 +451,24 @@ DspService::ImportResult DspService::import_buffer(
     } else {
         fb->mem_type = HAL_MEM_MALLOC; /* USERPTR planes (see above) */
         for (uint32_t p = 0; p < planes; ++p) {
+            /* mmap happily maps past a memfd's EOF; the fault only lands
+             * (SIGBUS, process-wide) when a DSP op touches those pages.
+             * sizes[p] is client-supplied, so the backing fd must prove it
+             * can hold it here — plain descriptors (memfd/regular file)
+             * report their length via fstat. Non-regular descriptors
+             * (pipes, sockets) have no meaningful length: reject. */
+            struct stat st{};
+            if (sizes[p] == 0 || fstat(dup_fds[p], &st) != 0 ||
+                !S_ISREG(st.st_mode) ||
+                st.st_size < static_cast<off_t>(sizes[p])) {
+                for (uint32_t q = 0; q < p; ++q)
+                    munmap(fb->planes[q], sizes[q]);
+                for (uint32_t q = 0; q < planes; ++q) close(dup_fds[q]);
+                delete fb;
+                out.rc = DSP_SVC_ERR_INVALID;
+                out.message = "import plane shorter than declared size";
+                return out;
+            }
             void* addr = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED,
                               dup_fds[p], 0);
             if (addr == MAP_FAILED) {

@@ -309,3 +309,37 @@ func TestReconcileRuntimeModelsHealsStaleRows(t *testing.T) {
 		t.Errorf("reconciliation must not touch the runtime, got %v", calls)
 	}
 }
+
+// A delete whose unload is logically refused (in-flight inference answers
+// OK transport status with success=false) must veto the whole deletion:
+// the row, the materialized copy and the last CAS blob would otherwise
+// vanish from under a model the NPU is still serving.
+func TestUnregisterModelUnloadRefusedAbortsDelete(t *testing.T) {
+	h, fake, store := newAIUpdateTestEnv(t)
+	oldRoot := constants.RootPath()
+	constants.SetRootPath(t.TempDir())
+	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
+	blob := seedBlob(t, store, "hz")
+	// Row says uploaded, runtime serves it — the runtime wins, and the
+	// runtime refuses the unload.
+	fake.markLive("busy_det")
+	fake.unloadFail = true
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "busy_det", Name: "busy_det", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "hz",
+	})
+
+	w := deleteModel(t, h, "busy_det")
+	if respCode(t, w) != CodeOperationFailed || !strings.Contains(w.Body.String(), "Failed to unload model before delete") {
+		t.Fatalf("refused unload must abort the delete, got: %s", w.Body.String())
+	}
+	if row, _ := h.aiModelRepo.GetByModelID("busy_det"); row == nil {
+		t.Error("row must survive a refused delete")
+	}
+	if !store.Exists("hz", ".hef") {
+		t.Error("blob must survive a refused delete")
+	}
+	if calls, _ := fake.snapshot(); len(calls) != 1 || calls[0] != "unload:busy_det" {
+		t.Errorf("runtime calls = %v, want only the refused unload", calls)
+	}
+}

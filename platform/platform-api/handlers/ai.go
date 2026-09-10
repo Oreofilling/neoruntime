@@ -705,8 +705,21 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			Config:        string(configJSON),
 			Status:        "uploaded",
 		}
-		if err := h.aiModelRepo.Create(dbModel); err != nil {
-			Resp(c).FailMsg(CodeServiceError, "Failed to persist model to DB: "+err.Error())
+		// Admission commit: re-assert the staged blob and create the row
+		// atomically with the orphan sweep (blobRefMu). The Exists check at
+		// the top ran before validations; an aged staged blob could have
+		// been collected in between, which would leave this row pointing
+		// at a deleted file.
+		h.blobRefMu.Lock()
+		if fileHash != "" && h.modelStore != nil && !h.modelStore.Exists(fileHash, ".hef") {
+			h.blobRefMu.Unlock()
+			Resp(c).FailMsg(CodeInvalidRequest, "Model file not found. Please re-parse the model first.")
+			return
+		}
+		createErr := h.aiModelRepo.Create(dbModel)
+		h.blobRefMu.Unlock()
+		if createErr != nil {
+			Resp(c).FailMsg(CodeServiceError, "Failed to persist model to DB: "+createErr.Error())
 			return
 		}
 	}
@@ -967,8 +980,22 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		dbModel.Status = "uploaded"
 		dbModel.DesiredState = "loaded"
 	}
-	if err := h.aiModelRepo.Update(dbModel); err != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to persist model update: "+err.Error())
+	// Admission commit under blobRefMu: re-assert the referenced blob and
+	// persist the row atomically with the orphan sweep — the Exists check
+	// near the top ran before the unload gate, and an aged deduped blob
+	// could otherwise be collected in between. Scoped to file_hash updates:
+	// a row keeping its old reference (metadata-only, model_path, disk
+	// models without a CAS blob) has nothing new to re-assert.
+	h.blobRefMu.Lock()
+	if req.FileHash != "" && h.modelStore != nil && !h.modelStore.Exists(req.FileHash, ".hef") {
+		h.blobRefMu.Unlock()
+		Resp(c).FailMsg(CodeInvalidRequest, "Model file not found. Please re-parse the model first.")
+		return
+	}
+	updateErr := h.aiModelRepo.Update(dbModel)
+	h.blobRefMu.Unlock()
+	if updateErr != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to persist model update: "+updateErr.Error())
 		return
 	}
 
@@ -1192,13 +1219,25 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 		}
 		// Save to DB as "uploaded" — not loaded to NPU yet. A row that
 		// fails to persist is an explicit error, never a silent success
-		// that leaves an unreachable model behind.
-		if err := h.aiModelRepo.Create(dbModel); err != nil {
+		// that leaves an unreachable model behind. The CAS case commits
+		// under blobRefMu with the blob re-asserted: a dedup hit landed on
+		// an aged blob the orphan sweep may have collected during HEF
+		// validation, and committing then would reference a deleted file.
+		h.blobRefMu.Lock()
+		if h.modelStore != nil && fileHash != "" && !h.modelStore.Exists(fileHash, ext) {
+			h.blobRefMu.Unlock()
+			h.cleanupStagedBlob(fileHash, ext, blobExisted)
+			Resp(c).FailMsg(CodeInvalidRequest, "Model file vanished during upload (reclaimed by storage cleanup); please retry")
+			return
+		}
+		createErr := h.aiModelRepo.Create(dbModel)
+		h.blobRefMu.Unlock()
+		if createErr != nil {
 			h.cleanupStagedBlob(fileHash, ext, blobExisted)
 			if h.modelStore == nil && modelPath != "" {
 				os.Remove(modelPath)
 			}
-			Resp(c).FailMsg(CodeServiceError, "Failed to save model record: "+err.Error())
+			Resp(c).FailMsg(CodeServiceError, "Failed to save model record: "+createErr.Error())
 			return
 		}
 	}
@@ -1559,7 +1598,23 @@ func (h *APIHandlers) UnregisterModel(c *gin.Context) {
 					unload = rt != nil
 				}
 				if unload {
-					client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+					// A failed unload must veto the deletion, same gate as
+					// UpdateModel: the runtime refuses (OK transport status,
+					// success=false) while an inference is in flight, and
+					// proceeding would delete the row, the runtime copy and
+					// possibly the last CAS blob out from under a model the
+					// NPU is still serving. Same contract as the no-DB
+					// fallback below: transport error or success=false
+					// aborts.
+					unregStatus, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID})
+					if unregErr != nil {
+						Resp(c).FailMsg(CodeServiceError, "Failed to unload model before delete: "+unregErr.Error())
+						return
+					}
+					if unregStatus != nil && !unregStatus.Success {
+						Resp(c).FailMsg(CodeOperationFailed, "Failed to unload model before delete: "+unregStatus.Message)
+						return
+					}
 				}
 			}
 			// Delete DB record first so ref-count excludes this entry
