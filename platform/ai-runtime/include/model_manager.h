@@ -61,16 +61,21 @@ public:
     ~ModelManager();
 
     /// Register (load) a model. If owner_id is non-empty, it tracks ownership.
-    /// If the model is already loaded by another owner, this just adds co-ownership.
+    /// If the model is already loaded by another owner from the SAME path,
+    /// this just adds co-ownership; the same id under a different path is a
+    /// collision and is refused (the incumbent's weights must not silently
+    /// serve the new registrant).
     /// transient marks an app-bundled model (hidden from the model page).
     /// variant is the model's postprocess variant blob; for detections its
     /// backend_function is forwarded to the HAL inference session so NMS output
     /// tensors are named after the selected vendor function, not the file path.
-    /// Returns 0 on success, <0 on error.
+    /// Returns 0 on success, <0 on error; why (optional) carries the
+    /// human-readable refusal reason.
     int register_model(const std::string& model_id, const std::string& model_path,
                        const std::string& owner_id = "",
                        bool transient = false,
-                       const std::string& variant = "");
+                       const std::string& variant = "",
+                       std::string* why = nullptr);
 
     /// Unregister (unload) a model. If owner_id is given, only removes that owner.
     /// The model is physically unloaded only when no owners remain AND ref_count == 0.

@@ -3100,69 +3100,90 @@ func (s *AppManagerServer) probeFreshRegistration(ctx context.Context, client in
 	return nil
 }
 
+// unregisterAppModel unregisters one model and reports whether the runtime
+// confirmed it gone. Transport errors and OK-with-success=false statuses
+// both count as "not confirmed" — success=false is how ai-runtime refuses
+// (e.g. while sessions are still in use).
+func (s *AppManagerServer) unregisterAppModel(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string) bool {
+	resp, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
+		ModelId: modelID,
+		OwnerId: appID,
+	})
+	if err != nil {
+		logger.Warn("Failed to unload model %s for app %s: %v", modelID, appID, err)
+		return false
+	}
+	if !resp.GetSuccess() {
+		logger.Warn("Runtime refused to unload model %s for app %s: %s", modelID, appID, resp.GetMessage())
+		return false
+	}
+	logger.Info("Unloaded model %s for app %s", modelID, appID)
+	return true
+}
+
 // UnloadModels unregisters the models for this app_id and removes the model
 // files extracted from its image
 func (s *AppManagerServer) UnloadModels(ctx context.Context, appID string, manifestPath string) {
+	s.aiRuntimeMutex.RLock()
+	client := s.aiRuntimeClient
+	s.aiRuntimeMutex.RUnlock()
+	runtimeEnabled := client != nil && s.config.AIRuntime.Enabled
+
+	// Unregister first; the file removal at the end is gated on the outcome.
+	// A refused unregister leaves a live transient registration that still
+	// needs its HEF — deleting the files would orphan it with no retry path.
+	// When the runtime is unreachable there is no live registration
+	// (registrations die with the process), so the files can still go.
+	unregisterHiccup := false
+	if runtimeEnabled {
+		// Unload models declared in manifest
+		if manifestPath != "" {
+			appManifest, err := manifest.LoadManifest(manifestPath)
+			if err == nil && appManifest != nil {
+				for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
+					if !s.unregisterAppModel(ctx, client, appID, modelID) {
+						unregisterHiccup = true
+					}
+				}
+			}
+		}
+
+		// Unload dynamically registered models by querying AI Runtime
+		resp, err := client.ListModels(ctx, &inferencepb.Empty{})
+		if err != nil {
+			logger.Warn("Failed to list models for app %s cleanup: %v", appID, err)
+			// Live registrations are unknown, not absent — keep the files.
+			unregisterHiccup = true
+		} else {
+			unloaded := 0
+			for _, m := range resp.Models {
+				if m.OwnerId == appID {
+					if s.unregisterAppModel(ctx, client, appID, m.ModelId) {
+						unloaded++
+					} else {
+						unregisterHiccup = true
+					}
+				}
+			}
+			if unloaded > 0 {
+				logger.Info("Unloaded %d dynamic models for app %s", unloaded, appID)
+			}
+		}
+	}
+
 	// Remove bundled model files extracted at install time. UninstallApp is
 	// the only caller and reinstall recreates the directory, so this is safe
-	// and idempotent. Runs before the ai-runtime guards: the files must go
-	// even when the runtime is unreachable.
+	// and idempotent. Kept (with a warning) when an unregister above failed:
+	// a live registration may still reference them.
 	if err := requireSafePathSegment("app id", appID); err != nil {
 		// Install rejects unsafe IDs long before any files exist, so there is
 		// nothing to remove — and RemoveAll on the derived path could act far
 		// outside this app's own tree.
 		logger.Warn("Skipping extracted-model cleanup for app %s: %v", appID, err)
+	} else if unregisterHiccup {
+		logger.Warn("Keeping extracted model files for app %s: an unregister was not confirmed — a live registration may still need them; retry the uninstall", appID)
 	} else if err := os.RemoveAll(appModelsDir(appID)); err != nil {
 		logger.Warn("Failed to remove extracted model files for app %s: %v", appID, err)
-	}
-
-	s.aiRuntimeMutex.RLock()
-	client := s.aiRuntimeClient
-	s.aiRuntimeMutex.RUnlock()
-	if client == nil || !s.config.AIRuntime.Enabled {
-		return
-	}
-
-	// Unload models declared in manifest
-	if manifestPath != "" {
-		appManifest, err := manifest.LoadManifest(manifestPath)
-		if err == nil && appManifest != nil {
-			for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
-				_, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
-					ModelId: modelID,
-					OwnerId: appID,
-				})
-				if err != nil {
-					logger.Warn("Failed to unload model %s for app %s: %v", modelID, appID, err)
-				} else {
-					logger.Info("Unloaded model %s for app %s", modelID, appID)
-				}
-			}
-		}
-	}
-
-	// Unload dynamically registered models by querying AI Runtime
-	resp, err := client.ListModels(ctx, &inferencepb.Empty{})
-	if err != nil {
-		logger.Warn("Failed to list models for app %s cleanup: %v", appID, err)
-		return
-	}
-	unloaded := 0
-	for _, m := range resp.Models {
-		if m.OwnerId == appID {
-			_, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{
-				ModelId: m.ModelId,
-				OwnerId: appID,
-			})
-			if err != nil {
-				logger.Warn("Failed to unload dynamic model %s for app %s: %v", m.ModelId, appID, err)
-			} else {
-				unloaded++
-			}
-		}
-	}
-	if unloaded > 0 {
-		logger.Info("Unloaded %d dynamic models for app %s", unloaded, appID)
 	}
 }
 

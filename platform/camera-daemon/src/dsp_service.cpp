@@ -23,9 +23,12 @@
 #include <memory>
 #include <random>
 #include <utility>
-#include <unistd.h> /* dup, close, readlink */
+#include <unistd.h> /* dup, close, readlink, pread/pwrite */
 #include <sys/mman.h> /* mmap/munmap (USERPTR imports) */
 #include <sys/stat.h>  /* fstat backing-size check for USERPTR imports */
+#include <fcntl.h>     /* fcntl, F_GET_SEALS/F_ADD_SEALS (memfd seals) */
+#include <sys/syscall.h> /* SYS_memfd_create (no _GNU_SOURCE in this TU) */
+#include <linux/memfd.h> /* MFD_*, F_SEAL_* */
 
 #include "common/hal_log.h"
 
@@ -95,6 +98,51 @@ void free_imported_fb(HalFrameBuffer* fb) {
         if (fb->dma_fds[p] >= 0) close(fb->dma_fds[p]);
     }
     delete fb;
+}
+
+/* Copies exactly `size` bytes from src_fd into a fresh daemon-owned memfd
+ * sealed against shrink/grow/write and returns its fd; -1 on short read or
+ * allocation failure. Guards the USERPTR import path: the client keeps a
+ * writable handle to its buffer, so a mapping of an unsealed file can be
+ * truncated under us — the DSP would then read past EOF and raise a
+ * process-wide SIGBUS. Reading through read(2) returns 0 at EOF instead,
+ * so the copy fails safely. */
+int copy_to_sealed_memfd(int src_fd, uint32_t size) {
+    int mfd = static_cast<int>(syscall(SYS_memfd_create, "dsp-import-copy",
+                                       MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (mfd < 0) return -1;
+    if (ftruncate(mfd, static_cast<off_t>(size)) != 0) {
+        close(mfd);
+        return -1;
+    }
+    char buf[65536];
+    off_t off = 0;
+    while (off < static_cast<off_t>(size)) {
+        ssize_t n = pread(src_fd, buf, sizeof(buf), off);
+        if (n <= 0) { /* EOF short of the declared size, or read error */
+            close(mfd);
+            return -1;
+        }
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t m = pwrite(mfd, buf + written,
+                               static_cast<size_t>(n - written), off + written);
+            if (m <= 0) {
+                close(mfd);
+                return -1;
+            }
+            written += m;
+        }
+        off += n;
+    }
+    /* Seal after the copy: no writable mapping exists, so shrink (the
+     * SIGBUS vector), grow and writes are all locked out for good. */
+    if (fcntl(mfd, F_ADD_SEALS,
+              F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+        close(mfd);
+        return -1;
+    }
+    return mfd;
 }
 
 /* A real dma-buf fd links to an "anon_inode:dmabuf" inode; anything else
@@ -469,9 +517,33 @@ DspService::ImportResult DspService::import_buffer(
                 out.message = "import plane shorter than declared size";
                 return out;
             }
+            /* fstat proves the size only at this instant: the client keeps
+             * a writable handle to the same file, so an ftruncate after the
+             * check would shrink the mapping and still SIGBUS the daemon on
+             * the next DSP read. A memfd sealed against shrinking is proof
+             * the size cannot change; anything else (unsealed memfd,
+             * regular file) is copied into a daemon-owned sealed memfd —
+             * unsealed imports pay one copy, sealed ones stay zero-copy. */
+            int map_fd = dup_fds[p];
+            bool daemon_copy = false;
+            const int seals = fcntl(map_fd, F_GET_SEALS);
+            if (seals == -1 || !(seals & F_SEAL_SHRINK)) {
+                map_fd = copy_to_sealed_memfd(dup_fds[p], sizes[p]);
+                if (map_fd < 0) {
+                    for (uint32_t q = 0; q < p; ++q)
+                        munmap(fb->planes[q], sizes[q]);
+                    for (uint32_t q = 0; q < planes; ++q) close(dup_fds[q]);
+                    delete fb;
+                    out.rc = DSP_SVC_ERR_INVALID;
+                    out.message = "import plane unreadable or shorter than declared size";
+                    return out;
+                }
+                daemon_copy = true;
+            }
             void* addr = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED,
-                              dup_fds[p], 0);
+                              map_fd, 0);
             if (addr == MAP_FAILED) {
+                if (daemon_copy) close(map_fd);
                 for (uint32_t q = 0; q < p; ++q)
                     munmap(fb->planes[q], sizes[q]);
                 for (uint32_t q = 0; q < planes; ++q) close(dup_fds[q]);
@@ -480,6 +552,7 @@ DspService::ImportResult DspService::import_buffer(
                 out.message = "import plane not mappable (memfd truncated?)";
                 return out;
             }
+            if (daemon_copy) close(map_fd); /* the mapping holds its own ref */
             fb->planes[p] = addr;
         }
     }

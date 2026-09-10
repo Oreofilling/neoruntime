@@ -98,10 +98,29 @@ int ModelManager::register_model(const std::string& model_id,
                                  const std::string& model_path,
                                  const std::string& owner_id,
                                  bool transient,
-                                 const std::string& variant) {
+                                 const std::string& variant,
+                                 std::string* why) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
+        if (models_[model_id].path != model_path) {
+            // Same id under a different file is a collision, not
+            // co-ownership: accepting it would serve the incumbent's
+            // weights to the new registrant, and the caller's
+            // init_post_process would then rewire the incumbent's
+            // postprocess session to the new variant. Two apps bundling
+            // their own model under the same id must collide loudly.
+            LOG_ERROR("Model %s: refusing registration from %s — already "
+                      "registered from %s",
+                      model_id.c_str(), model_path.c_str(),
+                      models_[model_id].path.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered from a different path (" +
+                       models_[model_id].path + ")";
+            }
+            return -1;
+        }
         // Model already loaded — add co-ownership if owner_id is provided.
         // The stored transient flag wins: a model already registered under a
         // visibility contract (e.g. system-visible) keeps it even when a

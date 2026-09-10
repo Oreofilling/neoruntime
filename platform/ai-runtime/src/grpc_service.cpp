@@ -124,12 +124,15 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         owner_id = "<system>";
     }
 
+    std::string why;
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
                                         owner_id, req->transient(),
-                                        req->model_variant());
+                                        req->model_variant(), &why);
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
-        resp->mutable_status()->set_message("Failed to register model");
+        resp->mutable_status()->set_message(
+            "Failed to register model '" + req->model_id() + "': " +
+            (why.empty() ? std::string("internal error") : why));
         return grpc::Status::OK;
     }
 

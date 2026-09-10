@@ -116,7 +116,14 @@ func (h *APIHandlers) loadModelCore(ctx context.Context, client inferencepb.Infe
 	dbModel.Status = "loaded"
 	dbModel.DesiredState = "loaded"
 	if err := h.aiModelRepo.Update(dbModel); err != nil {
-		logger.Warn("Failed to update model status to loaded: %v", err)
+		// Persistence is part of the load transaction, not a best-effort
+		// side effect: returning success here would leave status=uploaded
+		// with an explicit desired_state=unloaded — the REST load reports
+		// success for a model the DB says was never loaded, and the
+		// self-healer will not restore it after a runtime wipe. Roll the
+		// registration back and surface the error; callers retry.
+		rollbackRegistration(client, dbModel.ModelID)
+		return fmt.Errorf("failed to persist loaded state: %w", err)
 	}
 	return nil
 }

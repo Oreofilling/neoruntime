@@ -294,6 +294,42 @@ func TestLoadModelCoreSmokeRollbackSurvivesExhaustedDeadline(t *testing.T) {
 	}
 }
 
+// A DB persist failure after a successful runtime registration must surface
+// as a load failure and roll the registration back: silently succeeding
+// leaves status=uploaded with desired_state=unloaded, which the heal loop
+// (correctly) refuses to restore — the model would vanish after any runtime
+// restart despite the REST load reporting success.
+func TestLoadModelCorePersistFailureRollsBack(t *testing.T) {
+	withTempConstantsRoot(t)
+	h, fake, store, gdb := newBlobGCTestEnv(t)
+	blob := seedBlob(t, store, "h1")
+	row := &model.AIModel{
+		ModelID: "persist_fail", Name: "persist_fail", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1",
+	}
+	seedAIModel(t, h, row)
+	// Detection models run a load-time smoke test; give the fake an input
+	// spec so it passes and the failure stays focused on the DB write.
+	fake.smokeSpec = &inferencepb.TensorSpec{Shape: []int32{1, 8, 8}, Dtype: inferencepb.DataType_UINT8}
+
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		t.Fatalf("raw db: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	loadErr := h.loadModelCore(context.Background(), selfHealClient(h), row)
+	if loadErr == nil || !strings.Contains(loadErr.Error(), "persist") {
+		t.Fatalf("want persist failure surfaced, got %v", loadErr)
+	}
+	calls := loadCalls(t, fake)
+	if len(calls) != 2 || calls[0] != "load:persist_fail" || calls[1] != "unload:persist_fail" {
+		t.Fatalf("persist failure must roll the registration back, got %v", calls)
+	}
+}
+
 // The backoff schedule itself: 1x, 2x, 4x ... capped at 16x the interval.
 func TestModelHealBackoffSchedule(t *testing.T) {
 	interval := time.Minute
