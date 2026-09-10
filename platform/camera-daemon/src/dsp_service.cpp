@@ -1089,9 +1089,17 @@ DspJobResult DspService::wait_job(uint64_t job_id, uint32_t timeout_ms,
     }
     res = job->result;
     const int owner = job->owner_fd;
-    jobs_.erase(it);
-    auto cnt = client_async_jobs_.find(owner);
-    if (cnt != client_async_jobs_.end() && cnt->second > 0) cnt->second--;
+    /* The wait above released done_mu_: release_client_buffers may have
+     * reaped this entry meanwhile (client disconnect). The JobRef keeps the
+     * job object alive, but the map node is gone — erasing through the
+     * pre-wait iterator is UB. Re-find; an absent entry was already
+     * reaped (its async-job slot too), so only the found case unwinds. */
+    it = jobs_.find(job_id);
+    if (it != jobs_.end()) {
+        jobs_.erase(it);
+        auto cnt = client_async_jobs_.find(owner);
+        if (cnt != client_async_jobs_.end() && cnt->second > 0) cnt->second--;
+    }
     done_out = true;
     return res;
 }

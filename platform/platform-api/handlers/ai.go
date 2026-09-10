@@ -205,6 +205,12 @@ func (h *APIHandlers) AbandonStagedModel(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "file_path does not match the staged blob for file_hash")
 		return
 	}
+	// Same admission-vs-deletion atomicity as the orphan sweep (blobRefMu):
+	// without it, a concurrent RegisterModel committing a row for this
+	// deduplicated hash between the count and the delete would leave a live
+	// model pointing at a removed blob.
+	h.blobRefMu.Lock()
+	defer h.blobRefMu.Unlock()
 	// Fail closed on reference-count errors: a DB hiccup must never turn
 	// into deleting a live model's blob.
 	if h.aiModelRepo != nil {

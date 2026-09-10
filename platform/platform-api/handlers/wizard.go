@@ -34,6 +34,12 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "metadata.id is required")
 		return
 	}
+	// The ID becomes a directory name under apps/manifests — reject path
+	// segments before any MkdirAll/WriteFile happens.
+	if err := requireSafeAppID(req.Metadata.ID); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, err.Error())
+		return
+	}
 	if req.Metadata.Name == "" {
 		Resp(c).FailMsg(CodeInvalidRequest, "metadata.name is required")
 		return
