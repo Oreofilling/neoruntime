@@ -81,7 +81,7 @@ func TestRestoreDesiredLoadsSkipsNonCandidates(t *testing.T) {
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "not_desired", Name: "not_desired", Status: "uploaded", Source: "web",
 		ModelType: "detection", FilePath: blob, FileHash: "h1", DesiredState: "unloaded",
-		// (the column defaults to "loaded", so the negative case must be explicit)
+		// (explicit beats relying on the column default)
 	})
 	seedAIModel(t, h, &model.AIModel{
 		ModelID: "app_owned", Name: "app_owned", Status: "uploaded", Source: "web",
@@ -108,6 +108,60 @@ func TestRestoreDesiredLoadsSkipsNonCandidates(t *testing.T) {
 	}
 	if row, _ := h.aiModelRepo.GetByModelID("not_desired"); row.Status != "uploaded" {
 		t.Errorf("not_desired status = %q, want untouched uploaded", row.Status)
+	}
+}
+
+// Rows registered before the creation paths wrote desired_state explicitly
+// carry the old column default "loaded" despite never being loaded. The
+// startup demotion must flip exactly those (device-level, status uploaded)
+// to "unloaded" — leaving user-loaded rows and app-owned rows alone — so the
+// heal pass stops auto-loading models nobody asked to load.
+func TestDemoteNeverLoadedImports(t *testing.T) {
+	withTempConstantsRoot(t)
+	h, fake, store := newAIUpdateTestEnv(t)
+	blob := seedBlob(t, store, "h1")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "stale_import", Name: "stale_import", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1", DesiredState: "loaded",
+	})
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "user_loaded", Name: "user_loaded", Status: "loaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1", DesiredState: "loaded",
+	})
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "app_row", Name: "app_row", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h1",
+		DesiredState: "loaded", OwnerAppID: "app-x",
+	})
+	fake.markLiveEntry(&inferencepb.ModelInfo{
+		ModelId: "user_loaded", ModelPath: blob, OwnerId: systemOwnerID,
+	})
+
+	h.DemoteNeverLoadedImports()
+
+	for _, tc := range []struct{ id, want string }{
+		{"stale_import", "unloaded"}, // the regression: never-loaded import demoted
+		{"user_loaded", "loaded"},    // genuinely loaded promise preserved
+		{"app_row", "loaded"},        // app-owned rows are app-manager's business
+	} {
+		row, err := h.aiModelRepo.GetByModelID(tc.id)
+		if err != nil || row == nil {
+			t.Fatalf("%s: %v", tc.id, err)
+		}
+		if row.DesiredState != tc.want {
+			t.Errorf("%s desired_state = %q, want %q", tc.id, row.DesiredState, tc.want)
+		}
+	}
+
+	// The demoted row is no longer a heal candidate: one pass, zero loads.
+	runtimeMap, ok := h.listRuntimeModels(context.Background())
+	if !ok {
+		t.Fatal("listRuntimeModels failed against bufconn fake")
+	}
+	h.restoreDesiredLoads(context.Background(), selfHealClient(h),
+		runtimeMap, newModelHealBackoff(), time.Minute)
+	if calls := loadCalls(t, fake); len(calls) != 0 {
+		t.Errorf("demoted import must not be auto-loaded by the heal pass, got %v", calls)
 	}
 }
 

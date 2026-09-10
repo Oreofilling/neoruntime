@@ -288,6 +288,9 @@ func TestUploadModelHappyPathCreatesRow(t *testing.T) {
 		t.Errorf("row fields = type:%q thr:%v max:%d status:%q, want detection/0.5/32/uploaded",
 			row.ModelType, row.Threshold, row.MaxDetections, row.Status)
 	}
+	if row.DesiredState != "unloaded" {
+		t.Errorf("uploaded row desired_state = %q, want unloaded — upload is not a load promise", row.DesiredState)
+	}
 	if row.FileHash != hash || row.FilePath != store.BlobPath(hash, ".hef") {
 		t.Errorf("row file = %q@%q, want CAS %s", row.FilePath, row.FileHash, hash)
 	}

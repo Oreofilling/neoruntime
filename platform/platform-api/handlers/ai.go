@@ -710,6 +710,10 @@ func (h *APIHandlers) RegisterModel(c *gin.Context) {
 			InputHeight:   req.InputHeight,
 			Config:        string(configJSON),
 			Status:        "uploaded",
+			// Explicit "unloaded": registration is not a load promise, and
+			// desired_state=loaded would have the self-heal loop auto-load
+			// this model within a minute.
+			DesiredState: "unloaded",
 		}
 		// Admission commit: re-assert the staged blob and create the row
 		// atomically with the orphan sweep (blobRefMu). The Exists check at
@@ -1222,6 +1226,9 @@ func (h *APIHandlers) UploadModel(c *gin.Context) {
 			InputWidth:    inputWidth,
 			InputHeight:   inputHeight,
 			Status:        "uploaded",
+			// Same as RegisterModel: upload is not a load promise — an
+			// implicit desired_state=loaded would auto-load via self-heal.
+			DesiredState: "unloaded",
 		}
 		// Save to DB as "uploaded" — not loaded to NPU yet. A row that
 		// fails to persist is an explicit error, never a silent success
