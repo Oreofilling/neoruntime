@@ -138,6 +138,11 @@ bool AiOverlaySubscriber::is_bake_target(const std::string& stream) {
 // resolve_result_ttl_ms) — roughly two frame periods at 30fps.
 static constexpr uint32_t RESULT_TTL_FALLBACK_MS = 500;
 
+// Per-event wire override ceiling: a "result_ttl_ms" metadata value above
+// this is treated as malformed (unset). Results are refreshed per frame;
+// ten minutes of validity from a single event is far past any real use.
+static constexpr uint32_t RESULT_TTL_MAX_MS = 600000;
+
 // Face-blur label match: exact "face" in any case ("FACE", "Face").
 // Substrings like "facial" or "face_mask" do not match — only a detector that
 // labels the region class itself as face gets blurred.
@@ -832,12 +837,13 @@ void AiOverlaySubscriber::handle_event(
     }
 
     // Per-event override; absent metadata resets it — the override
-    // described THAT event, it must not stick to later ones.
+    // described THAT event, it must not stick to later ones. Malformed
+    // values parse as unset (0), never a wrapped huge TTL.
     uint32_t ttl_ms = 0;
     {
         auto it = metadata.find("result_ttl_ms");
         if (it != metadata.end()) {
-            ttl_ms = (uint32_t)strtoul(it->second.c_str(), nullptr, 10);
+            ttl_ms = parse_result_ttl_ms(it->second);
         }
     }
 
@@ -1311,6 +1317,20 @@ void apply_track_id_label(char* label, size_t cap, int32_t track_id) {
 bool is_overlay_session_end_topic(const std::string& topic,
                                   const std::string& topic_prefix) {
     return topic == topic_prefix + "session/end";
+}
+
+uint32_t parse_result_ttl_ms(const std::string& raw) {
+    // Signed parse + explicit range check: a bare strtoul wraps "-1" to
+    // ~4.29e9 (a layer that never expires) and silently truncates values
+    // beyond 32 bits. Out-of-range strtoll saturates at LLONG_MAX/LLONG_MIN,
+    // which the range check rejects just the same.
+    char* end = nullptr;
+    const long long v = strtoll(raw.c_str(), &end, 10);
+    if (end == raw.c_str() || *end != '\0' || v <= 0 ||
+        v > static_cast<long long>(RESULT_TTL_MAX_MS)) {
+        return 0;
+    }
+    return static_cast<uint32_t>(v);
 }
 
 uint32_t resolve_result_ttl_ms(uint32_t per_result_ttl,

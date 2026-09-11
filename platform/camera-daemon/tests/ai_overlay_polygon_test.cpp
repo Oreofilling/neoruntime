@@ -185,6 +185,19 @@ int main() {
         assert(resolve_result_ttl_ms(0, "fast", cfg) == 1);
     }
 
+    /* ---- parse_result_ttl_ms: wire metadata is never trusted ---- */
+    {
+        assert(parse_result_ttl_ms("50") == 50);
+        assert(parse_result_ttl_ms("600000") == 600000);   // the cap itself
+        assert(parse_result_ttl_ms("600001") == 0);        // above the cap
+        assert(parse_result_ttl_ms("0") == 0);             // zero = unset
+        assert(parse_result_ttl_ms("-5") == 0);            // pre-fix: wrapped to 4294967291
+        assert(parse_result_ttl_ms("") == 0);
+        assert(parse_result_ttl_ms("junk") == 0);
+        assert(parse_result_ttl_ms("50x") == 0);           // trailing garbage
+        assert(parse_result_ttl_ms("99999999999999999999") == 0);  // ERANGE-sized
+    }
+
     /* ---- compose_draw_config: HAL defaults seeded, overrides applied ----
        Regression guard for the silent no-render bug: per-stream draw configs
        used to be zero-initialized, so cfg->draw_detections was false and the

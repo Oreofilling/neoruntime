@@ -124,6 +124,13 @@ uint32_t resolve_result_ttl_ms(uint32_t per_result_ttl,
                                const std::string& display_stream,
                                const AiOverlayConfig& cfg);
 
+// Parses a "result_ttl_ms" event-metadata value: positive decimal ms,
+// capped at RESULT_TTL_MAX_MS. Malformed input — non-numeric, negative,
+// zero, overflow — returns 0 (unset), never a wrapped or truncated value:
+// the metadata is wire input and must not be trusted (a bare strtoul
+// turns "-1" into ~4.29e9, a layer that never expires).
+uint32_t parse_result_ttl_ms(const std::string& raw);
+
 // Builds the per-frame HAL draw config from the HAL-sanctioned defaults
 // (hal_draw_config_init_default) plus the overlay's runtime knobs (labels,
 // confidence, box thickness). The defaults seed everything — draw_detections,
