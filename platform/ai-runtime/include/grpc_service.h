@@ -5,6 +5,7 @@
 #include "session_manager.h"
 #include "inference_scheduler.h"
 #include "fd_receiver.h"
+#include "buffer_lookup.h"
 #include "event_bus_client.h"
 #include "postprocess_pool.h"
 #include "config.h"
@@ -25,6 +26,7 @@ public:
                          SessionManager* session_mgr,
                          InferenceScheduler* scheduler,
                          FdReceiver* fd_receiver,
+                         BufferLookupClient* buffer_lookup,
                          EventBusClient* event_bus,
                          PostprocessPool* postprocess_pool,
                          const HalClipTextEncoderOps* clip_enc_ops,
@@ -77,7 +79,7 @@ public:
 
     grpc::Status GetStats(
         grpc::ServerContext* ctx,
-        const aipc::inference::Empty* req,
+        const aipc::inference::GetStatsRequest* req,
         aipc::inference::SystemStats* resp) override;
 
     grpc::Status UpdatePostprocessConfig(
@@ -118,6 +120,13 @@ private:
                         uint64_t timestamp_ns,
                         const aipc::inference::PostResult& post_result);
 
+    // P2-13 lifecycle sessions: broadcast "<result-topic-prefix>session/end"
+    // with metadata {"session_id": client_session_id}. The camera-daemon
+    // overlay subscriber exact-matches that topic and sweeps every polygon
+    // sidecar tagged with the session. No-op for an empty tag (untagged
+    // sessions have nothing tagged to sweep) or when the bus is down.
+    void publish_session_end(const std::string& client_session_id);
+
     static aipc::inference::DataType hal_dtype_to_proto(HalDataType dt);
     static HalDataType proto_dtype_to_hal(aipc::inference::DataType dt);
     static std::string hal_layout_to_string(HalTensorLayout layout);
@@ -140,6 +149,7 @@ private:
     SessionManager*     session_mgr_;
     InferenceScheduler*  scheduler_;
     FdReceiver*          fd_receiver_;
+    BufferLookupClient*  buffer_lookup_;
     EventBusClient*      event_bus_;
     PostprocessPool*     postprocess_pool_;
     const HalClipTextEncoderOps* clip_enc_ops_;
