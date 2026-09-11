@@ -93,7 +93,7 @@ func callUploadPackage(t *testing.T, filename string, content []byte) *httptest.
 // imagesDirEntries lists everything left in the images dir after a request.
 func imagesDirEntries(t *testing.T, imagesDir string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(imagesDir, "*"))
+	matches, err := filepath.Glob(filepath.Join(imagesDir, "*", "*"))
 	if err != nil {
 		t.Fatalf("glob images dir: %v", err)
 	}
@@ -158,10 +158,10 @@ func TestUploadPackageValidSucceeds(t *testing.T) {
 		t.Error("extracted image.tar differs from package member")
 	}
 
-	// Exactly one artifact survives: the extracted image tar. The package
-	// itself must be gone.
-	if residue := imagesDirEntries(t, imagesDir); len(residue) != 1 || !strings.HasSuffix(residue[0], "_image.tar") {
-		t.Errorf("images dir = %v, want exactly one *_image.tar (package removed)", residue)
+	// Exactly the two install payloads survive together: staged app.yaml and
+	// extracted image tar. The uploaded package itself must be gone.
+	if residue := imagesDirEntries(t, imagesDir); len(residue) != 2 {
+		t.Errorf("staging dir = %v, want app.yaml plus *_image.tar", residue)
 	}
 }
 

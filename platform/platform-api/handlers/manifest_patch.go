@@ -11,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"aipc/platform/app-manager/manifest"
-	"aipc/platform/common/constants"
 	"aipc/platform/common/logger"
 )
 
@@ -85,9 +84,9 @@ func (h *APIHandlers) PatchManifest(c *gin.Context) {
 		return
 	}
 
-	// Path safety: this endpoint writes files, so confine it to the
-	// manifests root — no absolute escapes, no ../ walks.
-	manifestPath, err := safeManifestPath(req.ManifestPath)
+	// Editing is staging-only. Canonical live manifests are immutable through
+	// this endpoint and are published solely by app-manager.
+	manifestPath, err := safeStagingManifest(req.ManifestPath)
 	if err != nil {
 		Resp(c).FailMsg(CodeInvalidParameter, err.Error())
 		return
@@ -148,14 +147,35 @@ func (h *APIHandlers) PatchManifest(c *gin.Context) {
 		return
 	}
 
-	// Atomic write: readers never see a half-written app.yaml.
-	tmp := manifestPath + ".tmp"
-	if err := os.WriteFile(tmp, patched, 0644); err != nil {
+	// Atomic write: use a unique sibling temporary file so concurrent requests
+	// cannot clobber one another's fixed .tmp name.
+	tmp, err := os.CreateTemp(filepath.Dir(manifestPath), ".app.yaml-*")
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest temp file: "+err.Error())
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		Resp(c).FailMsg(CodeServiceError, "Failed to set manifest permissions: "+err.Error())
+		return
+	}
+	if _, err := tmp.Write(patched); err != nil {
+		tmp.Close()
 		Resp(c).FailMsg(CodeServiceError, "Failed to write manifest: "+err.Error())
 		return
 	}
-	if err := os.Rename(tmp, manifestPath); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		Resp(c).FailMsg(CodeServiceError, "Failed to sync manifest: "+err.Error())
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to close manifest: "+err.Error())
+		return
+	}
+	if err := os.Rename(tmpName, manifestPath); err != nil {
 		Resp(c).FailMsg(CodeServiceError, "Failed to replace manifest: "+err.Error())
 		return
 	}
@@ -167,15 +187,4 @@ func (h *APIHandlers) PatchManifest(c *gin.Context) {
 		"manifest":        patchedManifest,
 		"multi_container": patchedManifest.IsMultiContainer(),
 	})
-}
-
-// safeManifestPath confines writes to <root>/apps/manifests/. Absolute paths
-// and relative traversal outside that directory are rejected.
-func safeManifestPath(p string) (string, error) {
-	root := filepath.Clean(constants.RootPath() + "/apps/manifests")
-	clean := filepath.Clean(p)
-	if !strings.HasPrefix(clean, root+string(filepath.Separator)) {
-		return "", fmt.Errorf("manifest_path must stay under %s", root)
-	}
-	return clean, nil
 }

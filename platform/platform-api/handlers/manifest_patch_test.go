@@ -46,7 +46,7 @@ func newPatchTestEnv(t *testing.T, manifest string) (string, func()) {
 	oldRoot := constants.RootPath()
 	root := t.TempDir()
 	constants.SetRootPath(root)
-	dir := filepath.Join(root, "apps", "manifests", "patch-app")
+	dir := filepath.Join(root, "apps", "staging", "1700000000_deadbeef")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -275,16 +275,28 @@ func TestPatchManifestPathSafety(t *testing.T) {
 		}
 	}
 
-	// Direct unit check of the confining helper.
+	// Direct unit check of the strict staging helper.
 	root := constants.RootPath()
-	if _, err := safeManifestPath(root + "/apps/manifests/app/app.yaml"); err != nil {
-		t.Errorf("valid path rejected: %v", err)
+	validDir := filepath.Join(root, "apps", "staging", "1700000000_cafebabe")
+	if err := os.MkdirAll(validDir, 0755); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := safeManifestPath(root + "/apps/manifests/../../etc/passwd"); err == nil {
-		t.Error("traversal path accepted")
+	valid := filepath.Join(validDir, "app.yaml")
+	if err := os.WriteFile(valid, []byte(patchTestManifest), 0644); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := safeManifestPath(root + "/apps/manifests"); err == nil {
-		t.Error("manifests root itself accepted (must require a file under it)")
+	if _, err := safeStagingManifest(valid); err != nil {
+		t.Errorf("valid staging path rejected: %v", err)
+	}
+	for _, invalid := range []string{
+		filepath.Join(root, "apps", "manifests", "app", "app.yaml"),
+		filepath.Join(root, "apps", "staging", "bad-token", "app.yaml"),
+		filepath.Join(validDir, "nested", "app.yaml"),
+		filepath.Join(validDir, "other.yaml"),
+	} {
+		if _, err := safeStagingManifest(invalid); err == nil {
+			t.Errorf("unsafe staging path accepted: %s", invalid)
+		}
 	}
 }
 
@@ -351,9 +363,13 @@ func TestPatchManifestMissingInputs(t *testing.T) {
 		t.Errorf("broken json: code = %d, want 1001", code)
 	}
 	// Valid shape but nonexistent file.
-	w = callPatch(t, h, `{"manifest_path": `+quoteJSON(constants.RootPath()+"/apps/manifests/ghost/app.yaml")+`,"fields":{"metadata.name":"x"}}`)
-	if code := patchCode(t, w); code != CodeNotFound {
-		t.Errorf("missing file: code = %d, want 4000", code)
+	ghost := filepath.Join(constants.RootPath(), "apps", "staging", "1700000000_feedface", "app.yaml")
+	if err := os.MkdirAll(filepath.Dir(ghost), 0755); err != nil {
+		t.Fatal(err)
+	}
+	w = callPatch(t, h, `{"manifest_path": `+quoteJSON(ghost)+`,"fields":{"metadata.name":"x"}}`)
+	if code := patchCode(t, w); code != CodeInvalidParameter {
+		t.Errorf("missing staging artifact: code = %d, want 1004", code)
 	}
 }
 

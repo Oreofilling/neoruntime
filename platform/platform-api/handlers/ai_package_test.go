@@ -334,6 +334,57 @@ func TestExportAppOwnedRowNotFound(t *testing.T) {
 // A corrupted package (single flipped byte) must be rejected before anything
 // is staged — the two-pass import proves the digest first, and a rejected
 // import must not disturb blobs that already exist.
+func TestImportPackageHashMismatchPreservesAdjacentModelBlob(t *testing.T) {
+	h, _, store := newAIUpdateTestEnv(t)
+	hefBody := []byte("shared-package-hef")
+	sum := sha256.Sum256(hefBody)
+	hash := hex.EncodeToString(sum[:])
+	path := store.BlobPath(hash, ".hef")
+	// Simulate an adjacent admitted row whose missing CAS file is repaired by
+	// this import. Metadata is deliberately wrong, so cleanup must still retain
+	// the newly staged bytes because the row references their actual hash.
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "adjacent", Name: "adjacent", Status: "uploaded", Source: "web",
+		FilePath: path, FileHash: hash,
+	})
+
+	hefFile, err := os.CreateTemp(t.TempDir(), "adjacent-*.hef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hefFile.Write(hefBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hefFile.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	pkgFile, err := os.CreateTemp(t.TempDir(), "adjacent-*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := &storage.PackageMeta{
+		ModelID: "bad_meta",
+		HEF:     storage.PackageHEF{Filename: "adjacent.hef", SHA256: strings.Repeat("0", 64)},
+	}
+	if err := storage.WritePackage(pkgFile, meta, hefFile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pkgFile.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	st, err := pkgFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := h.importModelPackage(pkgFile, st.Size()); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("want metadata hash mismatch, got %v", err)
+	}
+	if !store.Exists(hash, ".hef") {
+		t.Fatal("hash-mismatch cleanup deleted a blob referenced by an adjacent model")
+	}
+}
+
 func TestImportPackageTamperedRejectedNothingStaged(t *testing.T) {
 	h, _, store := newAIUpdateTestEnv(t)
 

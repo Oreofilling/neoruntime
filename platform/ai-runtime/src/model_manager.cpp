@@ -512,25 +512,35 @@ int ModelManager::unregister_model(const std::string& model_id,
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
 
-    // If owner_id is provided, remove only that owner
+    // Owner-scoped release must be transactional with physical unload.
+    // A request for an owner that is not present is an idempotent no-op — it
+    // must never fall through and unload somebody else's registration. If
+    // this is the last owner, retain it while an active inference prevents
+    // unload so a refused request does not leave an ownerless live model.
     if (!owner_id.empty()) {
         auto oit = owners_.find(model_id);
-        if (oit != owners_.end()) {
+        if (oit == owners_.end() || oit->second.count(owner_id) == 0) {
+            LOG_INFO("Model %s: owner '%s' already absent, scoped unregister is a no-op",
+                     model_id.c_str(), owner_id.c_str());
+            return 1;  // logical success; physical model remains unchanged
+        }
+        if (oit->second.size() > 1) {
             oit->second.erase(owner_id);
             LOG_INFO("Model %s: removed owner '%s' (remaining owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), oit->second.size());
-
-            // If other owners remain, don't unload
-            if (!oit->second.empty()) {
-                return 0;
-            }
-            // Clean up empty owner set
-            owners_.erase(oit);
+            return 1;  // logical success; co-owners keep the physical model
         }
-    }
-
-    // Check ref_count before physical unload
-    if (it->second.ref_count > 0) {
+        if (it->second.ref_count > 0) {
+            LOG_ERROR("Cannot unregister %s for last owner '%s': ref_count=%d "
+                      "(still in use by active sessions)",
+                      model_id.c_str(), owner_id.c_str(), it->second.ref_count);
+            return -1;
+        }
+        oit->second.erase(owner_id);
+        owners_.erase(oit);
+    } else if (it->second.ref_count > 0) {
+        // Ownerless requests are the system-level force-unload path, but still
+        // respect live inference references.
         LOG_ERROR("Cannot unregister %s: ref_count=%d (still in use by active sessions)",
                   model_id.c_str(), it->second.ref_count);
         return -1;

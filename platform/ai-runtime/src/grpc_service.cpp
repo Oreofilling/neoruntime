@@ -193,8 +193,10 @@ grpc::Status AIRuntimeServiceImpl::UnregisterModel(
         // touched by any late callback.
         session_mgr_->destroy_sessions_by_model(req->model_id());
     }
-    resp->set_success(rc == 0);
-    resp->set_message(rc == 0 ? "Unregistered" : "Failed to unregister");
+    resp->set_success(rc >= 0);
+    resp->set_message(rc == 0 ? "Unregistered" :
+                      rc > 0 ? "Owner released; model remains registered" :
+                               "Failed to unregister");
     return grpc::Status::OK;
 }
 

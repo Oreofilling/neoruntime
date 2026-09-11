@@ -165,6 +165,53 @@ func TestCanonicalizeManifest(t *testing.T) {
 	})
 }
 
+func TestManifestPublishRollback(t *testing.T) {
+	t.Run("restores previous canonical bytes", func(t *testing.T) {
+		root := t.TempDir()
+		withRoot(t, root)
+		canonical := filepath.Join(root, "apps", "manifests", "app", "app.yaml")
+		if err := os.MkdirAll(filepath.Dir(canonical), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(canonical, []byte("old"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		rollback, err := manifestPublishRollback("app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(t.TempDir(), "app.yaml")
+		_ = os.WriteFile(src, []byte("new"), 0644)
+		if _, err := canonicalizeManifest(src, "app"); err != nil {
+			t.Fatal(err)
+		}
+		rollback()
+		got, _ := os.ReadFile(canonical)
+		if string(got) != "old" {
+			t.Fatalf("rollback restored %q", got)
+		}
+	})
+
+	t.Run("removes newly published canonical", func(t *testing.T) {
+		root := t.TempDir()
+		withRoot(t, root)
+		rollback, err := manifestPublishRollback("app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(t.TempDir(), "app.yaml")
+		_ = os.WriteFile(src, []byte("new"), 0644)
+		canonical, err := canonicalizeManifest(src, "app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rollback()
+		if _, err := os.Stat(canonical); !os.IsNotExist(err) {
+			t.Fatalf("new canonical survived rollback: %v", err)
+		}
+	})
+}
+
 func TestUnloadModelsRefusesUnsafeAppID(t *testing.T) {
 	// Uninstall removes appModelsDir(appID) wholesale; an id like ".." would
 	// resolve to the data root's parent. Install can never create such an

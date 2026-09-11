@@ -26,6 +26,13 @@ func (h *APIHandlers) cleanupStagedBlob(fileHash, ext string, existed bool) {
 	if fileHash == "" || h.modelStore == nil {
 		return
 	}
+
+	// Count and delete are one atomic decision against every admission path.
+	// Otherwise a register/update could commit a reference after the count but
+	// before Delete and be left pointing at a missing blob.
+	h.blobRefMu.Lock()
+	defer h.blobRefMu.Unlock()
+
 	if h.aiModelRepo != nil {
 		count, err := h.aiModelRepo.CountByFileHash(fileHash)
 		// Fail closed on reference-count errors: a DB hiccup must never

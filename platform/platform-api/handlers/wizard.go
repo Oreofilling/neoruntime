@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"aipc/platform/common/constants"
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,16 +57,16 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 		return
 	}
 
-	// Create persistent manifest directory
-	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", req.Metadata.ID)
-	if err := os.MkdirAll(manifestDir, 0755); err != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
+	// Generate into request-private staging; app-manager publishes the canonical
+	// manifest only after the install has passed validation.
+	manifestDir, err := newAppStagingDir()
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to create staging directory: "+err.Error())
 		return
 	}
-
-	// Write to persistent manifest file
 	manifestFile := filepath.Join(manifestDir, "app.yaml")
 	if err := os.WriteFile(manifestFile, yamlData, 0644); err != nil {
+		os.RemoveAll(manifestDir)
 		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest file: "+err.Error())
 		return
 	}
@@ -100,6 +98,7 @@ func (h *APIHandlers) WizardInstall(c *gin.Context) {
 		Force:        req.Force,
 	})
 	if err != nil {
+		os.RemoveAll(manifestDir)
 		Resp(c).FailMsg(CodeAppInstallFailed, err.Error())
 		return
 	}

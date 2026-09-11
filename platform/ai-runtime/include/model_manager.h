@@ -90,8 +90,13 @@ public:
                        const std::string& model_type = "",
                        std::string* why = nullptr);
 
-    /// Unregister (unload) a model. If owner_id is given, only removes that owner.
-    /// The model is physically unloaded only when no owners remain AND ref_count == 0.
+    /// Unregister (unload) a model. With owner_id, an absent owner is an
+    /// idempotent no-op; other owners keep the model resident; the last owner
+    /// is removed atomically with physical unload and is retained when a live
+    /// inference ref_count refuses that unload. An empty owner_id requests a
+    /// system-level unload but still respects ref_count. Returns 0 only when
+    /// the physical model was removed, 1 for an idempotent/co-owner logical
+    /// release that leaves it resident, and <0 on refusal.
     int unregister_model(const std::string& model_id, const std::string& owner_id = "");
 
     /// Force unregister all models, ignoring ref_count.

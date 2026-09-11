@@ -485,6 +485,40 @@ func TestSweepOrphanBlobsWaitsForAdmission(t *testing.T) {
 	}
 }
 
+// cleanupStagedBlob must serialize its count→delete decision with admission.
+// Once admission commits a reference while holding blobRefMu, cleanup recounts
+// after acquiring the lock and preserves the newly referenced blob.
+func TestCleanupStagedBlobConcurrentAdmissionPreservesBlob(t *testing.T) {
+	h, _, store, _ := newBlobGCTestEnv(t)
+	hash := contentHash(t, []byte("cleanup-admission"))
+	path := store.BlobPath(hash, ".hef")
+	if err := os.WriteFile(path, []byte("cleanup-admission"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h.blobRefMu.Lock()
+	cleanupDone := make(chan struct{})
+	go func() {
+		h.cleanupStagedBlob(hash, ".hef", false)
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup must wait for concurrent admission")
+	case <-time.After(100 * time.Millisecond):
+	}
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "admitted", Name: "admitted", Status: "uploaded", Source: "web",
+		FilePath: path, FileHash: hash,
+	})
+	h.blobRefMu.Unlock()
+	<-cleanupDone
+
+	if !store.Exists(hash, ".hef") {
+		t.Fatal("cleanup deleted a blob admitted by a concurrent model")
+	}
+}
+
 func TestUploadModelPersistsExplicitZeroDetectionThreshold(t *testing.T) {
 	h, _, _, _ := newBlobGCTestEnv(t)
 	fakeHailortcli(t)

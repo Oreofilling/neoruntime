@@ -126,6 +126,33 @@ func TestRequireSafeAppIDBoundaries(t *testing.T) {
 	}
 }
 
+func TestUploadManifestStagesWithoutTouchingCanonical(t *testing.T) {
+	root := guardTestRoot(t)
+	canonical := filepath.Join(root, "apps", "manifests", "app", "app.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(canonical, []byte("live"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	w := postMultipart(t, "/api/v1/apps/upload-manifest", "app.yaml",
+		validManifestYAML(t, "app"), func(c *gin.Context) {
+			(&APIHandlers{}).UploadManifest(c)
+		})
+	code, _, data := decodeUploadResponse(t, w)
+	if code != CodeSuccess {
+		t.Fatalf("body: %s", w.Body.String())
+	}
+	path, _ := data["path"].(string)
+	if _, err := safeStagingManifest(path); err != nil {
+		t.Fatalf("response path is not strict staging: %s: %v", path, err)
+	}
+	got, _ := os.ReadFile(canonical)
+	if string(got) != "live" {
+		t.Fatalf("upload changed canonical manifest: %q", got)
+	}
+}
+
 func TestUploadManifestRejectsTraversalAppID(t *testing.T) {
 	root := guardTestRoot(t)
 	w := postMultipart(t, "/api/v1/apps/upload-manifest", "app.yaml",

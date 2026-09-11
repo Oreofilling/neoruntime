@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -797,6 +796,10 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		Resp(c).FailMsg(CodeNotFound, "Model not found")
 		return
 	}
+	// Keep an immutable pre-update value for runtime compensation. dbModel is
+	// later overwritten with staged fields, so retaining only its pointer would
+	// restore the new path/variant after a failed Save.
+	original := *dbModel
 
 	newModelType := dbModel.ModelType
 	if req.ModelType != "" {
@@ -956,7 +959,10 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	}
 
 	// A loaded model whose runtime view changes must be unloaded first so
-	// the NPU never serves stale weights under the new row.
+	// the NPU never serves stale weights under the new row. Record actual
+	// successful teardown rather than inferring it later from wasLoaded: only
+	// that state requires compensation if the staged DB Save fails.
+	didUnload := false
 	if wasLoaded && needsReload && h.grpcClients.AIRuntime != nil {
 		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -985,6 +991,7 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 				"Failed to unload model before update: "+unloadStatus.Message)
 			return
 		}
+		didUnload = true
 	}
 
 	// Commit the staged row — fields were staged above so the reload
@@ -1010,7 +1017,22 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 	updateErr := h.aiModelRepo.Update(dbModel)
 	h.blobRefMu.Unlock()
 	if updateErr != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to persist model update: "+updateErr.Error())
+		persistMsg := "Failed to persist model update: " + updateErr.Error()
+		if didUnload {
+			// Never perform gRPC while holding blobRefMu. The DB row is still the
+			// immutable original because Save failed, so restore exactly that
+			// runtime registration under an independent deadline.
+			client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
+			restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			restoreErr := loadModelRuntime(restoreCtx, client, &original)
+			cancel()
+			if restoreErr != nil {
+				Resp(c).FailMsg(CodeServiceError, persistMsg+"; failed to restore original model on NPU: "+humanizeLoadError(restoreErr))
+				return
+			}
+		}
+		// Compensation does not turn a failed persistence operation into success.
+		Resp(c).FailMsg(CodeServiceError, persistMsg)
 		return
 	}
 
@@ -1019,37 +1041,7 @@ func (h *APIHandlers) UpdateModel(c *gin.Context) {
 		client := inferencepb.NewInferenceServiceClient(h.grpcClients.AIRuntime)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		runtimePath, runtimeVariant, grpcModelType, pathErr := modelload.RuntimeRegistration(dbModel)
-		var loadErr error
-		if pathErr != nil {
-			loadErr = pathErr
-		} else {
-			resp, regErr := client.RegisterModel(ctx, &inferencepb.ModelRegisterRequest{
-				ModelPath:    runtimePath,
-				ModelId:      dbModel.ModelID,
-				ModelType:    grpcModelType,
-				ModelVariant: runtimeVariant,
-			})
-			loadErr = regErr
-			if loadErr == nil && resp.Status != nil && !resp.Status.Success {
-				loadErr = fmt.Errorf("%s", resp.Status.Message)
-			}
-			if loadErr == nil && model.ResolveModelType(dbModel.ModelType) == "detection" {
-				// Same load-time probe as LoadModel: catch broken postprocess
-				// before the swapped model enters service.
-				info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: dbModel.ModelID})
-				if infoErr != nil {
-					info = nil
-				}
-				if smokeErr := modelload.RunLoadSmokeTest(ctx, client, dbModel.ModelID, info); smokeErr != nil {
-					loadErr = smokeErr
-					// Roll back so runtime and DB agree on "not loaded"; the
-					// helper runs on its own deadline because this reload ctx
-					// is typically exhausted by the time a smoke test fails.
-					rollbackRegistration(client, dbModel.ModelID)
-				}
-			}
-		}
+		loadErr := loadModelRuntime(ctx, client, dbModel)
 		if loadErr != nil {
 			// The row already reflects the new file as uploaded — report the
 			// reload failure explicitly instead of claiming success.

@@ -202,6 +202,12 @@ func (f *fakeAIRuntime) snapshot() ([]string, map[string]string) {
 // ai-runtime and a real temp-dir model store, plus the fake for assertions.
 func newAIUpdateTestEnv(t *testing.T) (*APIHandlers, *fakeAIRuntime, *storage.ModelStorage) {
 	t.Helper()
+	h, fake, store, _ := newAIUpdateTestEnvWithDB(t)
+	return h, fake, store
+}
+
+func newAIUpdateTestEnvWithDB(t *testing.T) (*APIHandlers, *fakeAIRuntime, *storage.ModelStorage, *gorm.DB) {
+	t.Helper()
 	gdb, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ai_update.db")), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	})
@@ -242,7 +248,7 @@ func newAIUpdateTestEnv(t *testing.T) (*APIHandlers, *fakeAIRuntime, *storage.Mo
 		aiModelRepo: repo.NewAIModelRepo(gdb),
 		grpcClients: &GRPCClients{AIRuntime: conn},
 		modelStore:  store,
-	}, fake, store
+	}, fake, store, gdb
 }
 
 // seedBlob drops a dummy .hef blob into the store so Exists/BlobPath resolve.
@@ -465,6 +471,80 @@ func TestUpdateModelLoadedTuningChangeReloads(t *testing.T) {
 	row, _ := h.aiModelRepo.GetByModelID("tuned_det")
 	if row.Status != "loaded" || row.Threshold != 0.5 || row.MaxDetections != 16 {
 		t.Errorf("row after tuning reload: status=%q threshold=%f maxDet=%d", row.Status, row.Threshold, row.MaxDetections)
+	}
+}
+
+func TestUpdateModelPersistFailureRestoresOriginalRuntime(t *testing.T) {
+	h, fake, store, gdb := newAIUpdateTestEnvWithDB(t)
+	seedBlob(t, store, "h2")
+	fake.markLive("restore_me")
+	original := &model.AIModel{
+		ModelID: "restore_me", Name: "restore_me", Status: "loaded", Source: "web",
+		ModelType: "classification", Variant: "old-variant",
+		FilePath: "/models/old.hef", FileHash: "h1", DesiredState: "loaded",
+	}
+	seedAIModel(t, h, original)
+	// Fail only the staged file swap Save; reads and the existing seed remain
+	// healthy, and a runtime-only compensation cannot touch this trigger.
+	if err := gdb.Exec(`CREATE TRIGGER fail_restore_me_swap BEFORE UPDATE ON ai_models
+		WHEN OLD.model_id = 'restore_me' AND NEW.file_hash = 'h2'
+		BEGIN SELECT RAISE(FAIL, 'target staged save failed'); END`).Error; err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	w := putUpdate(t, h, "restore_me", `{"file_hash":"h2","model_variant":"new-variant"}`)
+	if respCode(t, w) != CodeServiceError || !strings.Contains(w.Body.String(), "target staged save failed") {
+		t.Fatalf("want staged persist failure, code=%d body=%s", respCode(t, w), w.Body.String())
+	}
+	calls, paths := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:restore_me" || calls[1] != "load:restore_me" {
+		t.Fatalf("persist compensation order = %v, want unload old → load old", calls)
+	}
+	if paths["restore_me"] != original.FilePath {
+		t.Errorf("restored path = %q, want original %q", paths["restore_me"], original.FilePath)
+	}
+	if got := fake.registeredVariant("restore_me"); got != original.Variant {
+		t.Errorf("restored variant = %q, want original %q", got, original.Variant)
+	}
+	row, err := h.aiModelRepo.GetByModelID("restore_me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.FilePath != original.FilePath || row.FileHash != original.FileHash || row.Variant != original.Variant || row.Status != original.Status {
+		t.Errorf("DB row changed despite failed Save: %+v", row)
+	}
+}
+
+func TestUpdateModelPersistFailureReportsRestoreFailure(t *testing.T) {
+	h, fake, store, gdb := newAIUpdateTestEnvWithDB(t)
+	seedBlob(t, store, "h2")
+	fake.markLive("restore_bad")
+	seedAIModel(t, h, &model.AIModel{
+		ModelID: "restore_bad", Name: "restore_bad", Status: "loaded", Source: "web",
+		ModelType: "classification", Variant: "old-variant",
+		FilePath: "/models/old.hef", FileHash: "h1", DesiredState: "loaded",
+	})
+	if err := gdb.Exec(`CREATE TRIGGER fail_restore_bad_swap BEFORE UPDATE ON ai_models
+		WHEN OLD.model_id = 'restore_bad' AND NEW.file_hash = 'h2'
+		BEGIN SELECT RAISE(FAIL, 'target staged save failed'); END`).Error; err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	fake.loadFail = true
+
+	w := putUpdate(t, h, "restore_bad", `{"file_hash":"h2","model_variant":"new-variant"}`)
+	if respCode(t, w) != CodeServiceError {
+		t.Fatalf("code=%d body=%s, want service error", respCode(t, w), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "target staged save failed") || !strings.Contains(w.Body.String(), "failed to restore original model") || !strings.Contains(w.Body.String(), "npu rejected") {
+		t.Fatalf("combined error missing persist or restore cause: %s", w.Body.String())
+	}
+	calls, _ := fake.snapshot()
+	if len(calls) != 2 || calls[0] != "unload:restore_bad" || calls[1] != "load:restore_bad" {
+		t.Fatalf("restore failure call order = %v", calls)
+	}
+	row, _ := h.aiModelRepo.GetByModelID("restore_bad")
+	if row.FileHash != "h1" || row.FilePath != "/models/old.hef" || row.Variant != "old-variant" {
+		t.Errorf("DB row changed despite failed Save: %+v", row)
 	}
 }
 

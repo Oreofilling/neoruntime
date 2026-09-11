@@ -7,6 +7,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,8 +15,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	inferencepb "aipc/platform/ai-runtime/proto"
+	"aipc/platform/app-manager/manifest"
+	"aipc/platform/common/logger"
 	"aipc/platform/modelload"
 	"aipc/platform/platform-api/model"
 	"aipc/platform/platform-api/storage"
@@ -214,6 +223,306 @@ func loadBundledRegistration(aliasDir string) (*bundledRegistration, error) {
 // verified (a corrupted package is an error, never a hash). Used to compare a
 // bundled package against a platform HEF: the container bytes would never
 // match, the inner HEF bytes do.
+// bundledModelTransaction stages a complete replacement tree beside the
+// canonical app-models directory. The old tree and runtime registrations stay
+// untouched until every package has been extracted and verified.
+type bundledModelTransaction struct {
+	s          *AppManagerServer
+	appID      string
+	canonical  string
+	stage      string
+	backup     string
+	oldRegs    []*inferencepb.ModelRegisterRequest
+	newRegs    []*inferencepb.ModelRegisterRequest
+	registered []string
+	published  bool
+}
+
+func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, appID string, appManifest *manifest.AppManifest, pending []pendingBundledModel, task *InstallTask) (*bundledModelTransaction, error) {
+	if err := requireSafePathSegment("app id", appID); err != nil {
+		return nil, err
+	}
+	for _, p := range pending {
+		if err := requireSafePathSegment("model alias", p.alias); err != nil {
+			return nil, err
+		}
+	}
+
+	base := appModelsDir(appID)
+	parent := filepath.Dir(base)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, fmt.Errorf("create app-models root: %w", err)
+	}
+	stage, err := os.MkdirTemp(parent, "."+appID+".staging-")
+	if err != nil {
+		return nil, fmt.Errorf("create bundled model staging tree: %w", err)
+	}
+	tx := &bundledModelTransaction{s: s, appID: appID, canonical: base, stage: stage}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+
+	// Snapshot durable registrations before changing either disk or runtime.
+	entries, readErr := os.ReadDir(base)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("snapshot old bundled model tree: %w", readErr)
+	}
+	if readErr == nil {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			aliasDir := filepath.Join(base, entry.Name())
+			reg, err := loadBundledRegistration(aliasDir)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot old bundled model %q: %w", entry.Name(), err)
+			}
+			hefPath := filepath.Join(aliasDir, reg.HEF)
+			if _, err := os.Stat(hefPath); err != nil {
+				return nil, fmt.Errorf("snapshot old bundled model %q HEF: %w", entry.Name(), err)
+			}
+			tx.oldRegs = append(tx.oldRegs, bundledRegisterRequest(appID, reg, hefPath))
+		}
+	}
+
+	if len(pending) > 0 {
+		s.aiRuntimeMutex.RLock()
+		client := s.aiRuntimeClient
+		s.aiRuntimeMutex.RUnlock()
+		if client == nil || !s.config.AIRuntime.Enabled || s.extractModelFile == nil {
+			return nil, fmt.Errorf("bundled models cannot be prepared (ai-runtime or containerd unavailable)")
+		}
+		refs := appManifest.ImageReferences()
+		if len(refs) == 0 {
+			return nil, fmt.Errorf("the app declares no image to extract bundled models from")
+		}
+		for _, p := range pending {
+			if task != nil {
+				task.Update("registering", 82, fmt.Sprintf("Staging bundled model %q (alias %q)...", p.id, p.alias))
+			}
+			aliasDir := filepath.Join(stage, p.alias)
+			binPath, err := s.extractModelFile(ctx, refs[0], p.path, aliasDir)
+			if err != nil {
+				return nil, fmt.Errorf("model %q (alias %q): extract %q failed: %w", p.id, p.alias, p.path, err)
+			}
+			reg, err := unpackBundledPackage(binPath, aliasDir, p.id)
+			_ = os.Remove(binPath)
+			if err != nil {
+				return nil, fmt.Errorf("model %q (alias %q): package validation failed: %w", p.id, p.alias, err)
+			}
+			canonicalHEF := filepath.Join(base, p.alias, reg.HEF)
+			tx.newRegs = append(tx.newRegs, bundledRegisterRequest(appID, reg, canonicalHEF))
+		}
+	}
+	cleanup = false
+	return tx, nil
+}
+
+func bundledRegisterRequest(appID string, reg *bundledRegistration, hefPath string) *inferencepb.ModelRegisterRequest {
+	return &inferencepb.ModelRegisterRequest{ModelId: reg.ModelID, ModelPath: hefPath, OwnerId: appID, ModelType: reg.ModelType, ModelVariant: reg.ModelVariant, Transient: true, RawOutputOnly: reg.RawOutputOnly}
+}
+
+func registerRequest(ctx context.Context, client inferencepb.InferenceServiceClient, req *inferencepb.ModelRegisterRequest) error {
+	resp, err := client.RegisterModel(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp == nil || resp.Status == nil || !resp.Status.Success {
+		message := "missing runtime status"
+		if resp != nil && resp.Status != nil && resp.Status.Message != "" {
+			message = resp.Status.Message
+		}
+		return fmt.Errorf("runtime refused registration: %s", message)
+	}
+	return nil
+}
+
+// Publish performs the deliberately narrow destructive window: old ownership
+// must be released and physical absence proven before the tree swap and new
+// registrations. Any failure restores released ownership and/or the old tree.
+func (tx *bundledModelTransaction) Publish(ctx context.Context) error {
+	tx.s.aiRuntimeMutex.RLock()
+	client := tx.s.aiRuntimeClient
+	tx.s.aiRuntimeMutex.RUnlock()
+	if client == nil || !tx.s.config.AIRuntime.Enabled {
+		if len(tx.oldRegs)+len(tx.newRegs) == 0 {
+			return nil
+		}
+		return fmt.Errorf("ai-runtime is not available")
+	}
+
+	released := make([]*inferencepb.ModelRegisterRequest, 0, len(tx.oldRegs))
+	restoreReleased := func() {
+		for _, req := range released {
+			if err := registerRequest(ctx, client, req); err != nil {
+				logger.Error("Rollback: failed to restore ownership of model %s for app %s: %v", req.ModelId, tx.appID, err)
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	for _, req := range tx.oldRegs {
+		if seen[req.ModelId] {
+			continue
+		}
+		seen[req.ModelId] = true
+
+		// A solo ai-runtime restart legitimately loses the old transient
+		// registration while the durable app-models tree survives. In that case
+		// there is nothing to quiesce and replacement may proceed.
+		_, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: req.ModelId})
+		if status.Code(infoErr) == codes.NotFound {
+			continue
+		}
+		if infoErr != nil {
+			restoreReleased()
+			return fmt.Errorf("cannot inspect old bundled model %s before replacement: %w", req.ModelId, infoErr)
+		}
+
+		resp, err := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: req.ModelId, OwnerId: tx.appID})
+		if err != nil {
+			restoreReleased()
+			return fmt.Errorf("unregister old bundled model %s: %w", req.ModelId, err)
+		}
+		if resp == nil || !resp.Success {
+			restoreReleased()
+			return fmt.Errorf("runtime refused to unregister old bundled model %s: %s", req.ModelId, resp.GetMessage())
+		}
+		// Logical success commits this app's owner release even when another
+		// owner keeps the physical entry resident. Track it before the absence
+		// check so a co-owner veto restores this app's ownership too.
+		released = append(released, req)
+		_, err = client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: req.ModelId})
+		if status.Code(err) != codes.NotFound {
+			restoreReleased()
+			if err == nil {
+				return fmt.Errorf("old bundled model %s is still physically registered (busy or co-owned)", req.ModelId)
+			}
+			return fmt.Errorf("cannot confirm physical removal of old bundled model %s: %w", req.ModelId, err)
+		}
+	}
+
+	if _, err := os.Stat(tx.canonical); err == nil {
+		backup, mkErr := os.MkdirTemp(filepath.Dir(tx.canonical), "."+tx.appID+".backup-")
+		if mkErr != nil {
+			restoreReleased()
+			return fmt.Errorf("create old bundled tree backup: %w", mkErr)
+		}
+		_ = os.Remove(backup)
+		if err := os.Rename(tx.canonical, backup); err != nil {
+			restoreReleased()
+			return fmt.Errorf("backup old bundled tree: %w", err)
+		}
+		tx.backup = backup
+	} else if !os.IsNotExist(err) {
+		restoreReleased()
+		return fmt.Errorf("inspect old bundled tree: %w", err)
+	}
+	if err := os.Rename(tx.stage, tx.canonical); err != nil {
+		if tx.backup != "" {
+			_ = os.Rename(tx.backup, tx.canonical)
+		}
+		restoreReleased()
+		return fmt.Errorf("publish staged bundled tree: %w", err)
+	}
+	tx.stage = ""
+	tx.published = true
+
+	for _, req := range tx.newRegs {
+		// Track before the RPC: a transport failure may occur after the runtime
+		// accepted ownership, and owner-scoped unregister is safely idempotent.
+		tx.registered = append(tx.registered, req.ModelId)
+		if err := registerRequest(ctx, client, req); err != nil {
+			return fmt.Errorf("register new bundled model %s: %w", req.ModelId, err)
+		}
+		if req.ModelType == "detection" {
+			if err := tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId); err != nil {
+				return fmt.Errorf("new bundled model %s smoke test failed: %w", req.ModelId, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (tx *bundledModelTransaction) Rollback(_ context.Context) {
+	if tx == nil {
+		return
+	}
+	// Compensation must outlive the initiating HTTP/gRPC request. A client
+	// cancellation or exhausted publish deadline must not prevent releasing a
+	// partially accepted new registration and restoring the old tree/runtime.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	wasPublished := tx.published
+	tx.s.aiRuntimeMutex.RLock()
+	client := tx.s.aiRuntimeClient
+	tx.s.aiRuntimeMutex.RUnlock()
+	runtimeClear := true
+	if client != nil {
+		seen := make(map[string]bool)
+		for _, id := range tx.registered {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			resp, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: id, OwnerId: tx.appID})
+			// GetModelInfo is authoritative: the smoke-test helper may already
+			// have rolled this registration back, in which case a second
+			// UnregisterModel legitimately reports failure/not-found.
+			_, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: id})
+			if status.Code(infoErr) == codes.NotFound {
+				continue
+			}
+			runtimeClear = false
+			if unregErr != nil || resp == nil || !resp.Success {
+				logger.Error("Rollback: cannot release new bundled model %s for app %s: rpc=%v status=%v", id, tx.appID, unregErr, resp)
+			}
+			logger.Error("Rollback: new bundled model %s for app %s remains registered; preserving its HEF and old backup", id, tx.appID)
+		}
+	}
+	if tx.published && runtimeClear {
+		if err := os.RemoveAll(tx.canonical); err != nil {
+			runtimeClear = false
+			logger.Error("Rollback: failed to remove new bundled model tree for app %s: %v", tx.appID, err)
+		}
+		if runtimeClear && tx.backup != "" {
+			if err := os.Rename(tx.backup, tx.canonical); err != nil {
+				runtimeClear = false
+				logger.Error("Rollback: failed to restore bundled model tree for app %s: %v", tx.appID, err)
+			}
+		}
+	}
+	if client != nil && wasPublished && runtimeClear {
+		for _, req := range tx.oldRegs {
+			if err := registerRequest(ctx, client, req); err != nil {
+				logger.Error("Rollback: failed to restore bundled model %s for app %s: %v", req.ModelId, tx.appID, err)
+			}
+		}
+	}
+	if tx.stage != "" {
+		_ = os.RemoveAll(tx.stage)
+	}
+	tx.published = false
+}
+
+func (tx *bundledModelTransaction) Commit() {
+	if tx == nil {
+		return
+	}
+	if tx.backup != "" {
+		_ = os.RemoveAll(tx.backup)
+	}
+	if tx.stage != "" {
+		_ = os.RemoveAll(tx.stage)
+	}
+	if len(tx.newRegs) == 0 {
+		_ = os.RemoveAll(tx.canonical)
+	}
+}
+
 func bundledPackageHEFHash(binPath string) (string, error) {
 	f, err := os.Open(binPath)
 	if err != nil {

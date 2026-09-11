@@ -693,6 +693,7 @@ func (s *PlatformAPIServer) setupRoutes() {
 	apps.POST("/upload-image", apiHandlers.UploadImage)
 	apps.POST("/upload-manifest", apiHandlers.UploadManifest)
 	apps.POST("/upload-package", apiHandlers.UploadPackage)
+	apps.POST("/staging/abandon", apiHandlers.AbandonAppStaging)
 	apps.PATCH("/manifest", apiHandlers.PatchManifest)
 	apps.POST("/install-package", apiHandlers.InstallPackage)
 	apps.GET("/install-progress/:task_id", apiHandlers.GetInstallProgress)
@@ -1146,6 +1147,23 @@ func resolveGyroCalibration(cfg GyroConfig, mount [9]float64) (resolvedMount [9]
 
 func (s *PlatformAPIServer) Start() error {
 	logger.Info("Starting Platform API server on %s", s.config.Service.HTTPAddr)
+	// Reap abandoned import staging from previous process lifetimes, then keep
+	// doing so periodically. Cleanup is token-directory-only and never follows
+	// symlinks outside the staging root.
+	handlers.CleanupAppStaging(time.Now())
+	stagingCleanupStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				handlers.CleanupAppStaging(now)
+			case <-stagingCleanupStop:
+				return
+			}
+		}
+	}()
 
 	// Handle shutdown gracefully
 	sigChan := make(chan os.Signal, 1)
@@ -1153,6 +1171,7 @@ func (s *PlatformAPIServer) Start() error {
 
 	go func() {
 		<-sigChan
+		close(stagingCleanupStop)
 		logger.Info("Shutting down Platform API server...")
 
 		// Stop persist loop

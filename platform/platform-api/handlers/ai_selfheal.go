@@ -36,20 +36,14 @@ const (
 	modelHealTimeout = 30 * time.Second
 )
 
-// loadModelCore is the runtime half of a model load, shared by the REST
-// endpoint and the self-heal loop so both register models identically:
-// compose the runtime registration, register on the NPU, capture input
-// dimensions from live model info, probe postprocess (rolling the
-// registration back on failure) and persist the loaded status. The caller
-// owns the context lifetime and the pre-checks (runtime-already-has-model,
-// stale-row healing, app-usage guards).
-func (h *APIHandlers) loadModelCore(ctx context.Context, client inferencepb.InferenceServiceClient, dbModel *model.AIModel) error {
+// loadModelRuntime performs only the runtime half of a model load: compose the
+// registration, register it, capture tensor dimensions and smoke-test
+// postprocess. It never writes the database, which makes it safe for restoring
+// an immutable pre-update registration after a staged Save fails.
+func loadModelRuntime(ctx context.Context, client inferencepb.InferenceServiceClient, dbModel *model.AIModel) error {
 	// Wizard-imported detection models live under sha256 blob names the
 	// postprocess plugin cannot match; modelload.RuntimeRegistration materializes
-	// them under a recognized basename and composes a schema-valid variant that
-	// carries the stored threshold / max_detections to the runtime. Raw-output
-	// models come back with an empty grpcModelType so the runtime skips the
-	// postprocess session entirely.
+	// them under a recognized basename and composes a schema-valid variant.
 	runtimePath, runtimeVariant, grpcModelType, pathErr := modelload.RuntimeRegistration(dbModel)
 	if pathErr != nil {
 		return fmt.Errorf("Failed to prepare model for runtime: %w", pathErr)
@@ -68,23 +62,19 @@ func (h *APIHandlers) loadModelCore(ctx context.Context, client inferencepb.Infe
 		return fmt.Errorf("%s", resp.Status.Message)
 	}
 
-	// Update input dimensions from live model info (best effort: a runtime
-	// without GetModelInfo leaves the stored dimensions alone).
-	var modelInfo *inferencepb.ModelInfo
+	// Tensor info is best effort: runtimes without GetModelInfo leave the
+	// supplied model's dimensions unchanged.
 	infoModelID := resp.ModelId
 	if infoModelID == "" {
 		infoModelID = dbModel.ModelID
 	}
-	modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{
-		ModelId: infoModelID,
-	})
+	modelInfo, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: infoModelID})
 	if infoErr != nil {
 		modelInfo = nil
 	}
 	if modelInfo != nil && len(modelInfo.Inputs) > 0 {
 		input := modelInfo.Inputs[0]
-		layout := input.GetLayout()
-		switch layout {
+		switch input.GetLayout() {
 		case "NHWC":
 			if len(input.Shape) >= 4 {
 				dbModel.InputHeight = int(input.Shape[1])
@@ -103,25 +93,25 @@ func (h *APIHandlers) loadModelCore(ctx context.Context, client inferencepb.Infe
 		}
 	}
 
-	// Postprocess failures only surface at infer time — probe the freshly
-	// loaded model once so a broken registration can be rolled back here
-	// instead of failing on every frame later.
 	if model.ResolveModelType(dbModel.ModelType) == "detection" {
 		if smokeErr := modelload.RunLoadSmokeTest(ctx, client, dbModel.ModelID, modelInfo); smokeErr != nil {
 			rollbackRegistration(client, dbModel.ModelID)
 			return fmt.Errorf("postprocess smoke test failed: %w", smokeErr)
 		}
 	}
+	return nil
+}
 
+// loadModelCore adds persistence to the shared runtime-only load. Persistence
+// remains transactional from the caller's perspective: a failed Save rolls the
+// new runtime registration back.
+func (h *APIHandlers) loadModelCore(ctx context.Context, client inferencepb.InferenceServiceClient, dbModel *model.AIModel) error {
+	if err := loadModelRuntime(ctx, client, dbModel); err != nil {
+		return err
+	}
 	dbModel.Status = "loaded"
 	dbModel.DesiredState = "loaded"
 	if err := h.aiModelRepo.Update(dbModel); err != nil {
-		// Persistence is part of the load transaction, not a best-effort
-		// side effect: returning success here would leave status=uploaded
-		// with an explicit desired_state=unloaded — the REST load reports
-		// success for a model the DB says was never loaded, and the
-		// self-healer will not restore it after a runtime wipe. Roll the
-		// registration back and surface the error; callers retry.
 		rollbackRegistration(client, dbModel.ModelID)
 		return fmt.Errorf("failed to persist loaded state: %w", err)
 	}

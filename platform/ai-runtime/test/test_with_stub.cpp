@@ -228,6 +228,53 @@ void test_model_manager() {
     PASS();
 }
 
+// ─── Test: owner-scoped unregister is transactional ─────────────────────────
+void test_owner_scoped_unregister() {
+    TEST(owner_scoped_unregister);
+
+    g_mock_creates  = 0;
+    g_mock_destroys = 0;
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    ModelManager mgr(&infer_ops, nullptr, nullptr, nullptr);
+
+    int rc = mgr.register_model("owned", "/fake/owned.hef", "app-a");
+    ASSERT_EQ(rc, 0, "initial owner registration failed");
+    rc = mgr.register_model("owned", "/fake/owned.hef", "app-b");
+    ASSERT_EQ(rc, 1, "second owner should co-own existing entry");
+
+    // A foreign/duplicate scoped release is a no-op, never a force unload.
+    rc = mgr.unregister_model("owned", "not-an-owner");
+    ASSERT_EQ(rc, 1, "absent owner release should keep the physical model");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-a"), "app-a ownership was disturbed");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b ownership was disturbed");
+    ASSERT_EQ(g_mock_destroys, 0, "absent owner must not destroy the model");
+
+    // Releasing one of two owners keeps the shared registration resident.
+    rc = mgr.unregister_model("owned", "app-a");
+    ASSERT_EQ(rc, 1, "co-owner release should keep the physical model");
+    ASSERT_TRUE(!mgr.is_owner("owned", "app-a"), "app-a should be released");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b must remain");
+    ASSERT_EQ(g_mock_destroys, 0, "co-owner release must not destroy the model");
+
+    // Busy last-owner release is refused without deleting that ownership.
+    auto snap = mgr.acquire_model_snapshot("owned");
+    ASSERT_TRUE(snap.has_value(), "owned model missing");
+    rc = mgr.unregister_model("owned", "app-b");
+    ASSERT_TRUE(rc != 0, "busy last-owner release should fail");
+    ASSERT_TRUE(mgr.is_owner("owned", "app-b"),
+                "busy refusal must retain the last owner");
+    mgr.release_model("owned");
+
+    // Once idle, the last owner and physical session disappear together.
+    rc = mgr.unregister_model("owned", "app-b");
+    ASSERT_EQ(rc, 0, "idle last-owner release failed");
+    ASSERT_TRUE(!mgr.acquire_model_snapshot("owned").has_value(),
+                "last-owner release must remove the model");
+    ASSERT_EQ(g_mock_destroys, 1, "physical session should be destroyed once");
+
+    PASS();
+}
+
 // ─── Test: model alias session refcount (P0 UAF / double-free) ───────────────
 // Validates the ModelManager session-refcount fix for path aliases: two model
 // ids on the same file share one heap infer_session; it must be destroyed
@@ -542,6 +589,7 @@ int main() {
 
     test_hal_loader();
     test_model_manager();
+    test_owner_scoped_unregister();
     test_model_alias_refcount();
     test_session_manager();
     test_session_concurrent_destroy();

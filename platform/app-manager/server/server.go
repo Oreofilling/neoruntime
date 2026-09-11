@@ -75,10 +75,31 @@ type AppManagerServer struct {
 	// Async install tasks
 	taskStore *InstallTaskStore
 
+	// Per-app lifecycle serialization. Install/update/start/uninstall mutate the
+	// same registry, manifest and app-models tree; different apps remain fully
+	// parallel while operations for one ID cannot cross transaction boundaries.
+	appMutationMu    sync.Mutex
+	appMutationLocks map[string]*sync.Mutex
+
 	// extractModelFile pulls a file out of a containerd image; swappable in
 	// tests. Wired to containerd.Client.ExtractFileFromImage in
 	// NewAppManagerServer; nil when containerd is unavailable.
 	extractModelFile func(ctx context.Context, imageRef, containerPath, destDir string) (string, error)
+}
+
+func (s *AppManagerServer) lockAppMutation(appID string) func() {
+	s.appMutationMu.Lock()
+	if s.appMutationLocks == nil {
+		s.appMutationLocks = make(map[string]*sync.Mutex)
+	}
+	mu := s.appMutationLocks[appID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.appMutationLocks[appID] = mu
+	}
+	s.appMutationMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 type Config struct {
@@ -414,21 +435,29 @@ func (s *AppManagerServer) stopAndCleanupContainer(ctx context.Context, appID st
 
 	if appInfo.State == registry.AppStateRunning {
 		stopReq := &proto.StopRequest{AppId: appID, TimeoutSeconds: 10}
-		if _, err := s.StopApp(ctx, stopReq); err != nil {
-			logger.Warn("Failed to stop app %s during update: %v", appID, err)
+		st, err := s.StopApp(ctx, stopReq)
+		if err != nil {
+			return fmt.Errorf("stop app %s: %w", appID, err)
+		}
+		if st == nil || !st.Success {
+			message := "missing stop status"
+			if st != nil && st.Message != "" {
+				message = st.Message
+			}
+			return fmt.Errorf("stop app %s was refused: %s", appID, message)
 		}
 	}
 
 	if appInfo.ContainerID != "" && s.client != nil && s.runtime != nil {
 		container, err := s.client.GetContainer(ctx, appInfo.ContainerID)
 		if err == nil {
-			if task, err := container.Task(ctx, nil); err == nil {
+			if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 				if stopErr := s.runtime.StopAppContainer(ctx, task, 5); stopErr != nil {
-					logger.Warn("Failed to stop container during update: %v", stopErr)
+					return fmt.Errorf("stop container during update: %w", stopErr)
 				}
 			}
 			if err := s.runtime.RemoveAppContainer(ctx, container); err != nil {
-				logger.Warn("Failed to remove container during update: %v", err)
+				return fmt.Errorf("remove container during update: %w", err)
 			}
 		}
 	}
@@ -460,6 +489,8 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 			},
 		}, nil
 	}
+	unlockApp := s.lockAppMutation(appManifest.Metadata.ID)
+	defer unlockApp()
 
 	// Resolve spec.model dependencies before pulling the image (fail fast):
 	// by id first (runtime/platform.db), then by declared bundled path, which
@@ -479,6 +510,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	appID := appManifest.Metadata.ID
 	var isUpdate bool
 	var wasRunning bool
+	var oldAppInfo *registry.AppInfo
 	var oldWebURL string
 	var oldRestartCount int
 	var oldInstalledAt time.Time
@@ -495,16 +527,14 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}
 		// Force overwrite: preserve state then stop + remove container
 		existingApp, _ := s.registry.Get(appID)
+		oldAppInfo = existingApp
 		wasRunning = existingApp.State == registry.AppStateRunning
 		oldWebURL = existingApp.WebURL
 		oldRestartCount = existingApp.RestartCount
 		oldInstalledAt = existingApp.InstalledAt
 		isUpdate = true
 
-		logger.Info("Updating existing app %s (was running=%v)", appID, wasRunning)
-		if err := s.stopAndCleanupContainer(ctx, appID); err != nil {
-			logger.Warn("Failed to cleanup existing app %s: %v", appID, err)
-		}
+		logger.Info("Preparing update of existing app %s (was running=%v)", appID, wasRunning)
 	}
 
 	// Validate seccomp profile
@@ -579,16 +609,45 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}
 	}
 
-	// Extract bundled models (spec.models path fallback) now that the image
-	// is in containerd, and register them as transient models.
-	if extrErr := s.extractImageModels(ctx, appID, appManifest, resolution.pathPending, nil); extrErr != nil {
-		return &proto.InstallResponse{
-			Status: &proto.Status{
-				Success: false,
-				Message: fmt.Sprintf("Bundled model extraction failed: %v", extrErr),
-				Code:    400,
-			},
-		}, nil
+	// Prepare every bundled package in a sibling tree. Force updates always run
+	// this transaction, including an empty replacement (which removes old models).
+	var registeredFresh bool
+	committed := false
+	stoppedExisting := false
+	defer func() {
+		if !committed && stoppedExisting && wasRunning {
+			go func() {
+				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: appID}); err != nil || st == nil || !st.Success {
+					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", appID, err, st)
+				}
+			}()
+		}
+	}()
+	var modelTx *bundledModelTransaction
+	if isUpdate || len(resolution.pathPending) > 0 {
+		modelTx, err = s.prepareBundledModelTransaction(ctx, appID, appManifest, resolution.pathPending, nil)
+		if err != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Bundled model preparation failed: %v", err), Code: 400}}, nil
+		}
+	}
+
+	// All new packages are now verified while the old app/runtime/tree remain
+	// intact. Stop the old container before quiescing its registrations;
+	// otherwise it can race a new inference into the strict unload window.
+	if isUpdate {
+		stoppedExisting = true
+		if err := s.stopAndCleanupContainer(ctx, appID); err != nil {
+			if modelTx != nil {
+				modelTx.Rollback(ctx)
+			}
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to stop existing app before update: %v", err), Code: 409}}, nil
+		}
+	}
+	if modelTx != nil {
+		if err := modelTx.Publish(ctx); err != nil {
+			modelTx.Rollback(ctx)
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Bundled model publish failed: %v", err), Code: 409}}, nil
+		}
 	}
 
 	// Same rollback contract as runAsyncInstall for fresh installs: from
@@ -596,29 +655,39 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	// models back (and undoes a registry entry saved by a later step) —
 	// nothing of a failed install survives. Updates keep their artifacts:
 	// the registry entry (old or new) owns them and UninstallApp cleans up.
-	var registeredFresh bool
-	committed := false
-	if !isUpdate {
-		defer func() {
-			if committed {
-				return
+	defer func() {
+		if committed {
+			return
+		}
+		if registeredFresh {
+			if unErr := s.registry.Unregister(appID); unErr != nil {
+				logger.Warn("Rollback: failed to unregister app %s: %v", appID, unErr)
 			}
-			if registeredFresh {
-				if unErr := s.registry.Unregister(appID); unErr != nil {
-					logger.Warn("Rollback: failed to unregister app %s: %v", appID, unErr)
-				}
+		} else if isUpdate && oldAppInfo != nil {
+			if upErr := s.registry.Update(oldAppInfo); upErr != nil {
+				logger.Error("Rollback: failed to restore old app registry %s: %v", appID, upErr)
 			}
-			ids := make([]string, 0, len(resolution.pathPending))
-			for _, p := range resolution.pathPending {
-				ids = append(ids, p.id)
-			}
-			s.rollbackBundledModels(ctx, appID, ids)
-		}()
-	}
+		}
+		if modelTx != nil {
+			modelTx.Rollback(ctx)
+		}
+	}()
 
 	// Warn when a shadowed bundled copy differs from the platform copy that
 	// won resolution (best-effort, never fails the install).
 	s.checkShadowedModels(ctx, appManifest, resolution.shadowed, nil)
+
+	// Snapshot the canonical manifest so a failure after publication can restore
+	// the previous app metadata together with the old model tree.
+	manifestRollback, err := manifestPublishRollback(appID)
+	if err != nil {
+		return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to snapshot manifest: %v", err), Code: 500}}, nil
+	}
+	defer func() {
+		if !committed {
+			manifestRollback()
+		}
+	}()
 
 	// Store the manifest under the managed manifests root before
 	// registering, so cleanup can never target a caller-owned parent
@@ -721,9 +790,11 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
 
-	// The install is committed from here: cleanup of the models and any
-	// registry entry becomes UninstallApp's job.
+	// The install is committed from here: discard the old bundled tree backup.
 	committed = true
+	if modelTx != nil {
+		modelTx.Commit()
+	}
 
 	// Publish event
 	eventType := "installed"
@@ -764,10 +835,30 @@ func (s *AppManagerServer) AsyncInstallApp(ctx context.Context, req *proto.Async
 		return nil, fmt.Errorf("manifest_path is required")
 	}
 
-	task := s.taskStore.Create()
-	logger.Info("Created install task: %s", task.ID)
+	// Claim an immutable manifest snapshot before returning a task id. The
+	// caller may close/cancel the wizard immediately after acceptance, and its
+	// request staging can then be cleaned without racing the background parse.
+	manifestData, err := os.ReadFile(req.ManifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read manifest before accepting task: %w", err)
+	}
+	appManifest, err := manifest.ParseManifest(manifestData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse manifest before accepting task: %w", err)
+	}
+	if err := appManifest.Validate(); err != nil {
+		return nil, fmt.Errorf("failed to validate manifest before accepting task: %w", err)
+	}
 
-	go s.runAsyncInstall(task.ID, req.ManifestPath, req.ImagePath, req.Force)
+	task := s.taskStore.Create()
+	claimed, err := claimAppStaging(task.ID, req.ManifestPath, req.ImagePath)
+	if err != nil {
+		task.Fail(err.Error())
+		return nil, err
+	}
+	manifestPath, imagePath := claimed[0], claimed[1]
+	logger.Info("Created install task: %s", task.ID)
+	go s.runAsyncInstallSnapshot(task.ID, manifestData, manifestPath, imagePath, req.Force)
 
 	return &proto.AsyncInstallResponse{TaskId: task.ID}, nil
 }
@@ -790,18 +881,33 @@ func (s *AppManagerServer) GetInstallProgress(ctx context.Context, req *proto.In
 	}, nil
 }
 
-// runAsyncInstall executes the full installation flow in a background goroutine.
+// runAsyncInstall is the test/legacy wrapper; the production RPC snapshots
+// bytes before accepting the task and calls runAsyncInstallSnapshot directly.
 func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath string, force bool) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if task, ok := s.taskStore.Get(taskID); ok {
+			task.Fail(fmt.Sprintf("Failed to load manifest: %v", err))
+		}
+		return
+	}
+	s.runAsyncInstallSnapshot(taskID, data, manifestPath, imagePath, force)
+}
+
+// runAsyncInstallSnapshot executes the full installation flow from immutable
+// manifest bytes owned by the task.
+func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData []byte, manifestPath, imagePath string, force bool) {
 	task, ok := s.taskStore.Get(taskID)
 	if !ok {
 		return
 	}
+	defer cleanupOwnedAppStaging(manifestPath, imagePath)
 
 	ctx := namespaces.WithNamespace(context.Background(), s.config.Containerd.Namespace)
 
 	// Phase: validating (0-5%)
 	task.Update("validating", 2, "Validating manifest...")
-	appManifest, err := manifest.LoadManifest(manifestPath)
+	appManifest, err := manifest.ParseManifest(manifestData)
 	if err != nil {
 		task.Fail(fmt.Sprintf("Failed to load manifest: %v", err))
 		return
@@ -810,6 +916,8 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		task.Fail(fmt.Sprintf("Invalid manifest: %v", err))
 		return
 	}
+	unlockApp := s.lockAppMutation(appManifest.Metadata.ID)
+	defer unlockApp()
 	if err := security.ValidateSeccompProfile(s.config.Security.SeccompProfile); err != nil {
 		task.Fail(fmt.Sprintf("Invalid seccomp profile: %v", err))
 		return
@@ -825,17 +933,20 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		return
 	}
 
-	// Check duplicate BEFORE pulling image
+	// Check duplicate BEFORE pulling image. Force update keeps the old registry
+	// record until the replacement transaction commits.
 	asyncAppID := appManifest.Metadata.ID
+	var isUpdate, wasRunning bool
+	var oldAppInfo *registry.AppInfo
 	if s.registry.Exists(asyncAppID) {
 		if !force {
 			task.Fail(fmt.Sprintf("App %s already exists. Use force=true to overwrite.", asyncAppID))
 			return
 		}
-		task.Update("validating", 4, "Removing existing app for overwrite...")
-		if err := s.stopAndCleanupApp(ctx, asyncAppID); err != nil {
-			logger.Warn("Failed to cleanup existing app %s: %v", asyncAppID, err)
-		}
+		oldAppInfo, _ = s.registry.Get(asyncAppID)
+		isUpdate = oldAppInfo != nil
+		wasRunning = isUpdate && oldAppInfo.State == registry.AppStateRunning
+		task.Update("validating", 4, "Preparing existing app replacement...")
 	}
 
 	// Phase: pulling (5-80%)
@@ -988,14 +1099,45 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		task.Update("pulling", 80, "No image to pull")
 	}
 
-	// Extract bundled models (spec.models path fallback) now that every image
-	// reference is present, and register them as transient models.
-	if extrErr := s.extractImageModels(ctx, appManifest.Metadata.ID, appManifest, resolution.pathPending, task); extrErr != nil {
-		task.Fail(fmt.Sprintf("Bundled model extraction failed: %v", extrErr))
-		return
+	var modelTx *bundledModelTransaction
+	committed := false
+	stoppedExisting := false
+	defer func() {
+		if !committed && stoppedExisting && wasRunning {
+			go func() {
+				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: asyncAppID}); err != nil || st == nil || !st.Success {
+					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", asyncAppID, err, st)
+				}
+			}()
+		}
+	}()
+	if isUpdate || len(resolution.pathPending) > 0 {
+		modelTx, err = s.prepareBundledModelTransaction(ctx, asyncAppID, appManifest, resolution.pathPending, task)
+		if err != nil {
+			task.Fail(fmt.Sprintf("Bundled model preparation failed: %v", err))
+			return
+		}
+	}
+	if isUpdate {
+		stoppedExisting = true
+		if err := s.stopAndCleanupContainer(ctx, asyncAppID); err != nil {
+			if modelTx != nil {
+				modelTx.Rollback(ctx)
+			}
+			task.Fail(fmt.Sprintf("Failed to stop existing app before update: %v", err))
+			return
+		}
+	}
+	if modelTx != nil {
+		if err := modelTx.Publish(ctx); err != nil {
+			modelTx.Rollback(ctx)
+			task.Fail(fmt.Sprintf("Bundled model publish failed: %v", err))
+			return
+		}
 	}
 
-	// extractImageModels only cleans up after ITS OWN failures. From here
+	// From here until commit, restore the old tree/runtime registrations on any
+	// manifest, registry, or instance failure.
 	// until the install is committed, every later failure (manifest storage,
 	// registry save, instance dir) must roll the extracted models back too —
 	// the transient registrations and <root>/app-models/<app_id> live outside
@@ -1003,21 +1145,22 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 	// them. A registry entry saved before a later failure is unregistered as
 	// well: an app without its instance dir is half-installed.
 	var registeredApp *registry.AppInfo
-	committed := false
 	defer func() {
 		if committed {
 			return
 		}
 		if registeredApp != nil {
-			if unErr := s.registry.Unregister(registeredApp.ID); unErr != nil {
+			if isUpdate && oldAppInfo != nil {
+				if upErr := s.registry.Update(oldAppInfo); upErr != nil {
+					logger.Error("Rollback: failed to restore old app registry %s: %v", oldAppInfo.ID, upErr)
+				}
+			} else if unErr := s.registry.Unregister(registeredApp.ID); unErr != nil {
 				logger.Warn("Rollback: failed to unregister app %s: %v", registeredApp.ID, unErr)
 			}
 		}
-		ids := make([]string, 0, len(resolution.pathPending))
-		for _, p := range resolution.pathPending {
-			ids = append(ids, p.id)
+		if modelTx != nil {
+			modelTx.Rollback(ctx)
 		}
-		s.rollbackBundledModels(ctx, appManifest.Metadata.ID, ids)
 	}()
 
 	// Warn when a shadowed bundled copy differs from the platform copy that
@@ -1027,10 +1170,21 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 	// Phase: registering (80-95%)
 	task.Update("registering", 85, "Registering application...")
 
+	manifestRollback, err := manifestPublishRollback(asyncAppID)
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to snapshot manifest: %v", err))
+		return
+	}
+	defer func() {
+		if !committed {
+			manifestRollback()
+		}
+	}()
+
 	// Store the manifest under the managed manifests root before
 	// registering, so cleanup can never target a caller-owned parent
 	// directory (CLI tarball unpack dirs, legacy top-level paths).
-	canonicalPath, err := canonicalizeManifest(manifestPath, appManifest.Metadata.ID)
+	canonicalPath, err := canonicalizeManifestBytes(manifestData, manifestPath, appManifest.Metadata.ID)
 	if err != nil {
 		task.Fail(fmt.Sprintf("Failed to store manifest: %v", err))
 		return
@@ -1056,10 +1210,20 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 			})
 		}
 	}
+	if isUpdate && oldAppInfo != nil {
+		appInfo.WebURL = oldAppInfo.WebURL
+		appInfo.RestartCount = oldAppInfo.RestartCount
+		appInfo.InstalledAt = oldAppInfo.InstalledAt
+	}
 
 	task.Update("registering", 90, "Saving app registry...")
-	if err := s.registry.Register(appInfo); err != nil {
-		task.Fail(fmt.Sprintf("Failed to register app: %v", err))
+	if isUpdate {
+		err = s.registry.Update(appInfo)
+	} else {
+		err = s.registry.Register(appInfo)
+	}
+	if err != nil {
+		task.Fail(fmt.Sprintf("Failed to save app registry: %v", err))
 		return
 	}
 	registeredApp = appInfo
@@ -1075,18 +1239,31 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
 
-	// The install is committed from here: cleanup of the models and the
-	// registry entry becomes UninstallApp's job (explicit uninstall or the
-	// self-heal loop).
+	// The install is committed from here: discard the old bundled tree backup.
 	committed = true
+	if modelTx != nil {
+		modelTx.Commit()
+	}
 
 	// Publish event
-	s.publishAppEvent("installed", appInfo.ID, map[string]interface{}{
+	eventType := "installed"
+	if isUpdate {
+		eventType = "updated"
+	}
+	s.publishAppEvent(eventType, appInfo.ID, map[string]interface{}{
 		"name":    appManifest.Metadata.Name,
 		"version": appManifest.Metadata.Version,
 	})
 
 	logger.Info("Async install complete: %s", appInfo.ID)
+
+	if isUpdate && wasRunning {
+		go func() {
+			if _, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: appInfo.ID}); err != nil {
+				logger.Warn("Failed to auto-restart updated app %s: %v", appInfo.ID, err)
+			}
+		}()
+	}
 
 	// Phase: complete (100%)
 	task.Complete(appInfo.ID)
@@ -1095,6 +1272,8 @@ func (s *AppManagerServer) runAsyncInstall(taskID, manifestPath, imagePath strin
 // StartApp implements AppManager.StartApp
 func (s *AppManagerServer) StartApp(ctx context.Context, req *proto.StartRequest) (*proto.Status, error) {
 	logger.Info("StartApp called: app_id=%s", req.AppId)
+	unlockApp := s.lockAppMutation(req.AppId)
+	defer unlockApp()
 
 	// Get app info
 	appInfo, err := s.registry.Get(req.AppId)
@@ -1618,6 +1797,8 @@ func (s *AppManagerServer) stopMultiContainerApp(ctx context.Context, appID stri
 
 // UninstallApp implements AppManager.UninstallApp
 func (s *AppManagerServer) UninstallApp(ctx context.Context, req *proto.UninstallRequest) (*proto.Status, error) {
+	unlockApp := s.lockAppMutation(req.AppId)
+	defer unlockApp()
 	// Use background context for namespace and nested calls
 	bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

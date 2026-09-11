@@ -12,6 +12,8 @@ import (
 
 	"github.com/glebarez/sqlite"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gorm.io/gorm"
 
 	inferencepb "aipc/platform/ai-runtime/proto"
@@ -36,6 +38,9 @@ type stubInferenceClient struct {
 	infos         map[string]*inferencepb.ModelInfo // GetModelInfo results by model id
 	inferCalls    []string                          // model ids probed via Infer
 	inferFail     string                            // non-empty: Infer reports this failure
+	unregErr      error
+	unregStatus   *inferencepb.Status
+	stateful      map[string]*inferencepb.ModelInfo
 }
 
 func (c *stubInferenceClient) ListModels(ctx context.Context, in *inferencepb.Empty, opts ...grpc.CallOption) (*inferencepb.ModelListResponse, error) {
@@ -46,18 +51,32 @@ func (c *stubInferenceClient) ListModels(ctx context.Context, in *inferencepb.Em
 }
 
 func (c *stubInferenceClient) RegisterModel(ctx context.Context, in *inferencepb.ModelRegisterRequest, opts ...grpc.CallOption) (*inferencepb.ModelRegisterResponse, error) {
-	c.registrations = append(c.registrations, in)
+	copyReq := *in
+	c.registrations = append(c.registrations, &copyReq)
 	if c.regErr != nil {
 		return nil, c.regErr
 	}
 	if st, ok := c.regStatus[in.ModelId]; ok {
 		return &inferencepb.ModelRegisterResponse{ModelId: in.ModelId, Status: st}, nil
 	}
+	if c.stateful != nil {
+		c.stateful[in.ModelId] = &inferencepb.ModelInfo{ModelId: in.ModelId, ModelPath: in.ModelPath, OwnerId: in.OwnerId, Transient: in.Transient}
+	}
 	return &inferencepb.ModelRegisterResponse{ModelId: in.ModelId, Status: &inferencepb.Status{Success: true}}, nil
 }
 
 func (c *stubInferenceClient) UnregisterModel(ctx context.Context, in *inferencepb.ModelInfo, opts ...grpc.CallOption) (*inferencepb.Status, error) {
-	c.unregistered = append(c.unregistered, in)
+	copyInfo := *in
+	c.unregistered = append(c.unregistered, &copyInfo)
+	if c.unregErr != nil {
+		return nil, c.unregErr
+	}
+	if c.unregStatus != nil && !c.unregStatus.Success {
+		return c.unregStatus, nil
+	}
+	if c.stateful != nil {
+		delete(c.stateful, in.ModelId)
+	}
 	return &inferencepb.Status{Success: true}, nil
 }
 
@@ -68,7 +87,10 @@ func (c *stubInferenceClient) GetModelInfo(ctx context.Context, in *inferencepb.
 	if info, ok := c.infos[in.ModelId]; ok {
 		return info, nil
 	}
-	return nil, errors.New("model not found")
+	if info, ok := c.stateful[in.ModelId]; ok {
+		return info, nil
+	}
+	return nil, status.Error(codes.NotFound, "model not found")
 }
 
 func (c *stubInferenceClient) Infer(ctx context.Context, in *inferencepb.InferRequest, opts ...grpc.CallOption) (*inferencepb.InferResponse, error) {
@@ -768,6 +790,127 @@ func TestExtractImageModels(t *testing.T) {
 	})
 }
 
+func seedOldBundledTree(t *testing.T, appID, content string) string {
+	t.Helper()
+	aliasDir := filepath.Join(appModelsDir(appID), "detector")
+	if err := os.MkdirAll(aliasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hef := filepath.Join(aliasDir, model.DefaultDetectionProfile+".hef")
+	if err := os.WriteFile(hef, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg := bundledRegistration{ModelID: "bundled_det", HEF: filepath.Base(hef), ModelType: "detection"}
+	blob, _ := json.Marshal(reg)
+	if err := os.WriteFile(filepath.Join(aliasDir, bundledRegistrationFile), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return hef
+}
+
+func TestBundledModelTransactionForceUpdate(t *testing.T) {
+	t.Run("same_identity_loads_new_bytes", func(t *testing.T) {
+		withTempRoot(t)
+		oldPath := seedOldBundledTree(t, "app-x", "old-bytes")
+		client := &stubInferenceClient{stateful: map[string]*inferencepb.ModelInfo{
+			"bundled_det": {ModelId: "bundled_det", ModelPath: oldPath, OwnerId: "app-x"},
+		}}
+		s := newExtractionServer(t, client, contentExtractor([]byte("new-bytes")))
+		m := bundledImageManifest()
+		tx, err := s.prepareBundledModelTransaction(context.Background(), "app-x", m, pendingFor(m, "detector"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(oldPath); string(got) != "old-bytes" {
+			t.Fatalf("prepare changed canonical bytes: %q", got)
+		}
+		if err := tx.Publish(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		tx.Commit()
+		if got, _ := os.ReadFile(oldPath); string(got) != "new-bytes" {
+			t.Fatalf("published HEF = %q, want new-bytes", got)
+		}
+		if len(client.registrations) != 1 || client.registrations[0].ModelPath != oldPath {
+			t.Fatalf("registrations = %+v, want new canonical registration", client.registrations)
+		}
+	})
+
+	t.Run("validation_failure_preserves_old_state", func(t *testing.T) {
+		withTempRoot(t)
+		oldPath := seedOldBundledTree(t, "app-x", "old-bytes")
+		client := &stubInferenceClient{stateful: map[string]*inferencepb.ModelInfo{
+			"bundled_det": {ModelId: "bundled_det", ModelPath: oldPath, OwnerId: "app-x"},
+		}}
+		s := newExtractionServer(t, client, func(ctx context.Context, imageRef, containerPath, destDir string) (string, error) {
+			p, err := fakeExtractor(nil, nil)(ctx, imageRef, containerPath, destDir)
+			if err != nil {
+				return "", err
+			}
+			blob, _ := os.ReadFile(p)
+			blob[len(blob)-1] ^= 0xff
+			return p, os.WriteFile(p, blob, 0o644)
+		})
+		if _, err := s.prepareBundledModelTransaction(context.Background(), "app-x", bundledImageManifest(), pendingFor(bundledImageManifest(), "detector"), nil); err == nil {
+			t.Fatal("expected validation failure")
+		}
+		if got, _ := os.ReadFile(oldPath); string(got) != "old-bytes" {
+			t.Fatalf("old bytes changed: %q", got)
+		}
+		if len(client.unregistered) != 0 {
+			t.Fatalf("prepare touched runtime: %+v", client.unregistered)
+		}
+	})
+
+	t.Run("unregister_refusal_does_not_publish", func(t *testing.T) {
+		withTempRoot(t)
+		oldPath := seedOldBundledTree(t, "app-x", "old-bytes")
+		client := &stubInferenceClient{unregStatus: &inferencepb.Status{Success: false, Message: "busy"}, stateful: map[string]*inferencepb.ModelInfo{
+			"bundled_det": {ModelId: "bundled_det", ModelPath: oldPath, OwnerId: "app-x"},
+		}}
+		s := newExtractionServer(t, client, contentExtractor([]byte("new-bytes")))
+		m := bundledImageManifest()
+		tx, err := s.prepareBundledModelTransaction(context.Background(), "app-x", m, pendingFor(m, "detector"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Publish(context.Background()); err == nil || !strings.Contains(err.Error(), "busy") {
+			t.Fatalf("error = %v", err)
+		}
+		tx.Rollback(context.Background())
+		if got, _ := os.ReadFile(oldPath); string(got) != "old-bytes" {
+			t.Fatalf("canonical was published: %q", got)
+		}
+		if len(client.registrations) != 0 {
+			t.Fatalf("new model registered: %+v", client.registrations)
+		}
+	})
+
+	t.Run("postcommit_failure_rollback_restores_old", func(t *testing.T) {
+		withTempRoot(t)
+		oldPath := seedOldBundledTree(t, "app-x", "old-bytes")
+		client := &stubInferenceClient{stateful: map[string]*inferencepb.ModelInfo{
+			"bundled_det": {ModelId: "bundled_det", ModelPath: oldPath, OwnerId: "app-x"},
+		}}
+		s := newExtractionServer(t, client, contentExtractor([]byte("new-bytes")))
+		m := bundledImageManifest()
+		tx, err := s.prepareBundledModelTransaction(context.Background(), "app-x", m, pendingFor(m, "detector"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Publish(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		tx.Rollback(context.Background())
+		if got, _ := os.ReadFile(oldPath); string(got) != "old-bytes" {
+			t.Fatalf("rollback bytes = %q", got)
+		}
+		if got := client.stateful["bundled_det"]; got == nil || got.ModelPath != oldPath {
+			t.Fatalf("runtime not restored: %+v", got)
+		}
+	})
+}
+
 func TestPreloadModelsRestoresBundledModels(t *testing.T) {
 	root := withTempRoot(t)
 	extracted := filepath.Join(root, "app-models", "app-x", "detector", "det.hef")
@@ -879,7 +1022,7 @@ func contentExtractor(content []byte) func(ctx context.Context, imageRef, contai
 		if err != nil {
 			return "", err
 		}
-		meta := &storage.PackageMeta{HEF: storage.PackageHEF{Filename: "inner.hef"}}
+		meta := detectionPackageMeta("bundled_det")
 		if err := storage.WritePackage(f, meta, bytes.NewReader(content)); err != nil {
 			f.Close()
 			return "", err
@@ -1102,8 +1245,8 @@ func TestRunAsyncInstallPostExtractionFailureRollsBack(t *testing.T) {
 		s.runAsyncInstall(task.ID, writeBundledAppManifest(t), "", false)
 
 		phase, _, _, _, errMsg := task.Snapshot()
-		if phase != "error" || !strings.Contains(errMsg, "Failed to store manifest") {
-			t.Fatalf("task = (%q, %q), want manifest-storage failure", phase, errMsg)
+		if phase != "error" || (!strings.Contains(errMsg, "Failed to store manifest") && !strings.Contains(errMsg, "Failed to snapshot manifest")) {
+			t.Fatalf("task = (%q, %q), want manifest publication failure", phase, errMsg)
 		}
 		if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "bundled_det" ||
 			client.unregistered[0].OwnerId != "app-x" {

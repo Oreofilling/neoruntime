@@ -256,6 +256,8 @@ export interface WizardConfig {
   };
   image: string;
   image_path?: string;
+  /** explicitly confirmed replacement of an existing app id */
+  force?: boolean;
   /** model dependencies (spec.models): alias → mapping */
   models?: Record<string, WizardModelMapping>;
   resources?: {
