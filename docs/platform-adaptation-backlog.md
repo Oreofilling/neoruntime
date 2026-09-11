@@ -59,14 +59,15 @@ tensor through the HAL bridge.
 
 ## F. Daemon contract rollout (proposals ready, dependencies unblocked)
 
-The `dsp-offload` proposal is shipped (PLAT-1..5). Three remain, in
-cost/benefit order:
+The `dsp-offload` proposal is shipped (PLAT-1..5). The three
+remaining contracts all landed 2026-09-10/11 on pr-63-dsp-fix
+(uncommitted):
 
 | # | Contract | Content | Cost |
 |---|----------|---------|------|
-| F1 | **ai-overlay-extended** (cheapest) | `AiOverlayConfig` v2: polygons, tracks, per-class colors, per-app overlay sources. Its blend dependency is already hardware-validated (HAL-2: alpha=0 passthrough exact, ~129 µs/overlay marginal on dma-buf, ~0.67 ms single). | renderer extension only |
-| F2 | **frame-injection** | `PushFrame`: app-composed frames / OSD into the encoded main stream. The injection node exists and sits idle on the target device (`/dev/video10`, `hailo-vid-out-mcm-in`, memory-injection). Note: the AI-overlay use case no longer needs F2 — the overlay is baked into the pipeline buffer at the frontend-callback site (`handle_video_frame_for_routing`), upstream of the encoder in both auto_feed and manual mode. F2 remains for general app-composed frame push only. | media-graph wiring + dma-buf import contract + geometry/format constraints + EOS/flush semantics |
-| F3 | **web-stream-url** | `GetWebStreamUrl`: apps ask the platform console for a video endpoint (HLS/MJPEG reverse-proxied by the platform) instead of opening their own ports. | RPC + nginx; no dependencies |
+| F1 | **ai-overlay-extended** — SHIPPED | `AiOverlayConfig` v2: polygons, tracks, per-class colors, per-app overlay sources; RESULT_TTL configurable. Its blend dependency was already hardware-validated (HAL-2). | renderer extension only |
+| F2 | **frame-injection** — SHIPPED (P0+P2) | `PushFrame`: app-composed frames into the encoded streams. Landed at the encoder bake site (`handle_video_frame_for_routing`): REPLACE plane copy, OVERLAY opaque paste / ARGB32 alpha blend, client-streaming with pts pacing (newest-due-wins) and drop-oldest, manifest permission gate (`injection.allowed_apps` + SO_PEERCRED). Remaining tail: RGB888 input, DSP-offloaded blend (needs the P1-9 queue split), zero-copy swap. | media-graph wiring + dma-buf import contract + geometry/format constraints + EOS/flush semantics |
+| F3 | **web-stream-url** — P0 SHIPPED (SDK-side) | The gateway already reverse-proxies `/api/v1/h264/{id}`; the shipped `platform_stream_url()` SDK helper composes that URL (host/scheme/token), so apps publishing via F2 hand viewers a URL without opening ports and without a new RPC. Signed-ttl URLs + accept negotiation (`GetWebStreamUrl`) remain future daemon work (P1/P2 of the proposal). | none for P0; RPC + nginx later |
 
 ## G. Telemetry / quota operations
 
