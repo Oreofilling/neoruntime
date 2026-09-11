@@ -34,6 +34,20 @@ constexpr uint32_t kMinDim = 16;
 constexpr uint32_t kMaxDim = 8192;
 /* SCM_RIGHTS wire cap on the UDS alloc response: count*num_planes fds. */
 constexpr uint32_t kMaxAllocFds = 64;
+/* HAL pool chunk the service asks for (alloc_buffers) AND the unit of
+ * retention footprint accounting: parking one buffer of a geometry keeps
+ * the vendor's whole chunk alive (the pool cache in hailo15_media_impl is
+ * weak — the chunk dies when its last buffer frees), so a geometry parked
+ * at all is accounted as a full chunk. */
+constexpr uint32_t kPoolChunkBuffers = 32;
+
+/* Full-chunk byte cost of parking any buffer of fb's geometry (strides
+ * and sizes are pool-determined, so every buffer of a geometry agrees). */
+uint64_t chunk_bytes_of(const HalFrameBuffer* fb) {
+    uint64_t per = 0;
+    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) per += fb->sizes[p];
+    return static_cast<uint64_t>(kPoolChunkBuffers) * per;
+}
 
 /* Unpredictable 64-bit id draw for buffer/job handles. Clients address
  * buffers and jobs by id over camera.sock, and pin/blend/encode act on
@@ -124,23 +138,40 @@ bool DspService::start() {
         return false;
     }
 
-    // Same context recipe as dpm_worker (E1 proved contexts coexist; the
-    // vendor PriorityQueueSingleton serializes hardware access anyway).
+    // P1-9 lane split: one HAL context per priority lane. Extra contexts
+    // buy no parallelism (the vendor PriorityQueueSingleton serializes all
+    // hardware access process-wide) — they buy QUEUE ORDERING: the vendor
+    // runs higher-priority queued work first (dsp_set_priority). NORMAL
+    // rides cfg_.device_priority (default 1, ahead of stream-side DSP work:
+    // dpm resizes / encoder); BACKGROUND stays at 0 so a bulk lane never
+    // preempts the encoder.
     HalDspConfig dcfg{};
-    dcfg.device_priority = 0;
-    if (dsp_ops_->init(&dcfg, &dsp_ctx_) != 0 || !dsp_ctx_) {
+    dcfg.device_priority = cfg_.device_priority;
+    if (dsp_ops_->init(&dcfg, &dsp_ctx_normal_) != 0 || !dsp_ctx_normal_) {
         HAL_LOG_ERROR("DspService: HAL DSP init failed — SubmitDspJob unavailable");
-        dsp_ctx_ = nullptr;
+        dsp_ctx_normal_ = nullptr;
         return false;
+    }
+    dcfg.device_priority = 0;
+    if (dsp_ops_->init(&dcfg, &dsp_ctx_background_) != 0 ||
+        !dsp_ctx_background_) {
+        // Degrade, don't die: BACKGROUND jobs ride the normal lane (their
+        // in-service queue position is unchanged; only the vendor-level
+        // ordering folds back to the flat pre-split behavior).
+        HAL_LOG_WARNING(
+            "DspService: background-lane DSP init failed — background jobs "
+            "share the normal lane");
+        dsp_ctx_background_ = nullptr;
     }
 
     running_ = true;
     worker_ = std::thread(&DspService::worker_loop, this);
     HAL_LOG_INFO(
         "DspService: started (max_batch=%u quota=%.0f jobs/s %.0f MPix/s "
-        "timeout=%ums)",
+        "timeout=%ums prio=%d bg_lane=%s)",
         cfg_.max_batch, cfg_.quota_jobs_per_sec, cfg_.quota_mpix_per_sec,
-        cfg_.job_timeout_ms);
+        cfg_.job_timeout_ms, cfg_.device_priority,
+        dsp_ctx_background_ ? "on" : "off");
     return true;
 }
 
@@ -173,6 +204,19 @@ void DspService::stop() {
         done_cv_.notify_all();
     }
 
+    // Lookup leases hold pins against registered buffers; drop them BEFORE
+    // the free-everything pass below (its "no pins can exist" assumption
+    // predates leases). Pins are destroyed outside lookup_mu_ — their dtor
+    // takes buffers_mu_.
+    {
+        decltype(lookup_leases_) leases;
+        {
+            std::lock_guard<std::mutex> lk(lookup_mu_);
+            leases = std::move(lookup_leases_);
+        }
+        leases.clear();
+    }
+
     // Free every remaining registered buffer (no pins can exist now).
     {
         // P2: drop the async registry — waiters see "unknown job id" from
@@ -201,9 +245,36 @@ void DspService::stop() {
         for (HalFrameBuffer* fb : imported) free_imported_fb(fb);
     }
 
-    if (dsp_ctx_) {
-        dsp_ops_->deinit(dsp_ctx_);
-        dsp_ctx_ = nullptr;
+    // Retention cache: running_ is false, so nothing can re-park. Flush
+    // every park through the same collect-under-lock / release-outside
+    // discipline as the registry above.
+    {
+        std::vector<HalFrameBuffer*> to_free;
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(buffers_mu_);
+            for (auto& kv : parked_)
+                for (const ParkedBuffer& pb : kv.second) to_free.push_back(pb.fb);
+            n = to_free.size();
+            parked_.clear();
+            parked_order_.clear();
+            parked_footprint_ = 0;
+            if (n > 0) {
+                std::lock_guard<std::mutex> slk(stats_mu_);
+                stats_.retention_releases += n;
+                stats_.retention_parked = 0;
+            }
+        }
+        for (HalFrameBuffer* fb : to_free) fb_ops_->release_frame_buffer(fb);
+    }
+
+    if (dsp_ctx_normal_) {
+        dsp_ops_->deinit(dsp_ctx_normal_);
+        dsp_ctx_normal_ = nullptr;
+    }
+    if (dsp_ctx_background_) {
+        dsp_ops_->deinit(dsp_ctx_background_);
+        dsp_ctx_background_ = nullptr;
     }
     HAL_LOG_INFO("DspService: stopped");
 }
@@ -278,24 +349,30 @@ DspService::AllocResult DspService::alloc_buffers(int client_fd, uint32_t width,
     // the fd-plane ceiling: 32 two-plane buffers = FD_PUB_DSP_MAX_FDS(64) fds.
     // Pool key includes the size, so this never touches the pipeline's own
     // pool_max_buffers=0 pools.
-    req.pool_max_buffers = 32;
+    req.pool_max_buffers = kPoolChunkBuffers;
     req.mem_type = HAL_MEM_DMABUF;
     req.zero_initialize = false;
+    const ParkedGeometry geom{width, height, static_cast<uint32_t>(format)};
 
     std::vector<HalFrameBuffer*> fbs;
     fbs.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
-        HalFrameBuffer* fb = nullptr;
-        int rc = fb_ops_->request_frame_buffer(&req, &fb);
-        if (rc != 0 || !fb) {
-            for (HalFrameBuffer* done : fbs) fb_ops_->release_frame_buffer(done);
-            out.rc = DSP_SVC_ERR_NO_MEM;
-            char msg[128];
-            std::snprintf(msg, sizeof(msg), "HAL alloc failed at %u/%u (rc=%d)", i,
-                          count, rc);
-            out.message = msg;
-            HAL_LOG_WARNING("DspService: %s", msg);
-            return out;
+        // Retention first: a parked same-geometry buffer skips the HAL
+        // pool-chunk create round entirely (the 43ms tail's source).
+        HalFrameBuffer* fb = take_parked(geom);
+        if (!fb) {
+            int rc = fb_ops_->request_frame_buffer(&req, &fb);
+            if (rc != 0 || !fb) {
+                for (HalFrameBuffer* done : fbs)
+                    fb_ops_->release_frame_buffer(done);
+                out.rc = DSP_SVC_ERR_NO_MEM;
+                char msg[128];
+                std::snprintf(msg, sizeof(msg), "HAL alloc failed at %u/%u (rc=%d)",
+                              i, count, rc);
+                out.message = msg;
+                HAL_LOG_WARNING("DspService: %s", msg);
+                return out;
+            }
         }
         fbs.push_back(fb);
     }
@@ -494,7 +571,8 @@ DspService::ImportResult DspService::import_buffer(
 }
 
 void DspService::detach_entry_locked(BufferEntry* entry,
-                                     std::vector<HalFrameBuffer*>& to_free) {
+                                     std::vector<HalFrameBuffer*>& to_free,
+                                     size_t* parked_out) {
     if (entry->detached) return;
     entry->detached = true;
     buffers_.erase(entry->id);
@@ -523,8 +601,159 @@ void DspService::detach_entry_locked(BufferEntry* entry,
         if (stats_.buffers_in_registry > 0) stats_.buffers_in_registry--;
     }
     if (entry->pins == 0) {
-        to_free.push_back(entry->fb);
+        park_or_free_locked(
+            ParkedGeometry{entry->fb->width, entry->fb->height,
+                           static_cast<uint32_t>(entry->fb->format)},
+            entry->fb, to_free, parked_out);
         delete entry;
+    }
+}
+
+/* Park fb for same-geometry reuse, or hand it back via `to_free`.
+ * Caller holds buffers_mu_. Parking is refused while stopping or with
+ * retention disabled (either knob = 0); a geometry whose pool chunk
+ * alone exceeds the cap is never parked. On first park of a geometry
+ * the whole chunk enters the footprint; over-cap pressure then evicts
+ * whole geometries front-first (oldest first) — the just-parked
+ * geometry always fits under the cap alone, so eviction stops before
+ * reaching it. */
+void DspService::park_or_free_locked(const ParkedGeometry& g,
+                                     HalFrameBuffer* fb,
+                                     std::vector<HalFrameBuffer*>& to_free,
+                                     size_t* parked_out) {
+    if (!running_.load() || cfg_.pool_retention_ms == 0 ||
+        cfg_.pool_retention_max_bytes == 0) {
+        to_free.push_back(fb);
+        return;
+    }
+    const uint64_t chunk = chunk_bytes_of(fb);
+    if (chunk > cfg_.pool_retention_max_bytes) {
+        to_free.push_back(fb);
+        return;
+    }
+    auto it = parked_.find(g);
+    if (it == parked_.end()) {
+        it = parked_.emplace(g, std::deque<ParkedBuffer>()).first;
+        parked_order_.push_back(g);
+        parked_footprint_ += chunk;
+    }
+    it->second.push_back(
+        {fb, std::chrono::steady_clock::now() +
+                 std::chrono::milliseconds(cfg_.pool_retention_ms)});
+    {
+        std::lock_guard<std::mutex> lk(stats_mu_);
+        stats_.retention_parked++;
+    }
+    if (parked_out) (*parked_out)++;
+
+    while (parked_footprint_ > cfg_.pool_retention_max_bytes &&
+           !parked_order_.empty()) {
+        const ParkedGeometry victim = parked_order_.front();
+        parked_order_.pop_front();
+        auto vit = parked_.find(victim);
+        if (vit == parked_.end() || vit->second.empty()) {
+            if (vit != parked_.end()) parked_.erase(vit);
+            continue; /* stale order entry — nothing to free or subtract */
+        }
+        const uint64_t vchunk = chunk_bytes_of(vit->second.front().fb);
+        const size_t n = vit->second.size();
+        for (const ParkedBuffer& pb : vit->second) to_free.push_back(pb.fb);
+        parked_.erase(vit);
+        parked_footprint_ =
+            (parked_footprint_ > vchunk) ? parked_footprint_ - vchunk : 0;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu_);
+            stats_.retention_releases += n;
+            stats_.retention_parked =
+                (stats_.retention_parked >= n) ? stats_.retention_parked - n : 0;
+        }
+    }
+}
+
+/* Pop a reusable same-geometry buffer, or nullptr. Takes buffers_mu_
+ * itself — alloc_buffers' request loop runs unlocked. Expired front
+ * entries are HAL-released after unlock, never under the lock. */
+HalFrameBuffer* DspService::take_parked(const ParkedGeometry& g) {
+    std::vector<HalFrameBuffer*> dead;
+    HalFrameBuffer* reuse = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(buffers_mu_);
+        auto it = parked_.find(g);
+        if (it != parked_.end() && !it->second.empty()) {
+            const auto now = std::chrono::steady_clock::now();
+            while (!it->second.empty() && it->second.front().deadline <= now) {
+                dead.push_back(it->second.front().fb);
+                it->second.pop_front();
+                {
+                    std::lock_guard<std::mutex> slk(stats_mu_);
+                    stats_.retention_releases++;
+                    if (stats_.retention_parked > 0) stats_.retention_parked--;
+                }
+            }
+            if (!it->second.empty()) {
+                reuse = it->second.front().fb;
+                it->second.pop_front();
+                {
+                    std::lock_guard<std::mutex> slk(stats_mu_);
+                    stats_.retention_reuses++;
+                    if (stats_.retention_parked > 0) stats_.retention_parked--;
+                }
+            }
+            if (it->second.empty()) {
+                /* All buffers of a geometry share pool-determined sizes:
+                 * compute the chunk from the last pop while it's in hand. */
+                const HalFrameBuffer* last = reuse ? reuse : dead.back();
+                const uint64_t chunk = chunk_bytes_of(last);
+                parked_.erase(it);
+                parked_footprint_ =
+                    (parked_footprint_ > chunk) ? parked_footprint_ - chunk : 0;
+                for (auto oit = parked_order_.begin();
+                     oit != parked_order_.end(); ++oit) {
+                    if (*oit == g) {
+                        parked_order_.erase(oit);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for (HalFrameBuffer* fb : dead) fb_ops_->release_frame_buffer(fb);
+    return reuse;
+}
+
+/* Drop every expired park. Caller holds buffers_mu_ and HAL-releases
+ * the collected list after unlocking. */
+void DspService::sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free) {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = parked_.begin(); it != parked_.end();) {
+        auto& dq = it->second;
+        const ParkedGeometry g = it->first;
+        const HalFrameBuffer* any = nullptr; /* any fb of this geometry */
+        while (!dq.empty() && dq.front().deadline <= now) {
+            any = dq.front().fb;
+            to_free.push_back(dq.front().fb);
+            dq.pop_front();
+            {
+                std::lock_guard<std::mutex> slk(stats_mu_);
+                stats_.retention_releases++;
+                if (stats_.retention_parked > 0) stats_.retention_parked--;
+            }
+        }
+        if (dq.empty() && any) {
+            const uint64_t chunk = chunk_bytes_of(any);
+            parked_footprint_ =
+                (parked_footprint_ > chunk) ? parked_footprint_ - chunk : 0;
+            for (auto oit = parked_order_.begin();
+                 oit != parked_order_.end(); ++oit) {
+                if (*oit == g) {
+                    parked_order_.erase(oit);
+                    break;
+                }
+            }
+            it = parked_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -543,12 +772,13 @@ int DspService::release_buffer(int client_fd, uint64_t buffer_id) {
 
 void DspService::release_client_buffers(int client_fd) {
     std::vector<HalFrameBuffer*> to_free;
+    size_t parked = 0;
     {
         std::lock_guard<std::mutex> lk(buffers_mu_);
         for (auto it = buffers_.begin(); it != buffers_.end();) {
             if (it->second->client_fd == client_fd) {
                 // detach_entry_locked erases `it` from the map.
-                detach_entry_locked(it->second, to_free);
+                detach_entry_locked(it->second, to_free, &parked);
                 it = buffers_.begin();
             } else {
                 ++it;
@@ -559,9 +789,11 @@ void DspService::release_client_buffers(int client_fd) {
         client_import_count_.erase(client_fd);
     }
     for (HalFrameBuffer* fb : to_free) fb_ops_->release_frame_buffer(fb);
-    if (!to_free.empty())
-        HAL_LOG_INFO("DspService: client %d disconnected, freed %zu buffer(s)",
-                     client_fd, to_free.size());
+    if (!to_free.empty() || parked > 0)
+        HAL_LOG_INFO(
+            "DspService: client %d disconnected, freed %zu buffer(s) "
+            "(%zu parked for retention)",
+            client_fd, to_free.size(), parked);
 
     // P2: the owner is gone — abandon + reap its async jobs. Pins are NOT
     // touched here: the worker drops them at the execute_job tail, and
@@ -647,6 +879,123 @@ DspService::BufferPin DspService::pin_buffer(uint64_t buffer_id) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Cross-process lookup plane (DSP_LOOKUP)                              */
+/* ------------------------------------------------------------------ */
+
+DspService::LookupResult DspService::lookup_buffer(int client_fd,
+                                                   uint64_t buffer_id) {
+    LookupResult out;
+    if (!running_.load()) {
+        out.rc = DSP_SVC_ERR_UNAVAILABLE;
+        out.message = "service not running";
+        return out;
+    }
+
+    // Lease cap (check-only: one recv thread per connection calls this, so
+    // no same-client race can overrun the cap between check and insert).
+    {
+        std::lock_guard<std::mutex> lk(lookup_mu_);
+        auto& per_client = lookup_leases_[client_fd];
+        uint32_t count = 0;
+        for (const auto& kv : per_client)
+            count += static_cast<uint32_t>(kv.second.size());
+        if (count + 1u > cfg_.max_lookups_per_client) {
+            if (per_client.empty()) lookup_leases_.erase(client_fd);
+            out.rc = DSP_SVC_ERR_LIMIT;
+            out.message = "per-connection lookup lease cap exceeded";
+            return out;
+        }
+    }
+
+    // Registry pin: identical semantics to a queued job — a concurrent owner
+    // release detaches the id; the frame stays alive until this pin drops,
+    // even if the owning client disconnects first.
+    BufferPin pin = pin_buffer(buffer_id);
+    if (!pin.ok()) {
+        out.rc = pin.rc(); /* DSP_SVC_ERR_NO_BUFFER */
+        out.message = "unknown buffer id";
+        return out;
+    }
+
+    HalFrameBuffer* fb = pin.fb();
+    if (!fb || fb->num_planes == 0u) {
+        out.rc = DSP_SVC_ERR_NO_BUFFER;
+        out.message = "registered buffer has no planes";
+        return out; /* pin dtor unpins */
+    }
+    if (fb->mem_type != HAL_MEM_DMABUF) {
+        // memfd/USERPTR imports expose no dma-buf fd to dup — the borrower
+        // already owns those fds and does not need this path.
+        out.rc = DSP_SVC_ERR_INVALID;
+        out.message = "buffer is not a dma-buf frame (memfd/USERPTR import)";
+        return out;
+    }
+
+    // Dup plane fds outside every lock; on failure the pin dtor unpins.
+    for (uint32_t p = 0; p < fb->num_planes; ++p) {
+        const int fd = dup(fb->dma_fds[p]);
+        if (fd < 0) {
+            for (int q : out.fds) close(q);
+            out.fds.clear();
+            out.rc = DSP_SVC_ERR_NO_MEM;
+            out.message = "dup of buffer plane fd failed";
+            return out;
+        }
+        out.fds.push_back(fd);
+    }
+
+    out.width = fb->width;
+    out.height = fb->height;
+    out.format = fb->format;
+    out.num_planes = fb->num_planes;
+    for (uint32_t p = 0; p < HAL_MAX_PLANES; ++p) {
+        out.strides[p] = fb->strides[p];
+        out.sizes[p] = fb->sizes[p];
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(lookup_mu_);
+        lookup_leases_[client_fd][buffer_id].push_back(std::move(pin));
+    }
+    return out;
+}
+
+int DspService::lookup_release(int client_fd, uint64_t buffer_id) {
+    // The pin moves out of the map under lookup_mu_ and is destroyed after
+    // the unlock (its dtor takes buffers_mu_ — never both held at once).
+    std::vector<BufferPin> dropped;
+    {
+        std::lock_guard<std::mutex> lk(lookup_mu_);
+        auto cit = lookup_leases_.find(client_fd);
+        if (cit == lookup_leases_.end()) return DSP_SVC_ERR_NO_BUFFER;
+        auto bit = cit->second.find(buffer_id);
+        if (bit == cit->second.end() || bit->second.empty())
+            return DSP_SVC_ERR_NO_BUFFER;
+        dropped.push_back(std::move(bit->second.back()));
+        bit->second.pop_back();
+        if (bit->second.empty()) cit->second.erase(bit);
+        if (cit->second.empty()) lookup_leases_.erase(cit);
+    }
+    return DSP_SVC_OK;
+}
+
+void DspService::lookup_release_all(int client_fd) {
+    std::unordered_map<uint64_t, std::vector<BufferPin>> dropped;
+    {
+        std::lock_guard<std::mutex> lk(lookup_mu_);
+        auto cit = lookup_leases_.find(client_fd);
+        if (cit == lookup_leases_.end()) return;
+        dropped = std::move(cit->second);
+        lookup_leases_.erase(cit);
+    }
+    /* BufferPin dtors run here, outside lookup_mu_. */
+    if (!dropped.empty()) {
+        HAL_LOG_INFO("DspService: client %d disconnected, dropped %zu lookup "
+                     "lease(s)", client_fd, dropped.size());
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Job plane                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -670,7 +1019,11 @@ void DspService::unpin_entries(const std::vector<BufferEntry*>& entries) {
             if (e->pins > 0) e->pins--;
             if (e->detached && e->pins == 0) {
                 if (e->imported) free_imported_fb(e->fb);
-                else to_free.push_back(e->fb);
+                else
+                    park_or_free_locked(
+                        ParkedGeometry{e->fb->width, e->fb->height,
+                                       static_cast<uint32_t>(e->fb->format)},
+                        e->fb, to_free, nullptr);
                 delete e;
             }
         }
@@ -955,7 +1308,7 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
                                           uint64_t& job_id_out) {
     job_id_out = 0;
     DspJobResult res;
-    if (!running_.load() || !dsp_ctx_) {
+    if (!running_.load() || !dsp_ctx_normal_) {
         res.rc = DSP_SVC_ERR_UNAVAILABLE;
         res.message = "DspService not running";
         return res;
@@ -1073,20 +1426,35 @@ DspJobResult DspService::wait_job(uint64_t job_id, uint32_t timeout_ms,
 void DspService::worker_loop() {
     while (running_.load()) {
         JobRef job;
+        bool have_job = false;
         {
             std::unique_lock<std::mutex> lk(q_mu_);
-            q_cv_.wait(lk, [&] {
+            /* 1s cap so the idle worker still wakes to expire retention
+             * parks. q_mu_ is fully released before buffers_mu_ is ever
+             * taken below — the two are never nested. */
+            have_job = q_cv_.wait_for(lk, std::chrono::milliseconds(1000), [&] {
                 return !q_normal_.empty() || !q_background_.empty() ||
                        !running_.load();
             });
             if (!running_.load()) break;
-            if (!q_normal_.empty()) {
-                job = q_normal_.front();
-                q_normal_.pop_front();
-            } else {
-                job = q_background_.front();
-                q_background_.pop_front();
+            if (have_job) {
+                if (!q_normal_.empty()) {
+                    job = q_normal_.front();
+                    q_normal_.pop_front();
+                } else {
+                    job = q_background_.front();
+                    q_background_.pop_front();
+                }
             }
+        }
+        if (!have_job) {
+            std::vector<HalFrameBuffer*> dead;
+            {
+                std::lock_guard<std::mutex> blk(buffers_mu_);
+                sweep_parked_locked(dead);
+            }
+            for (HalFrameBuffer* fb : dead) fb_ops_->release_frame_buffer(fb);
+            continue;
         }
         execute_job(job);
         {
@@ -1175,6 +1543,13 @@ void DspService::execute_job(const JobRef& job) {
     int rc = DSP_SVC_ERR_INVALID;
     const char* what = "unhandled op";
 
+    // P1-9: route by lane. BACKGROUND falls back to the normal ctx when
+    // its own context failed to init (degraded mode, see start()).
+    void* const ctx =
+        (job->priority == DspPriority::Background && dsp_ctx_background_)
+            ? dsp_ctx_background_
+            : dsp_ctx_normal_;
+
     HalDspResizeParams rp{};
     HalDspCropResizeParams crp{};
     HalDspConvertFormatParams cfp{};
@@ -1187,31 +1562,31 @@ void DspService::execute_job(const JobRef& job) {
     case HAL_DSP_OP_RESIZE:
         if (build_resize(job, rp) == DSP_SVC_OK) {
             what = "resize";
-            rc = dsp_ops_->resize(dsp_ctx_, &rp);
+            rc = dsp_ops_->resize(ctx, &rp);
         }
         break;
     case HAL_DSP_OP_CROP_RESIZE:
         if (build_crop_resize(job, crp) == DSP_SVC_OK) {
             what = "crop_and_resize";
-            rc = dsp_ops_->crop_and_resize(dsp_ctx_, &crp);
+            rc = dsp_ops_->crop_and_resize(ctx, &crp);
         }
         break;
     case HAL_DSP_OP_MULTI_CROP_RESIZE:
         if (build_multi_crop(job, outs, mcp) == DSP_SVC_OK) {
             what = "multi_crop_and_resize";
-            rc = dsp_ops_->multi_crop_and_resize(dsp_ctx_, &mcp);
+            rc = dsp_ops_->multi_crop_and_resize(ctx, &mcp);
         }
         break;
     case HAL_DSP_OP_CONVERT_FORMAT:
         if (build_convert(job, cfp) == DSP_SVC_OK) {
             what = "convert_format";
-            rc = dsp_ops_->convert_format(dsp_ctx_, &cfp);
+            rc = dsp_ops_->convert_format(ctx, &cfp);
         }
         break;
     case HAL_DSP_OP_BLEND:
         if (build_blend(job, ovs, blp) == DSP_SVC_OK) {
             what = "blend";
-            rc = dsp_ops_->blend(dsp_ctx_, &blp);
+            rc = dsp_ops_->blend(ctx, &blp);
         }
         break;
     default:
