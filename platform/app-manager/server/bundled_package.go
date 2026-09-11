@@ -233,9 +233,11 @@ type bundledModelTransaction struct {
 	stage      string
 	backup     string
 	oldRegs    []*inferencepb.ModelRegisterRequest
-	newRegs    []*inferencepb.ModelRegisterRequest
+	items      []pendingBundledModel
 	registered []string
+	succeeded  int
 	published  bool
+	task       *InstallTask
 }
 
 func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, appID string, appManifest *manifest.AppManifest, pending []pendingBundledModel, task *InstallTask) (*bundledModelTransaction, error) {
@@ -257,7 +259,7 @@ func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, a
 	if err != nil {
 		return nil, fmt.Errorf("create bundled model staging tree: %w", err)
 	}
-	tx := &bundledModelTransaction{s: s, appID: appID, canonical: base, stage: stage}
+	tx := &bundledModelTransaction{s: s, appID: appID, canonical: base, stage: stage, task: task}
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -272,6 +274,7 @@ func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, a
 	}
 	if readErr == nil {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		oldByID := make(map[string]*inferencepb.ModelRegisterRequest)
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
@@ -285,7 +288,15 @@ func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, a
 			if _, err := os.Stat(hefPath); err != nil {
 				return nil, fmt.Errorf("snapshot old bundled model %q HEF: %w", entry.Name(), err)
 			}
-			tx.oldRegs = append(tx.oldRegs, bundledRegisterRequest(appID, reg, hefPath))
+			req := bundledRegisterRequest(appID, reg, hefPath)
+			if prior, ok := oldByID[reg.ModelID]; ok {
+				if prior.ModelPath != req.ModelPath || prior.ModelType != req.ModelType || prior.ModelVariant != req.ModelVariant || prior.RawOutputOnly != req.RawOutputOnly {
+					return nil, fmt.Errorf("snapshot old bundled model tree has conflicting paths or registrations for id %q", reg.ModelID)
+				}
+				continue
+			}
+			oldByID[reg.ModelID] = req
+			tx.oldRegs = append(tx.oldRegs, req)
 		}
 	}
 
@@ -293,29 +304,52 @@ func (s *AppManagerServer) prepareBundledModelTransaction(ctx context.Context, a
 		s.aiRuntimeMutex.RLock()
 		client := s.aiRuntimeClient
 		s.aiRuntimeMutex.RUnlock()
-		if client == nil || !s.config.AIRuntime.Enabled || s.extractModelFile == nil {
-			return nil, fmt.Errorf("bundled models cannot be prepared (ai-runtime or containerd unavailable)")
-		}
+		available := client != nil && s.config.AIRuntime.Enabled && s.extractModelFile != nil
 		refs := appManifest.ImageReferences()
-		if len(refs) == 0 {
-			return nil, fmt.Errorf("the app declares no image to extract bundled models from")
-		}
+		var requiredErrs, warnings []string
+		seen := make(map[string]pendingBundledModel)
 		for _, p := range pending {
-			if task != nil {
-				task.Update("registering", 82, fmt.Sprintf("Staging bundled model %q (alias %q)...", p.id, p.alias))
+			if prior, ok := seen[p.id]; ok {
+				if prior.path != p.path {
+					return nil, fmt.Errorf("model id %q has conflicting bundled paths", p.id)
+				}
+				continue
+			}
+			seen[p.id] = p
+			fail := func(msg string) {
+				if p.required {
+					requiredErrs = append(requiredErrs, "required "+msg)
+				} else {
+					warnings = append(warnings, "optional "+msg)
+				}
+			}
+			if !available {
+				fail(fmt.Sprintf("model %q (alias %q) cannot be prepared (ai-runtime or containerd unavailable)", p.id, p.alias))
+				continue
+			}
+			if len(refs) == 0 {
+				fail(fmt.Sprintf("model %q (alias %q): app declares no image", p.id, p.alias))
+				continue
 			}
 			aliasDir := filepath.Join(stage, p.alias)
 			binPath, err := s.extractModelFile(ctx, refs[0], p.path, aliasDir)
 			if err != nil {
-				return nil, fmt.Errorf("model %q (alias %q): extract %q failed: %w", p.id, p.alias, p.path, err)
+				_ = os.RemoveAll(aliasDir)
+				fail(fmt.Sprintf("model %q (alias %q): extract %q failed: %v", p.id, p.alias, p.path, err))
+				continue
 			}
 			reg, err := unpackBundledPackage(binPath, aliasDir, p.id)
 			_ = os.Remove(binPath)
 			if err != nil {
-				return nil, fmt.Errorf("model %q (alias %q): package validation failed: %w", p.id, p.alias, err)
+				_ = os.RemoveAll(aliasDir)
+				fail(fmt.Sprintf("model %q (alias %q): package validation failed: %v", p.id, p.alias, err))
+				continue
 			}
-			canonicalHEF := filepath.Join(base, p.alias, reg.HEF)
-			tx.newRegs = append(tx.newRegs, bundledRegisterRequest(appID, reg, canonicalHEF))
+			p.request = bundledRegisterRequest(appID, reg, filepath.Join(base, p.alias, reg.HEF))
+			tx.items = append(tx.items, p)
+		}
+		if err := reportModelValidationAt("registering", 82, requiredErrs, warnings, task); err != nil {
+			return nil, err
 		}
 	}
 	cleanup = false
@@ -349,7 +383,7 @@ func (tx *bundledModelTransaction) Publish(ctx context.Context) error {
 	client := tx.s.aiRuntimeClient
 	tx.s.aiRuntimeMutex.RUnlock()
 	if client == nil || !tx.s.config.AIRuntime.Enabled {
-		if len(tx.oldRegs)+len(tx.newRegs) == 0 {
+		if len(tx.oldRegs)+len(tx.items) == 0 {
 			return nil
 		}
 		return fmt.Errorf("ai-runtime is not available")
@@ -431,18 +465,39 @@ func (tx *bundledModelTransaction) Publish(ctx context.Context) error {
 	tx.stage = ""
 	tx.published = true
 
-	for _, req := range tx.newRegs {
-		// Track before the RPC: a transport failure may occur after the runtime
-		// accepted ownership, and owner-scoped unregister is safely idempotent.
+	for _, item := range tx.items {
+		req := item.request
 		tx.registered = append(tx.registered, req.ModelId)
-		if err := registerRequest(ctx, client, req); err != nil {
-			return fmt.Errorf("register new bundled model %s: %w", req.ModelId, err)
+		failure := registerRequest(ctx, client, req)
+		if failure == nil && req.ModelType == "detection" {
+			failure = tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId)
 		}
-		if req.ModelType == "detection" {
-			if err := tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId); err != nil {
-				return fmt.Errorf("new bundled model %s smoke test failed: %w", req.ModelId, err)
+		if failure == nil {
+			tx.succeeded++
+			continue
+		}
+		if item.required {
+			return fmt.Errorf("required new bundled model %s (alias %q) publish failed: %w", req.ModelId, item.alias, failure)
+		}
+		_, _ = client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: req.ModelId, OwnerId: tx.appID})
+		// A transport failure may have occurred after runtime acceptance, and a
+		// smoke failure may already have unregistered the model. Only the final
+		// runtime state is authoritative: never delete an optional HEF while a
+		// registration may still reference it.
+		_, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: req.ModelId})
+		if status.Code(infoErr) != codes.NotFound {
+			return fmt.Errorf("optional new bundled model %s cleanup could not confirm runtime removal after publish failure: %w", req.ModelId, failure)
+		}
+		if err := os.RemoveAll(filepath.Join(tx.canonical, item.alias)); err != nil {
+			return fmt.Errorf("remove failed optional bundled model %s: %w", req.ModelId, err)
+		}
+		for i, id := range tx.registered {
+			if id == req.ModelId {
+				tx.registered = append(tx.registered[:i], tx.registered[i+1:]...)
+				break
 			}
 		}
+		reportModelValidationAt("registering", 82, nil, []string{fmt.Sprintf("optional model %q (alias %q) publish failed and was removed: %v", req.ModelId, item.alias, failure)}, tx.task)
 	}
 	return nil
 }
@@ -518,7 +573,7 @@ func (tx *bundledModelTransaction) Commit() {
 	if tx.stage != "" {
 		_ = os.RemoveAll(tx.stage)
 	}
-	if len(tx.newRegs) == 0 {
+	if tx.succeeded == 0 {
 		_ = os.RemoveAll(tx.canonical)
 	}
 }

@@ -2714,6 +2714,7 @@ type pendingBundledModel struct {
 	id       string
 	path     string // absolute container path of the .bin package inside the app image
 	required bool
+	request  *inferencepb.ModelRegisterRequest
 }
 
 // shadowedBundledModel is a spec.models entry whose id was found on the
@@ -2756,11 +2757,25 @@ func (s *AppManagerServer) resolveModelDependencies(ctx context.Context, appMani
 		return res, nil
 	}
 
-	refs := make([]modelRef, 0, len(appManifest.Spec.Models))
-	for alias, mapping := range appManifest.Spec.Models {
+	aliases := make([]string, 0, len(appManifest.Spec.Models))
+	for alias := range appManifest.Spec.Models {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	refs := make([]modelRef, 0, len(aliases))
+	byID := make(map[string]int, len(aliases))
+	for _, alias := range aliases {
+		mapping := appManifest.Spec.Models[alias]
+		if i, ok := byID[mapping.ID]; ok {
+			if refs[i].mapping.Path != mapping.Path {
+				return res, fmt.Errorf("model id %q has conflicting bundled paths", mapping.ID)
+			}
+			refs[i].mapping.Required = refs[i].mapping.Required || mapping.Required
+			continue
+		}
+		byID[mapping.ID] = len(refs)
 		refs = append(refs, modelRef{alias: alias, mapping: mapping})
 	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i].alias < refs[j].alias })
 
 	// classify sorts each ref into resolved / pathPending / reported-missing.
 	// runtimeUp is false when the loaded set could not be queried, in which
@@ -3190,7 +3205,13 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 	// after unpack, so the type/variant cannot be re-derived). First alias per
 	// id wins; spec.models is tiny so determinism only matters for logging.
 	bundled := make(map[string]string, len(appManifest.Spec.Models))
-	for alias, mapping := range appManifest.Spec.Models {
+	aliases := make([]string, 0, len(appManifest.Spec.Models))
+	for alias := range appManifest.Spec.Models {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	for _, alias := range aliases {
+		mapping := appManifest.Spec.Models[alias]
 		if mapping.Path == "" {
 			continue
 		}
@@ -3213,7 +3234,12 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 		}
 	}
 
+	seenModelIDs := make(map[string]bool, len(appManifest.Spec.Permissions.Inference.Models))
 	for _, modelID := range appManifest.Spec.Permissions.Inference.Models {
+		if seenModelIDs[modelID] {
+			continue
+		}
+		seenModelIDs[modelID] = true
 		if meta := s.getModelMeta(modelID); meta != nil {
 			if err := s.preloadPlatformModel(ctx, client, appID, modelID, meta, !preexisting[modelID]); err != nil {
 				recordFailure(modelID, fmt.Sprintf("failed to preload model %s for app %s: %v", modelID, appID, err))

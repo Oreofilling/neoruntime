@@ -36,6 +36,9 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#ifdef DSP_SERVICE_TESTING
+#include <functional>
+#endif
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -239,6 +242,13 @@ public:
 
     DspServiceStats stats() const;
 
+#ifdef DSP_SERVICE_TESTING
+    /** Test-only fence immediately after async registration and before enqueue. */
+    void set_after_async_register_hook(std::function<void()> hook);
+    size_t async_job_count_for_test();
+    uint32_t client_async_job_count_for_test(int client_fd);
+#endif
+
 private:
     struct BufferEntry {
         uint64_t id = 0;
@@ -324,6 +334,9 @@ private:
     std::condition_variable done_cv_;
     std::unordered_map<uint64_t, JobRef> jobs_;
     std::unordered_map<int, uint32_t> client_async_jobs_;
+#ifdef DSP_SERVICE_TESTING
+    std::function<void()> after_async_register_hook_;
+#endif
 
     // Buffer registry (keys are unpredictable random ids; 0 is never valid).
     std::mutex buffers_mu_;

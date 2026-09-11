@@ -9,6 +9,11 @@
  *  - q_mu_       : job deques            - done_mu_  : job done/abandoned
  *  - quota_mu_   : token buckets         - stats_mu_ : counters
  *
+ * The only nested pair is buffers_mu_ -> done_mu_: disconnect holds that pair
+ * while detaching buffers and reaping jobs, and async registration takes the
+ * same pair to prove its pinned owner is still attached. done_mu_ and q_mu_
+ * are never nested; registration is complete before queue insertion.
+ *
  * CPU coherency: the daemon never CPU-touches registered buffers, so it
  * does no DMA_BUF_IOCTL_SYNC itself. The DMA_BUF_IOCTL_SYNC discipline
  * (write-fence after CPU fill, read-fence before CPU read) is part of the
@@ -640,8 +645,14 @@ int DspService::release_buffer(int client_fd, uint64_t buffer_id) {
 
 void DspService::release_client_buffers(int client_fd) {
     std::vector<HalFrameBuffer*> to_free;
+    size_t reaped = 0;
     {
-        std::lock_guard<std::mutex> lk(buffers_mu_);
+        /* Lifecycle fence with submit_job_async registration. Keeping
+         * buffers_mu_ while taking done_mu_ makes detach-and-reap one atomic
+         * transition with respect to "pinned owner still live" validation.
+         * Pins are NOT dropped here: queued/running workers own those pins. */
+        std::lock_guard<std::mutex> buffers_lk(buffers_mu_);
+        std::lock_guard<std::mutex> done_lk(done_mu_);
         for (auto it = buffers_.begin(); it != buffers_.end();) {
             if (it->second->client_fd == client_fd) {
                 // detach_entry_locked erases `it` from the map.
@@ -654,35 +665,25 @@ void DspService::release_client_buffers(int client_fd) {
         client_buffer_count_.erase(client_fd);
         client_pixels_.erase(client_fd);
         client_import_count_.erase(client_fd);
+
+        for (auto it = jobs_.begin(); it != jobs_.end();) {
+            if (it->second->owner_fd == client_fd) {
+                it->second->abandoned = true;
+                it = jobs_.erase(it);
+                reaped++;
+            } else {
+                ++it;
+            }
+        }
+        client_async_jobs_.erase(client_fd);
     }
     for (HalFrameBuffer* fb : to_free) fb_ops_->release_frame_buffer(fb);
     if (!to_free.empty())
         HAL_LOG_INFO("DspService: client %d disconnected, freed %zu buffer(s)",
                      client_fd, to_free.size());
-
-    // P2: the owner is gone — abandon + reap its async jobs. Pins are NOT
-    // touched here: the worker drops them at the execute_job tail, and
-    // unpinning a still-queued job would free buffers it executes against.
-    {
-        size_t reaped = 0;
-        {
-            std::lock_guard<std::mutex> lk(done_mu_);
-            for (auto it = jobs_.begin(); it != jobs_.end();) {
-                if (it->second->owner_fd == client_fd) {
-                    it->second->abandoned = true;
-                    it = jobs_.erase(it);
-                    reaped++;
-                } else {
-                    ++it;
-                }
-            }
-            client_async_jobs_.erase(client_fd);
-        }
-        if (reaped > 0)
-            HAL_LOG_INFO(
-                "DspService: client %d disconnected, reaped %zu async job(s)",
-                client_fd, reaped);
-    }
+    if (reaped > 0)
+        HAL_LOG_INFO("DspService: client %d disconnected, reaped %zu async job(s)",
+                     client_fd, reaped);
     quota_forget(client_fd);
 }
 
@@ -1084,23 +1085,55 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
         return res;
     }
 
-    // P2: bound outstanding jobs per owner — each registry entry holds a
-    // JobItem and keeps its buffers pinned until completed and reaped.
-    // Applies to sync submitters too (they are async jobs waited at once),
-    // so in-flight jobs per connection cap at the same limit either way.
-    // The slot is reserved atomically with the check: releasing the lock
-    // between a check-only pass and a later increment let concurrent
-    // submissions each observe count == cap-1, both pass, and overshoot.
-    // Nothing between this reservation and the registry insert below can
-    // fail, so the reservation cannot leak.
-    {
-        std::lock_guard<std::mutex> lk(done_mu_);
-        if (client_async_jobs_[job->owner_fd] >= cfg_.max_async_jobs_per_client) {
-            res.rc = DSP_SVC_ERR_QUOTA;
-            res.message = "too many outstanding jobs for this client";
+    /* Register before enqueue so disconnect can always find an accepted job.
+     * buffers_mu_ -> done_mu_ is the lifecycle fence shared with disconnect:
+     * if disconnect already detached the pinned source, registration fails;
+     * otherwise disconnect must run after this insertion and will reap it.
+     * Cap check, random id generation, registry insertion and count increment
+     * are one done_mu_ critical section. q_mu_ is deliberately not nested. */
+    try {
+        std::lock_guard<std::mutex> buffers_lk(buffers_mu_);
+        BufferEntry* owner_entry = job->pinned.empty() ? nullptr : job->pinned[0];
+        auto owner_it = owner_entry ? buffers_.find(owner_entry->id) : buffers_.end();
+        if (!owner_entry || owner_entry->detached || owner_it == buffers_.end() ||
+            owner_it->second != owner_entry ||
+            owner_entry->client_fd != job->owner_fd) {
+            res.rc = DSP_SVC_ERR_NO_BUFFER;
+            res.message = "buffer owner disconnected during submission";
         } else {
-            client_async_jobs_[job->owner_fd]++;
+            std::lock_guard<std::mutex> done_lk(done_mu_);
+            auto count_it = client_async_jobs_.find(job->owner_fd);
+            const uint32_t count = count_it == client_async_jobs_.end()
+                                       ? 0
+                                       : count_it->second;
+            if (count >= cfg_.max_async_jobs_per_client) {
+                res.rc = DSP_SVC_ERR_QUOTA;
+                res.message = "too many outstanding jobs for this client";
+            } else {
+                /* Same unpredictable-id rule as buffers: wait/poll act on
+                 * whatever an id resolves to. If creating the count node
+                 * throws after the job insertion, erase that job and preserve
+                 * the original allocation exception. */
+                do { job_id_out = fresh_random_id(); }
+                while (job_id_out == 0 || jobs_.count(job_id_out));
+                auto inserted_job = jobs_.emplace(job_id_out, job).first;
+                if (count_it == client_async_jobs_.end()) {
+                    try {
+                        client_async_jobs_.emplace(job->owner_fd, 1);
+                    } catch (...) {
+                        jobs_.erase(inserted_job);
+                        throw;
+                    }
+                } else {
+                    ++count_it->second;
+                }
+            }
         }
+    } catch (...) {
+        job_id_out = 0;
+        unpin_entries(job->pinned);
+        job->pinned.clear();
+        throw;
     }
     if (res.rc != DSP_SVC_OK) {
         unpin_entries(job->pinned);
@@ -1112,23 +1145,39 @@ DspJobResult DspService::submit_job_async(const DspJobDesc& desc,
         return res;
     }
 
+#ifdef DSP_SERVICE_TESTING
+    if (after_async_register_hook_) after_async_register_hook_();
+#endif
+
     const auto priority = job->priority;
-    {
+    try {
         std::lock_guard<std::mutex> lk(q_mu_);
         (priority == DspPriority::Background ? q_background_ : q_normal_)
             .push_back(job);
+    } catch (...) {
+        /* deque growth may allocate. Undo only our still-live registration;
+         * disconnect may already have reaped it. Preserve the allocation
+         * exception for callers rather than translating an otherwise
+         * exception-based failure into an unrelated service status. */
+        {
+            std::lock_guard<std::mutex> lk(done_mu_);
+            auto it = jobs_.find(job_id_out);
+            if (it != jobs_.end() && it->second == job) {
+                jobs_.erase(it);
+                auto count_it = client_async_jobs_.find(job->owner_fd);
+                if (count_it != client_async_jobs_.end()) {
+                    if (count_it->second > 1) --count_it->second;
+                    else client_async_jobs_.erase(count_it);
+                }
+            }
+        }
+        job_id_out = 0;
+        unpin_entries(job->pinned);
+        job->pinned.clear();
+        throw;
     }
     q_cv_.notify_one();
 
-    {
-        std::lock_guard<std::mutex> lk(done_mu_);
-        /* Same unpredictable-id rule as buffers: wait/poll act on whatever
-         * job id resolves to, so ids must not be a guessable sequence. The
-         * draw and the jobs_ collision check share the lock. */
-        do { job_id_out = fresh_random_id(); }
-        while (job_id_out == 0 || jobs_.count(job_id_out));
-        jobs_[job_id_out] = job;
-    }
     res.rc = DSP_SVC_OK;
     res.message = "submitted";
     return res;
@@ -1361,3 +1410,20 @@ DspServiceStats DspService::stats() const {
     std::lock_guard<std::mutex> lk(stats_mu_);
     return stats_;
 }
+
+#ifdef DSP_SERVICE_TESTING
+void DspService::set_after_async_register_hook(std::function<void()> hook) {
+    after_async_register_hook_ = std::move(hook);
+}
+
+size_t DspService::async_job_count_for_test() {
+    std::lock_guard<std::mutex> lk(done_mu_);
+    return jobs_.size();
+}
+
+uint32_t DspService::client_async_job_count_for_test(int client_fd) {
+    std::lock_guard<std::mutex> lk(done_mu_);
+    auto it = client_async_jobs_.find(client_fd);
+    return it == client_async_jobs_.end() ? 0 : it->second;
+}
+#endif

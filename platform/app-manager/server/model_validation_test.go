@@ -678,6 +678,7 @@ func TestExtractImageModels(t *testing.T) {
 	})
 
 	t.Run("register_status_failure_fails_required", func(t *testing.T) {
+
 		withTempRoot(t)
 		client := &stubInferenceClient{regStatus: map[string]*inferencepb.Status{
 			"bundled_det": {Success: false, Message: "model_type is required for app-bundled model"},
@@ -1063,9 +1064,8 @@ func TestResolveModelDependenciesShadowedCapture(t *testing.T) {
 		"db_det": {FilePath: "/data/aipc/models/db.hef", ModelType: "detection"},
 	})
 	m := &manifest.AppManifest{Spec: manifest.Spec{Models: map[string]manifest.ModelMapping{
-		"rt":    {ID: "runtime_det", Path: "/app/models/rt.bin", Required: true},
-		"dbm":   {ID: "db_det", Path: "/app/models/db.bin", Required: true},
-		"plain": {ID: "runtime_det"}, // id hit without a path: resolved, never shadowed
+		"rt":  {ID: "runtime_det", Path: "/app/models/rt.bin", Required: true},
+		"dbm": {ID: "db_det", Path: "/app/models/db.bin", Required: true},
 	}}}
 
 	res, err := s.resolveModelDependencies(context.Background(), m, nil)
@@ -1075,8 +1075,8 @@ func TestResolveModelDependenciesShadowedCapture(t *testing.T) {
 	if len(res.pathPending) != 0 {
 		t.Errorf("pathPending = %+v, want none (both ids hit)", res.pathPending)
 	}
-	if len(res.resolved) != 3 {
-		t.Errorf("resolved = %v, want all 3 ids", res.resolved)
+	if len(res.resolved) != 2 {
+		t.Errorf("resolved = %v, want both ids", res.resolved)
 	}
 	want := map[string]string{
 		"rt":  "/data/aipc/models/runtime.hef",
