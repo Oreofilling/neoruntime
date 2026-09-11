@@ -34,9 +34,13 @@ type AIModel struct {
 	Config string `gorm:"type:text" json:"config,omitempty"`
 
 	// Model provenance and lifecycle
-	Source       string `gorm:"default:disk" json:"source"`          // "disk" (seed) or "dynamic" (gRPC registration)
-	OwnerAppID   string `json:"owner_app_id"`                        // App ID that registered this model
-	DesiredState string `gorm:"default:loaded" json:"desired_state"` // "loaded" or "unloaded"
+	Source     string `gorm:"default:disk" json:"source"` // "disk" (seed) or "dynamic" (gRPC registration)
+	OwnerAppID string `json:"owner_app_id"`               // App ID that registered this model
+	// DesiredState is the self-heal loop's promise: "loaded" rows are
+	// re-registered on the NPU whenever the runtime loses them. The default
+	// must be "unloaded" — an imported-but-never-loaded row that defaults to
+	// "loaded" gets auto-loaded by the heal pass within a minute.
+	DesiredState string `gorm:"default:unloaded" json:"desired_state"` // "loaded" or "unloaded"
 }
 
 // TableName overrides the default table name.

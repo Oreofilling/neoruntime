@@ -52,6 +52,18 @@ typedef enum {
      * usable as SubmitDspJob src_buffer_id and freed with DSP_BUF_RELEASE. */
     FD_PUB_MSG_DSP_IMPORT       = 10,   /* client → server, fds attached */
     FD_PUB_MSG_DSP_IMPORT_RESP  = 11,   /* server → client */
+    /* Cross-process buffer lookup for inference inputs: a second process
+     * (ai-runtime) that received a buffer_id over its own control channel
+     * (Tensor.buffer_id in the Infer gRPC) resolves it here against the
+     * registry the id was allocated/imported in. The daemon pins the buffer
+     * for the LOOKUP caller (pin semantics identical to a queued DSP job:
+     * the underlying frame stays alive even if the owning client
+     * disconnects) and attaches dup()s of the frame's dma-buf fds via
+     * SCM_RIGHTS. The caller MUST release with DSP_LOOKUP_RELEASE when done
+     * reading (typically right after repacking into its own input buffer). */
+    FD_PUB_MSG_DSP_LOOKUP       = 12,   /* client → server */
+    FD_PUB_MSG_DSP_LOOKUP_RESP  = 13,   /* server → client, fds attached */
+    FD_PUB_MSG_DSP_LOOKUP_RELEASE = 14, /* client → server */
 } FdPubMsgType;
 
 /* ========== Message header (all messages start with this) ========== */
@@ -67,7 +79,23 @@ typedef struct {
     char stream_name[FD_PUB_MAX_STREAM_NAME];
 } FdPubSubscribeMsg;
 
-/* ========== Server → Client: Frame delivery (sent with SCM_RIGHTS) ========== */
+/* Frame metadata flags (FdPubFrameMsg.flags). Coarse "bake active" truth
+ * captured at dispatch time, not per-frame draw outcome: bit0 says the
+ * overlay pass ran on the dispatching path (AiOverlay enabled+running),
+ * bit1 says the DPM render block ran (DPM enabled+running and the HAL
+ * exposes a draw op). Per-frame "did anything actually draw" would flap
+ * with empty scenes and can never promise a clean frame — every router
+ * stream is a potential overlay display, so the flag answers "is this
+ * stream in the baked set" (cross-check against stream_map config). */
+#define FD_PUB_FRAME_FLAG_OVERLAY_BAKED 0x1u
+#define FD_PUB_FRAME_FLAG_DPM_BAKED     0x2u
+
+/* ========== Server → Client: Frame delivery (sent with SCM_RIGHTS) ==========
+ * Wire compat: on 64-bit builds this struct ends with 4 bytes of tail
+ * padding (76 data bytes, sizeof 80). `flags` consumes that padding, so
+ * sizeof stays 80 — an older SDK's format string ending in "4x" ignores
+ * it, and an older daemon's memset leaves it 0. No protocol version
+ * bump needed in either direction. */
 typedef struct {
     FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_FRAME */
     uint64_t frame_id;      /* Unique frame ID (must be sent back in RELEASE) */
@@ -80,6 +108,7 @@ typedef struct {
     uint32_t strides[3];    /* Stride per plane */
     uint32_t sizes[3];      /* Size per plane in bytes */
     uint32_t num_fds;       /* Number of DMA-BUF fds attached */
+    uint32_t flags;         /* FD_PUB_FRAME_FLAG_* (metadata) */
 } FdPubFrameMsg;
 
 /* ========== Client → Server: Release frame ========== */
@@ -147,6 +176,42 @@ typedef struct {
     int32_t code;           /* 0 = success, < 0 = error code */
     uint64_t import_id;     /* valid iff code == 0 */
 } FdPubDspImportRespMsg;
+
+/* ========== Client → Server: buffer lookup (cross-process read lease) ======
+ * Resolve a registry buffer_id in the daemon and pin it for THIS connection.
+ * Serves HAL_MEM_DMABUF buffers only (pool-allocated or imported dma-buf
+ * frames); a memfd/USERPTR import is refused with the same error code path
+ * as an unknown id. Idempotence is the caller's business: one LOOKUP = one
+ * lease; repeat LOOKUPs of the same id stack additional pins until
+ * released. */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_LOOKUP */
+    uint64_t buffer_id;     /* id from FdPubDspAllocRespMsg or IMPORT_RESP */
+} FdPubDspLookupMsg;
+
+/* ========== Server → Client: lookup response ================================
+ * On success (code == 0) the buffer's dma-buf plane fds are attached via
+ * SCM_RIGHTS — dup()s made in the daemon, owned by the caller after the
+ * recvmsg returns (close them after reading / mmap). num_fds == num_planes,
+ * plane i maps to strides[i]/sizes[i]. On failure code < 0 and no fds. */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_LOOKUP_RESP */
+    int32_t code;           /* 0 = success, < 0 = error code */
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;        /* HalPixelFormat (NV12=0, RGB24=4, GRAY8=8) */
+    uint32_t num_planes;    /* fds attached; 1..3 */
+    uint32_t strides[3];
+    uint32_t sizes[3];
+} FdPubDspLookupRespMsg;
+
+/* ========== Client → Server: buffer lookup release ==========================
+ * Drop one lease taken by DSP_LOOKUP on this connection (release of a lease
+ * this connection never took is a no-op counted as an error reply). */
+typedef struct {
+    FdPubMsgHeader hdr;     /* type = FD_PUB_MSG_DSP_LOOKUP_RELEASE */
+    uint64_t buffer_id;     /* id from the FdPubDspLookupMsg */
+} FdPubDspLookupReleaseMsg;
 
 /* ========== Helper: Send message with optional FDs via SCM_RIGHTS ==========
  * General form: the ancillary buffer is sized for `fd_capacity` fds (must

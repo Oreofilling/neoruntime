@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <future>
 #include <unistd.h>
+#include <sys/mman.h>
 
 namespace aipc::ai_runtime {
 
@@ -25,6 +26,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     SessionManager* session_mgr,
     InferenceScheduler* scheduler,
     FdReceiver* fd_receiver,
+    BufferLookupClient* buffer_lookup,
     EventBusClient* event_bus,
     PostprocessPool* postprocess_pool,
     const HalClipTextEncoderOps* clip_enc_ops,
@@ -34,6 +36,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     , session_mgr_(session_mgr)
     , scheduler_(scheduler)
     , fd_receiver_(fd_receiver)
+    , buffer_lookup_(buffer_lookup)
     , event_bus_(event_bus)
     , postprocess_pool_(postprocess_pool)
     , clip_enc_ops_(clip_enc_ops)
@@ -484,6 +487,97 @@ static void fill_proto_post_result(pb::PostResult* out, const HalPostprocessResu
     }
 }
 
+namespace {
+
+// Repack an NV12 frame received as per-plane dma-buf fds into a tight
+// [h*3/2, w] UINT8 CPU buffer — byte-for-byte the layout the bytes path
+// sends, so downstream geometry validation is identical. One dma-buf per
+// plane, plane data at offset 0 (platform convention: DSP pool allocs,
+// imports, and subscribed frames). Returns false with a reason on any
+// layout it cannot map.
+bool repack_nv12_planes(uint32_t width, uint32_t height, uint32_t format,
+                        uint32_t num_planes, const uint32_t* strides,
+                        const uint32_t* sizes, const std::vector<int>& fds,
+                        std::string& out, std::string& why) {
+    constexpr uint32_t kHalPixFmtNv12 = 0;  // HalPixelFormat NV12
+    if (format != kHalPixFmtNv12) {
+        why = "frame format is not NV12 (repack supports NV12 only)";
+        return false;
+    }
+    if (num_planes != 2) {
+        why = "NV12 frame must have 2 planes, got " + std::to_string(num_planes);
+        return false;
+    }
+    const uint32_t w = width, h = height;
+    if (w == 0 || h == 0 || (h & 1) != 0) {
+        why = "invalid NV12 geometry";
+        return false;
+    }
+    if (fds.size() < 2) {
+        why = "NV12 frame must carry 2 plane fds, got "
+              + std::to_string(fds.size());
+        return false;
+    }
+    const uint32_t uv_rows = h / 2;
+    if (strides[0] < w || sizes[0] < (uint64_t)strides[0] * h) {
+        why = "Y plane smaller than stride*height";
+        return false;
+    }
+    if (strides[1] < w || sizes[1] < (uint64_t)strides[1] * uv_rows) {
+        why = "UV plane smaller than stride*(height/2)";
+        return false;
+    }
+
+    out.assign((size_t)w * h * 3 / 2, '\0');
+
+    void* maps[2] = {nullptr, nullptr};
+    const uint32_t rows[2] = {h, uv_rows};
+    bool ok = true;
+    for (int p = 0; p < 2 && ok; ++p) {
+        maps[p] = mmap(nullptr, sizes[p], PROT_READ, MAP_SHARED, fds[p], 0);
+        if (maps[p] == MAP_FAILED) {
+            maps[p] = nullptr;
+            why = "mmap of plane " + std::to_string(p) + " failed";
+            ok = false;
+        }
+    }
+    if (ok) {
+        char* dst = out.data();
+        for (int p = 0; p < 2; ++p) {
+            const char* src  = static_cast<const char*>(maps[p]);
+            uint32_t   stride = strides[p];
+            for (uint32_t row = 0; row < rows[p]; ++row) {
+                memcpy(dst, src + (size_t)row * stride, w);
+                dst += w;
+            }
+        }
+    }
+    for (int p = 0; p < 2; ++p) {
+        if (maps[p]) munmap(maps[p], sizes[p]);
+    }
+    return ok;
+}
+
+// Frame fetched via Tensor.buffer_id (per-plane dma-buf fds + geometry from
+// BufferLookupClient).
+bool repack_nv12_planes(const BufferLookupClient::LookupResult& r,
+                        std::string& out, std::string& why) {
+    return repack_nv12_planes(r.width, r.height, r.format, r.num_planes,
+                              r.strides, r.sizes, r.fds, out, why);
+}
+
+// Frame pushed by camera-daemon's FD publisher (StreamInfer input).
+bool repack_nv12_planes(const ReceivedFrame& f,
+                        std::string& out, std::string& why) {
+    static const std::vector<int> kNoFds;
+    return repack_nv12_planes(f.width, f.height, f.format, f.num_planes,
+                              f.strides, f.sizes,
+                              f.fd_group ? f.fd_group->fds : kNoFds,
+                              out, why);
+}
+
+}  // namespace
+
 // ─── Infer (synchronous single-shot) ─────────────────────────────────────────
 
 grpc::Status AIRuntimeServiceImpl::Infer(
@@ -544,8 +638,53 @@ grpc::Status AIRuntimeServiceImpl::Infer(
         std::memset(&ht, 0, sizeof(HalTensor));
 
         if (pb_t.dma_fd() > 0) {
-            ht.dma_fd = pb_t.dma_fd();
-            ht.data   = nullptr;
+            // A raw fd number from the caller's process is meaningless here —
+            // exactly the cross-process handoff the buffer_id path replaces.
+            // Reject loudly instead of binding a random descriptor.
+            resp->mutable_status()->set_success(false);
+            resp->mutable_status()->set_message(
+                "Tensor.dma_fd rejected: a raw fd number cannot cross "
+                "processes; pass the frame as bytes or a buffer_id");
+            return grpc::Status::OK;
+        }
+
+        bool frame_geometry = false;  // dtype/shape taken from the looked-up frame
+        if (pb_t.buffer_id() != 0) {
+            if (!buffer_lookup_) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Tensor.buffer_id rejected: buffer registry not configured");
+                return grpc::Status::OK;
+            }
+            auto lr = buffer_lookup_->lookup(pb_t.buffer_id());
+            if (lr.rc != 0) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Tensor.buffer_id lookup failed: " + lr.message);
+                return grpc::Status::OK;
+            }
+            std::string why;
+            bool repacked = repack_nv12_planes(lr, (*input_data_holder)[i], why);
+            for (int fd : lr.fds) close(fd);
+            // Lease dropped once our own copy exists (or cannot be made).
+            buffer_lookup_->release(pb_t.buffer_id());
+            if (!repacked) {
+                resp->mutable_status()->set_success(false);
+                resp->mutable_status()->set_message(
+                    "Tensor.buffer_id repack failed: " + why);
+                return grpc::Status::OK;
+            }
+            const uint32_t w = lr.width, h = lr.height;
+            ht.data      = const_cast<char*>((*input_data_holder)[i].data());
+            ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+            ht.dma_fd    = -1;
+            // Geometry comes from the daemon's registry, not the wire, so a
+            // mismatched client-declared shape never reaches the NPU.
+            ht.dtype     = HAL_DTYPE_UINT8;
+            ht.ndim      = 2;
+            ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+            ht.shape[1]  = static_cast<int32_t>(w);
+            frame_geometry = true;
         } else {
             // Assign to pre-allocated slot — no reallocation
             (*input_data_holder)[i] = pb_t.data();
@@ -554,10 +693,12 @@ grpc::Status AIRuntimeServiceImpl::Infer(
             ht.dma_fd    = -1;
         }
 
-        ht.dtype = proto_dtype_to_hal(pb_t.dtype());
-        ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
-        for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++) {
-            ht.shape[d] = pb_t.shape(d);
+        if (!frame_geometry) {
+            ht.dtype = proto_dtype_to_hal(pb_t.dtype());
+            ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
+            for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++) {
+                ht.shape[d] = pb_t.shape(d);
+            }
         }
     }
 
@@ -921,23 +1062,76 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         const int num_inputs = infer_req.inputs_size();
         c->input_data.resize(num_inputs);
         c->inputs.resize(num_inputs);
+        bool item_failed = false;
+        std::string fail_msg;
         for (int j = 0; j < num_inputs; j++) {
             const auto& pb_t = infer_req.inputs(j);
             HalTensor&  ht   = c->inputs[j];
             std::memset(&ht, 0, sizeof(HalTensor));
             if (pb_t.dma_fd() > 0) {
-                ht.dma_fd = pb_t.dma_fd();
-                ht.data   = nullptr;
+                // Cross-process raw fd — same red line as single Infer.
+                item_failed = true;
+                fail_msg = "Tensor.dma_fd rejected: a raw fd number cannot "
+                           "cross processes; pass the frame as bytes or a "
+                           "buffer_id";
+                break;
+            }
+            bool frame_geometry = false;  // dtype/shape from the looked-up frame
+            if (pb_t.buffer_id() != 0) {
+                if (!buffer_lookup_) {
+                    item_failed = true;
+                    fail_msg = "Tensor.buffer_id rejected: buffer registry not configured";
+                    break;
+                }
+                auto lr = buffer_lookup_->lookup(pb_t.buffer_id());
+                if (lr.rc != 0) {
+                    item_failed = true;
+                    fail_msg = "Tensor.buffer_id lookup failed: " + lr.message;
+                    break;
+                }
+                std::string why;
+                bool repacked = repack_nv12_planes(lr, c->input_data[j], why);
+                for (int fd : lr.fds) close(fd);
+                // Lease dropped once our own copy exists (or cannot be made).
+                buffer_lookup_->release(pb_t.buffer_id());
+                if (!repacked) {
+                    item_failed = true;
+                    fail_msg = "Tensor.buffer_id repack failed: " + why;
+                    break;
+                }
+                const uint32_t w = lr.width, h = lr.height;
+                ht.data      = const_cast<char*>(c->input_data[j].data());
+                ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+                ht.dma_fd    = -1;
+                // Geometry comes from the daemon's registry, not the wire.
+                ht.dtype     = HAL_DTYPE_UINT8;
+                ht.ndim      = 2;
+                ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+                ht.shape[1]  = static_cast<int32_t>(w);
+                frame_geometry = true;
             } else {
                 c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());
                 ht.data      = const_cast<char*>(c->input_data[j].data());
                 ht.byte_size = static_cast<uint32_t>(c->input_data[j].size());
                 ht.dma_fd    = -1;
             }
-            ht.dtype = proto_dtype_to_hal(pb_t.dtype());
-            ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
-            for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
-                ht.shape[d] = pb_t.shape(d);
+            if (!frame_geometry) {
+                ht.dtype = proto_dtype_to_hal(pb_t.dtype());
+                ht.ndim  = static_cast<int32_t>(pb_t.shape_size());
+                for (int d = 0; d < ht.ndim && d < HAL_MAX_TENSOR_DIMS; d++)
+                    ht.shape[d] = pb_t.shape(d);
+            }
+        }
+        if (item_failed) {
+            // Release the model ref taken above — no async callback will fire.
+            if (!c->released.exchange(true)) {
+                model_mgr_->release_model(c->model_id);
+            }
+            c->response.mutable_status()->set_success(false);
+            c->response.mutable_status()->set_message(fail_msg);
+            c->done.store(true);
+            complete_now();
+            continue;
         }
 
         c->max_outputs = c->snap->num_outputs;
@@ -1057,10 +1251,22 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         req->session_id(), req->stream_id(), req->model_id(),
         req->fps_limit(), 0, 5);
 
+    // The guard fires on every StreamInfer exit — clean finish, error
+    // return, or client disconnect (ctx cancellation breaks the loop): the
+    // session is destroyed and a tagged session additionally broadcasts
+    // session/end so the daemon-side overlay sidecars are swept (P2-13).
+    // The sweep tag is req->session_id() — the client-facing string the
+    // SDK stamps on its annotate events — NOT the internal session id
+    // (app-stream-model-ts) the daemon would never have seen.
     struct SessionGuard {
         SessionManager* mgr; std::string id;
-        ~SessionGuard() { mgr->destroy_session(id); }
-    } guard{session_mgr_, session_id};
+        AIRuntimeServiceImpl* svc = nullptr;
+        std::string client_tag;
+        ~SessionGuard() {
+            mgr->destroy_session(id);
+            if (svc) svc->publish_session_end(client_tag);
+        }
+    } guard{session_mgr_, session_id, this, req->session_id()};
 
     auto session = session_mgr_->get_session(session_id);
     if (!session) {
@@ -1140,9 +1346,35 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 continue;
             }
 
-            // Build HalTensor from DMA-BUF fd — zero copy
-            HalTensor inputs[2] = {};
-            int num_inputs = build_nv12_tensors(frame, inputs);
+            // Repack the daemon-fed frame into a tight NV12 CPU buffer and
+            // bind one CPU tensor — HAL v2 accepts CPU-pointer inputs only,
+            // so the dma_fd-only tensors this path used to build were
+            // rejected by hailo15_bind_inputs_outputs with
+            // HAL_ERR_INVALID_ARG (-2814). Same tensor layout the
+            // single-shot Infer buffer_id path builds, so HAL sees
+            // identical geometry both ways. The buffer is held by the
+            // on_complete lambda until the request completes.
+            auto nv12 = std::make_shared<std::string>();
+            std::string repack_why;
+            if (!repack_nv12_planes(frame, *nv12, repack_why)) {
+                fd_receiver_->release_frame(stream_id, frame.frame_id);
+                resp.set_frame_sequence(frame.sequence);
+                resp.set_timestamp_ns(frame.timestamp_ns);
+                resp.mutable_status()->set_success(false);
+                resp.mutable_status()->set_message(
+                    "Frame repack failed: " + repack_why);
+                if (!writer->Write(resp)) break;
+                continue;
+            }
+            const int num_inputs = 1;
+            HalTensor inputs[1] = {};
+            inputs[0].data      = const_cast<char*>(nv12->data());
+            inputs[0].byte_size = static_cast<uint32_t>(nv12->size());
+            inputs[0].dma_fd    = -1;
+            inputs[0].dtype     = HAL_DTYPE_UINT8;
+            inputs[0].ndim      = 2;
+            inputs[0].shape[0]  = static_cast<int32_t>(frame.height * 3 / 2);
+            inputs[0].shape[1]  = static_cast<int32_t>(frame.width);
 
             resp.set_frame_sequence(frame.sequence);
             resp.set_timestamp_ns(frame.timestamp_ns);
@@ -1173,7 +1405,8 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             inf_req->on_complete = [this, promise, stream_resp, pp_session,
                                     enable_post, model_id, stream_id,
                                     frame_id, frame_seq, ts_ns, in_flight,
-                                    fd_receiver = fd_receiver_, session](
+                                    fd_receiver = fd_receiver_, session,
+                                    nv12](
                 int rc, HalTensor* outputs, int num_outputs,
                 uint64_t infer_us, uint64_t queue_us,
                 bool model_acquired) {
@@ -1247,6 +1480,23 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 model_mgr_->release_model(model_id);
                 in_flight->fetch_sub(1);
 
+                // Skew (success only): result-ready (here — response fully
+                // built, post-process done) minus frame capture. Both stamps
+                // are CLOCK_MONOTONIC: the daemon's frame stamp comes from
+                // the media pipeline (monotonic, rig-verified) and now_us()
+                // is steady_clock. Failures keep skew_us = 0 ("not
+                // measured" on the wire).
+                if (!pp_failed) {
+                    uint64_t ready_us = now_us();
+                    uint64_t capture_us = ts_ns / 1000;
+                    if (ready_us > capture_us) {
+                        uint64_t skew_us = ready_us - capture_us;
+                        stream_resp->set_skew_us(
+                            static_cast<int64_t>(skew_us));
+                        session_mgr_->record_skew(session.get(), skew_us);
+                    }
+                }
+
                 promise->set_value(true);
             };
 
@@ -1261,12 +1511,25 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 continue;
             }
 
-            // Wait with timeout. On timeout, on_complete still fires
-            // later and does its own free/release — no leak, and
-            // in_flight is decremented by on_complete (not here).
+            // Wait with timeout, sliced so a client cancel is noticed
+            // within ~50ms instead of blocking out the full window. On
+            // timeout, on_complete still fires later and does its own
+            // free/release — no leak, and in_flight is decremented by
+            // on_complete (not here).
             uint32_t stream_timeout_ms = 5000;
-            if (future.wait_for(std::chrono::milliseconds(stream_timeout_ms))
-                != std::future_status::ready) {
+            constexpr uint32_t WAIT_SLICE_MS = 50;
+            uint32_t waited_ms = 0;
+            std::future_status fstat = std::future_status::timeout;
+            while (!ctx->IsCancelled()
+                   && fstat != std::future_status::ready
+                   && waited_ms < stream_timeout_ms) {
+                fstat = future.wait_for(
+                    std::chrono::milliseconds(WAIT_SLICE_MS));
+                waited_ms += WAIT_SLICE_MS;
+            }
+            if (fstat != std::future_status::ready) {
+                if (ctx->IsCancelled()) break;  // drop the response;
+                                                // on_complete self-cleans
                 LOG_WARN("StreamInfer: inference timeout, skipping frame");
                 // Do NOT decrement in_flight here — on_complete will do it.
                 // Do NOT touch stream_resp — on_complete owns it.
@@ -1292,13 +1555,29 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
 
     if (fd_path) {
         fd_receiver_->unsubscribe(stream_id, session_id);
+        // A frame still sitting in the latest-frame slot was never consumed
+        // and its daemon reference would leak until the watchdog reclaims
+        // it. After unsubscribe returns no callback can be mid-flight (they
+        // run under the receiver's sub_mu, which unsubscribe acquires), so
+        // taking frame_mu here is race-free.
+        {
+            std::lock_guard<std::mutex> lock(frame_mu);
+            if (has_frame && latest_frame.frame_id != 0) {
+                fd_receiver_->release_frame(stream_id,
+                                            latest_frame.frame_id);
+                has_frame = false;
+            }
+        }
     }
 
     // Bounded drain: wait for in-flight tasks to complete, but don't
     // block forever if a HAL job is stuck. Late callbacks self-clean
     // (free + release + in_flight--) so it's safe to return.
     {
-        auto deadline = SteadyClock::now() + Milliseconds(5000);
+        // Cancelled streams get a shorter drain — the client is gone and
+        // late callbacks self-clean, so the full window buys nothing.
+        auto deadline = SteadyClock::now()
+            + Milliseconds(ctx->IsCancelled() ? 1000 : 5000);
         while (in_flight->load() > 0) {
             if (SteadyClock::now() >= deadline) {
                 LOG_WARN("StreamInfer: drain timeout, %d orphan job(s) — "
@@ -1338,7 +1617,17 @@ grpc::Status AIRuntimeServiceImpl::DestroySession(
     const pb::SessionConfig* req,
     pb::Status* resp) {
 
+    // P2-13: capture the client-facing tag before the session object is
+    // destroyed — app_id at creation time (for StreamInfer sessions that
+    // is the SDK's session_id) is what overlay sidecars were tagged with.
+    // The broadcast goes out after the destroy so a downstream observer
+    // reacting to session/end sees a fully torn-down runtime session.
+    std::string client_tag;
+    if (auto s = session_mgr_->get_session(req->session_id()))
+        client_tag = s->app_id;
+
     bool ok = session_mgr_->destroy_session(req->session_id());
+    publish_session_end(client_tag);
     resp->set_success(ok);
     resp->set_message(ok ? "Destroyed" : "Session not found");
     return grpc::Status::OK;
@@ -1348,8 +1637,20 @@ grpc::Status AIRuntimeServiceImpl::DestroySession(
 
 grpc::Status AIRuntimeServiceImpl::GetStats(
     grpc::ServerContext* /*ctx*/,
-    const pb::Empty* /*req*/,
+    const pb::GetStatsRequest* req,
     pb::SystemStats* resp) {
+
+    // Sampling window for the blocking HAL queries below (device/CPU/DSP
+    // utilization is measured, not read). 0 = server default 500ms — the
+    // pre-parameterization behavior, also what an Empty-sending legacy
+    // client gets. Clamped to [1,5000]: the perf suite measured a 536ms
+    // watermark at the default, so cheap snapshots ask for 1-50ms.
+    uint32_t window_ms = req ? req->sampling_window_ms() : 0;
+    if (window_ms == 0) {
+        window_ms = 500;
+    } else if (window_ms > 5000) {
+        window_ms = 5000;
+    }
 
     auto models   = model_mgr_->list_models();
     auto sessions = session_mgr_->list_sessions();
@@ -1362,11 +1663,20 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
         // Aggregate from sessions
         uint64_t total_latency = 0;
         uint64_t total_inferences = 0;
+        uint64_t total_skew = 0;
+        uint64_t skew_samples = 0;
+        uint64_t max_skew = 0;
         for (auto& s : sessions) {
             if (s->model_id == m.id) {
                 uint64_t count = s->infer_count.load(std::memory_order_relaxed);
                 total_inferences += count;
                 total_latency += s->total_latency_us.load(std::memory_order_relaxed);
+
+                // Stream-infer skew aggregation (see Session::total_skew_us)
+                skew_samples += s->skew_count.load(std::memory_order_relaxed);
+                total_skew += s->total_skew_us.load(std::memory_order_relaxed);
+                uint64_t sk_max = s->max_skew_us.load(std::memory_order_relaxed);
+                if (sk_max > max_skew) max_skew = sk_max;
 
                 // QPS from sliding window
                 auto now_ms = static_cast<uint64_t>(
@@ -1388,9 +1698,17 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
         }
         stat->set_total_inferences(total_inferences);
 
+        // Skew aggregates — only set when samples exist so old-server
+        // semantics ("all 0") are preserved for stream-less models.
+        if (skew_samples > 0) {
+            stat->set_avg_skew_us(total_skew / skew_samples);
+            stat->set_max_skew_us(max_skew);
+            stat->set_skew_samples(skew_samples);
+        }
+
         // Query HAL for per-session hardware FPS
         HalInferenceSessionPerfStats hw_perf{};
-        if (model_mgr_->query_session_stats(m.id, 500, &hw_perf) == 0) {
+        if (model_mgr_->query_session_stats(m.id, window_ms, &hw_perf) == 0) {
             if (hw_perf.fps > 0)
                 stat->set_hw_fps(hw_perf.fps);
         }
@@ -1404,7 +1722,7 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
 
     // Query HAL for performance stats
     HalInferencePerfStats perf{};
-    if (model_mgr_->query_performance_stats(500, &perf) == 0) {
+    if (model_mgr_->query_performance_stats(window_ms, &perf) == 0) {
         if (perf.npu_utilization >= 0) {
             resp->set_device_utilization(perf.npu_utilization / 100.0f);
         }
@@ -1464,6 +1782,26 @@ void AIRuntimeServiceImpl::publish_result(const std::string& stream_id,
 
     event_bus_->publish(topic, "ai-runtime", timestamp_ns, event_id, payload,
                         {{"stream_id", stream_id}, {"model_id", model_id}});
+}
+
+void AIRuntimeServiceImpl::publish_session_end(
+    const std::string& client_session_id) {
+    // Daemon contract (ai_overlay_subscriber.h:104): the sweep trigger is
+    // the exact topic "<prefix>session/end" with the session riding in
+    // metadata["session_id"]. The prefix is the configured result prefix —
+    // the daemon's ai_overlay.topic_prefix must agree with it (both
+    // default "inference/"), the same coupling result publishing already
+    // has. Payload is unused by the daemon; "{}" keeps bus snoopers happy.
+    // Reserved-name rule: no result may publish under a model+stream that
+    // literally spells "session/end" — this is the sole sanctioned user.
+    if (client_session_id.empty()) return;  // untagged: nothing to sweep
+    if (!event_bus_ || !event_bus_->connected()) return;
+
+    const std::string topic =
+        cfg_.event_bus_result_topic_prefix + "session/end";
+    event_bus_->publish(topic, "ai-runtime", now_ns(),
+                        "session-end-" + client_session_id,
+                        "{}", {{"session_id", client_session_id}});
 }
 
 // ─── CLIP text encoding ──────────────────────────────────────────────────────

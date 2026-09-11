@@ -181,6 +181,30 @@ func (b *modelHealBackoff) reset(modelID string) {
 	delete(b.nextTry, modelID)
 }
 
+// DemoteNeverLoadedImports corrects desired_state on rows created before the
+// registration paths stopped relying on the column default: import, upload
+// and disk-seed used to leave desired_state at its old default "loaded", so
+// this loop's restore pass auto-loaded models the user never loaded —
+// flipping the models page to "loaded" on its own and pushing every scanned
+// disk model onto the NPU. Idempotent; runs once per startup before the heal
+// loop's first tick, which is the pass that would otherwise act on the stale
+// promise. The rare crash-mid-load row (uploaded + desired loaded) is
+// indistinguishable from a never-loaded import and gets demoted too: it then
+// takes one manual load, an acceptable trade for not auto-loading everything.
+func (h *APIHandlers) DemoteNeverLoadedImports() {
+	if h.aiModelRepo == nil {
+		return
+	}
+	n, err := h.aiModelRepo.DemoteNeverLoadedToUnloaded()
+	if err != nil {
+		logger.Warn("ModelSelfHeal: demoting never-loaded imports failed: %v", err)
+		return
+	}
+	if n > 0 {
+		logger.Info("ModelSelfHeal: demoted %d imported-but-never-loaded model(s) to desired_state=unloaded", n)
+	}
+}
+
 // restoreDesiredLoads re-registers platform-managed models whose
 // desired_state=loaded but which the runtime no longer holds. Any runtime
 // entry for the id counts as served — an app-owned registration keeping the

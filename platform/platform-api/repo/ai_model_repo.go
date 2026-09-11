@@ -51,6 +51,20 @@ func (r *AIModelRepo) UpdateFileHash(modelID string, hash string) error {
 		Update("file_hash", hash).Error
 }
 
+// DemoteNeverLoadedToUnloaded flips desired_state on device-level rows that
+// were registered but never loaded. Rows created before the import/disk-seed
+// paths started writing an explicit "unloaded" inherited the column default
+// "loaded", which the self-heal loop honors by auto-loading the model — so
+// the correction must run at startup, before the heal loop's first tick.
+// Rows the user actually loaded (status "loaded") and app-owned rows are
+// untouched: the latter are app-manager's preload responsibility.
+func (r *AIModelRepo) DemoteNeverLoadedToUnloaded() (int64, error) {
+	result := r.db.Model(&model.AIModel{}).
+		Where("owner_app_id = ? AND status = ? AND desired_state = ?", "", "uploaded", "loaded").
+		Update("desired_state", "unloaded")
+	return result.RowsAffected, result.Error
+}
+
 // GetByFilePath retrieves a model by its file path.
 func (r *AIModelRepo) GetByFilePath(filePath string) (*model.AIModel, error) {
 	var m model.AIModel

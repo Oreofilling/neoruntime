@@ -449,6 +449,12 @@ func (s *PlatformAPIServer) setupRoutes() {
 	// list; this pass covers devices nobody is browsing.
 	go apiHandlers.ReconcileRuntimeModels()
 
+	// Correct desired_state on rows registered-but-never-loaded before the
+	// import/disk-seed paths wrote it explicitly (the old column default
+	// "loaded" made the heal loop auto-load them). Must run before the heal
+	// loop's first tick — that pass is the consumer of the stale promise.
+	apiHandlers.DemoteNeverLoadedImports()
+
 	// Periodic desired-state restore: models loaded by the user but lost
 	// from the runtime (solo ai-runtime restart, force_unregister_all wipe,
 	// crash mid-operation) are re-registered automatically every minute —

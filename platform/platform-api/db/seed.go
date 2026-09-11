@@ -179,6 +179,10 @@ func registerDiskModel(modelRepo *repo.AIModelRepo, hefPath, category string) er
 		InputWidth:    inputWidth,
 		InputHeight:   inputHeight,
 		Status:        "uploaded",
+		// Disk discovery is not a load promise: without an explicit
+		// "unloaded" the column default would let the self-heal loop
+		// auto-load every model found by a scan.
+		DesiredState: "unloaded",
 	}
 
 	return modelRepo.Create(dbModel)
