@@ -87,6 +87,9 @@ func TestRegisterModelRawModeStoredOnRow(t *testing.T) {
 	if row.OutputMode != model.OutputModeRaw {
 		t.Errorf("row output_mode = %q, want %q", row.OutputMode, model.OutputModeRaw)
 	}
+	if row.DesiredState != "unloaded" {
+		t.Errorf("registered row desired_state = %q, want unloaded — registration is not a load promise", row.DesiredState)
+	}
 	if !strings.Contains(w.Body.String(), `"output_mode":"raw"`) {
 		t.Errorf("response must echo output_mode: %s", w.Body.String())
 	}
