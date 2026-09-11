@@ -30,10 +30,19 @@ int main() {
     /* ---- label matching: exact "face" in any case; substrings rejected ---- */
     {
         const char* labels[] = {"face", "Face", "FACE", "person", "facial", "face_mask", ""};
-        float bboxes[7][4] = {};
+        // Non-degenerate bboxes: zero-size rects are skipped by contract, so
+        // all-zero boxes would turn this into a geometry test, not a label test.
+        float bboxes[7][4] = {{0.10f, 0.10f, 0.20f, 0.20f},
+                              {0.35f, 0.10f, 0.20f, 0.20f},
+                              {0.60f, 0.10f, 0.20f, 0.20f},
+                              {0.10f, 0.40f, 0.20f, 0.20f},
+                              {0.35f, 0.40f, 0.20f, 0.20f},
+                              {0.60f, 0.40f, 0.20f, 0.20f},
+                              {0.10f, 0.70f, 0.20f, 0.20f}};
         auto r = make_detection_result(labels, 7, bboxes);
         HalDrawMosaic out[7] = {};
         assert(collect_face_mosaic_rects(r, FW, FH, 8, out, 7) == 3);
+        assert(out[0].x == 192 && out[1].x == 672 && out[2].x == 1152);  // the three faces, in order
         assert(out[0].block_size == 8 && out[1].block_size == 8 && out[2].block_size == 8);
     }
 
