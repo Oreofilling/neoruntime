@@ -133,7 +133,13 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
                                         req->batch_size());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
-        resp->mutable_status()->set_message("Failed to register model");
+        resp->mutable_status()->set_message(
+            req->batch_size() > 1
+                ? "Failed to register model: batch_size=" +
+                      std::to_string(req->batch_size()) +
+                      " rejected (HEF not compiled for this batch, or the "
+                      "model is already loaded at a different batch)"
+                : "Failed to register model");
         return grpc::Status::OK;
     }
 

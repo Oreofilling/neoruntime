@@ -548,8 +548,8 @@ void test_batch_model() {
     ASSERT_TRUE(snap.has_value(), "model not found");
     ASSERT_EQ(snap->batch_size, B, "snapshot should carry the configured batch");
 
-    // Stub geometry scales by batch, like hailo15 get_frame_size() after
-    // set_batch_size(B): input/output tensors are B frames wide.
+    // Stub geometry scales by batch — the platform contract that model_manager
+    // verifies at registration (input byte_size == B x single-frame).
     ASSERT_EQ(snap->model_info.inputs[0].byte_size, per_frame_in * B,
               "input byte_size should be B x per-frame");
     ASSERT_EQ(snap->model_info.inputs[0].shape[0], (int32_t)B,
@@ -602,6 +602,18 @@ void test_batch_model() {
     ASSERT_EQ(snap1->batch_size, 1u, "default registration should be batch=1");
     mgr.release_model("batch1");
     mgr.unregister_model("batch1");
+
+    // Re-registering an id (or aliasing a file) at a DIFFERENT batch must be
+    // rejected: both paths share the existing HAL session, so a silent accept
+    // would serve the stored batch (fake success — the on-device trap that
+    // motivated the checks in model_manager).
+    rc = mgr.register_model("batch4", "/fake/batch4.hef", "", false, "", 2);
+    ASSERT_NE(rc, 0, "same-id re-registration with batch=2 must fail");
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef", "", false, "", 1);
+    ASSERT_NE(rc, 0, "alias of a batch=4 file at batch=1 must fail");
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef", "", false, "", 4);
+    ASSERT_EQ(rc, 0, "alias at the SAME batch should still succeed");
+    mgr.unregister_model("batch4b");
 
     mgr.release_model("batch4");
     rc = mgr.unregister_model("batch4");

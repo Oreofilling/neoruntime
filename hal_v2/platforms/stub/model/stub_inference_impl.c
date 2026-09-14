@@ -45,8 +45,11 @@ static int stub_infer_get_model_info(HalInferenceSession *session, HalModelInfo 
     }
     const uint32_t batch = session_batch(session);
     /* Provide a minimal model info for testing. Sizes are scaled by the
-     * configured batch, mirroring the hailo15 backend where InferStream
-     * get_frame_size() returns B x per-frame after set_batch_size(B). */
+     * configured batch: this models the platform contract that registration
+     * verifies (input byte_size == B x single-frame). The real hailo15
+     * backend reports get_frame_size() unscaled when the HEF does not serve
+     * the batch (verified on-device 2026-09-14) — such registrations are
+     * rejected by model_manager, so the stub only sees batches it serves. */
     info->num_inputs = 1;
     info->num_outputs = 1;
     info->inputs[0].ndim = 4;
@@ -55,11 +58,15 @@ static int stub_infer_get_model_info(HalInferenceSession *session, HalModelInfo 
     info->inputs[0].shape[2] = 640;
     info->inputs[0].shape[3] = 640;
     info->inputs[0].dtype = HAL_DTYPE_UINT8;
+    /* [B,C,H,W] uint8 — the geometry the platform's batch registration check
+     * verifies against (single-frame = 3*640*640, byte_size = B x that). */
+    info->inputs[0].layout = HAL_TENSOR_LAYOUT_NCHW;
     info->inputs[0].byte_size = 640 * 640 * 3 * batch;
     info->outputs[0].ndim = 2;
     info->outputs[0].shape[0] = (int32_t)batch;
     info->outputs[0].shape[1] = 1024;
     info->outputs[0].dtype = HAL_DTYPE_FLOAT32;
+    info->outputs[0].layout = HAL_TENSOR_LAYOUT_NC;
     info->outputs[0].byte_size = 1024 * sizeof(float) * batch;
     return 0;
 }
