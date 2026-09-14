@@ -98,7 +98,8 @@ int ModelManager::register_model(const std::string& model_id,
                                  const std::string& model_path,
                                  const std::string& owner_id,
                                  bool transient,
-                                 const std::string& variant) {
+                                 const std::string& variant,
+                                 uint32_t batch_size) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
@@ -149,7 +150,11 @@ int ModelManager::register_model(const std::string& model_id,
     // HAL v2: session-based inference
     HalInferenceConfig infer_cfg{};
     std::strncpy(infer_cfg.model_path, model_path.c_str(), HAL_MAX_MODEL_PATH - 1);
-    infer_cfg.batch_size = 1;
+    // NPU batch: 0 normalizes to 1 (single-frame). >1 asks HailoRT for a
+    // batched session (set_batch_size); create() fails for HEFs that cannot
+    // serve the requested batch, so misconfiguration fails at registration
+    // instead of at first inference.
+    infer_cfg.batch_size = batch_size > 0 ? batch_size : 1;
     infer_cfg.timeout_ms = 5000;
     infer_cfg.use_dma = true;
 
@@ -202,20 +207,22 @@ int ModelManager::register_model(const std::string& model_id,
 
     // Get model info and create entry
     ModelEntry entry;
-    entry.id        = model_id;
-    entry.name      = model_id;
-    entry.path      = model_path;
-    entry.transient = transient;
-    entry.ref_count = 0;
-    entry.load_time = std::time(nullptr);
+    entry.id         = model_id;
+    entry.name       = model_id;
+    entry.path       = model_path;
+    entry.transient  = transient;
+    entry.batch_size = infer_cfg.batch_size;
+    entry.ref_count  = 0;
+    entry.load_time  = std::time(nullptr);
 
     entry.infer_session = session;
     if (infer_ops_->get_model_info) {
         infer_ops_->get_model_info(session, &entry.model_info);
     }
-    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d)",
+    LOG_INFO("Model registered: %s (session=%p, owner=%s, transient=%d, batch=%u)",
              model_id.c_str(), (void*)session,
-             owner_id.empty() ? "<system>" : owner_id.c_str(), transient);
+             owner_id.empty() ? "<system>" : owner_id.c_str(), transient,
+             entry.batch_size);
 
     models_.emplace(model_id, std::move(entry));
     add_infer_locked(session);  // first reference to the freshly created session
@@ -557,6 +564,7 @@ std::optional<ModelSnapshot> ModelManager::acquire_model_snapshot(const std::str
     snap.model_info    = it->second.model_info;
     snap.num_outputs   = static_cast<int>(it->second.model_info.num_outputs);
     if (snap.num_outputs <= 0) snap.num_outputs = 1;
+    snap.batch_size    = it->second.batch_size > 0 ? it->second.batch_size : 1;
     return snap;
 }
 

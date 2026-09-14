@@ -113,6 +113,13 @@ public:
         const aipc::inference::GenaiAbortRequest* req,
         aipc::inference::Status* resp) override;
 
+    // Stateless dtype/layout converters, shared with the anonymous-namespace
+    // InferBatch helpers below (they are free functions and cannot reach
+    // private statics).
+    static aipc::inference::DataType hal_dtype_to_proto(HalDataType dt);
+    static HalDataType proto_dtype_to_hal(aipc::inference::DataType dt);
+    static std::string hal_layout_to_string(HalTensorLayout layout);
+
 private:
     void publish_result(const std::string& stream_id,
                         const std::string& model_id,
@@ -127,9 +134,6 @@ private:
     // sessions have nothing tagged to sweep) or when the bus is down.
     void publish_session_end(const std::string& client_session_id);
 
-    static aipc::inference::DataType hal_dtype_to_proto(HalDataType dt);
-    static HalDataType proto_dtype_to_hal(aipc::inference::DataType dt);
-    static std::string hal_layout_to_string(HalTensorLayout layout);
 
     // Copies HAL tensor specs onto a protobuf ModelInfo. Shared by
     // ListModels and GetModelInfo so the list path carries the same
