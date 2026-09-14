@@ -299,6 +299,7 @@ InjectionPushResult InjectionService::push_frame(
     const uint64_t frame_id = next_frame_id_++;
     QueuedFrame q;
     q.pin = std::move(pin);
+    q.buffer_id = desc.buffer_id;
     q.width = desc.width;
     q.height = desc.height;
     q.stride = desc.stride;
@@ -343,6 +344,15 @@ InjectionServiceStatus InjectionService::status() const {
     s.frames_injected = frames_injected_;
     s.frames_dropped = frames_dropped_;
     s.queue_depth = static_cast<uint32_t>(queue_.size());
+    /* Write-lease snapshot: queued ids plus baking ids, sorted for a
+     * deterministic wire order (tests assert on the exact list). */
+    s.in_flight_buffer_ids.reserve(queue_.size() + baking_ids_.size());
+    for (const QueuedFrame& q : queue_)
+        s.in_flight_buffer_ids.push_back(q.buffer_id);
+    s.in_flight_buffer_ids.insert(s.in_flight_buffer_ids.end(),
+                                  baking_ids_.begin(), baking_ids_.end());
+    std::sort(s.in_flight_buffer_ids.begin(),
+              s.in_flight_buffer_ids.end());
     return s;
 }
 
@@ -367,6 +377,7 @@ bool InjectionService::take_frame(const std::string& stream_name,
     if (!chosen)
         return false;
     const uint64_t chosen_id = chosen->frame_id;
+    const uint64_t chosen_buffer = chosen->buffer_id;
 
     for (auto it = queue_.begin(); it != queue_.end();) {
         if (it->frame_id == chosen_id ||
@@ -381,6 +392,12 @@ bool InjectionService::take_frame(const std::string& stream_name,
 
     for (auto it = queue_.begin(); it != queue_.end(); ++it) {
         if (it->frame_id == chosen_id) {
+            /* Lease transfer queue -> bake: the id leaves the queued set
+             * and enters baking_ids_ so status() keeps reporting it until
+             * the bake site's note_bake_done() lands. Between the move
+             * and that ack the daemon may still read these pixels — a
+             * slot rewrite in that window is the tear P1-1 described. */
+            baking_ids_.insert(chosen_buffer);
             out = std::move(*it);
             queue_.erase(it);
             ++frames_injected_;
@@ -388,4 +405,9 @@ bool InjectionService::take_frame(const std::string& stream_name,
         }
     }
     return false; /* unreachable: chosen_id was just seen in the queue */
+}
+
+void InjectionService::note_bake_done(uint64_t buffer_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    baking_ids_.erase(buffer_id);
 }

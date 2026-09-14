@@ -76,10 +76,13 @@ struct AiOverlayConfig {
     // inference feed is itself (stream_map[D] == D), the bake waits —
     // bounded by strict_wait_cap_ms — for the result belonging to the
     // exact frame before drawing, so boxes and picture are the same
-    // frame. Wait expiry degrades to the preview semantics (freshest
-    // TTL-valid result) with a counter + rate-limited warning; the
-    // encoder is never stalled past the cap. 0 cap = derive: 2x frame
-    // period of the display stream, clamped to [1,500] ms.
+    // frame. The lock covers the PLATFORM result only; app layers
+    // (SDK annotate) draw alongside it — TTL-governed, never suppressed,
+    // and also alone when the gate SKIPs or the locked result aged out.
+    // Wait expiry degrades to the preview semantics (freshest TTL-valid
+    // result) with a counter + rate-limited warning; the encoder is
+    // never stalled past the cap. 0 cap = derive: 2x frame period of the
+    // display stream, clamped to [1,500] ms.
     bool     strict_frame_lock = false;
     uint32_t strict_wait_cap_ms = 0;
 
@@ -189,6 +192,11 @@ bool parse_frame_sequence(const std::string& payload, uint64_t* out_seq);
 // ingest-side late-command judgement (frame_sequence far past the last
 // frame the bake site saw = dead generation, rejected).
 constexpr uint64_t kFrameBindSlack = 2;
+// How many display frames behind the anchor a bound command may arrive
+// before the ingest gate calls it dead: covers inference latency (a
+// result riding a subscribe() iteration is a few frames old on arrival)
+// with margin, while still rejecting genuinely stale generations.
+constexpr uint64_t kFrameBindPastFrames = 10;
 
 class AiOverlaySubscriber {
 public:
@@ -251,6 +259,14 @@ public:
     // the old generation must not survive into the new one. App events
     // tagged with a stale epoch are rejected from then on.
     void note_stream_restart(const std::string& stream);
+
+    // Effective frame-bind window for a display stream, in HAL-counter
+    // steps: kFrameBindSlack display frames converted via the stream's
+    // learned steps-per-frame EMA (unlearned → 1 step/frame). Caller must
+    // hold results_mu_. The past window for the ingest gate is
+    // kFrameBindPastFrames frames in the same conversion.
+    uint64_t bind_slack_steps(const std::string& stream) const;
+    uint64_t bind_past_steps(const std::string& stream) const;
 
     // Clears the polygon sidecar of every stream whose latest polygons
     // write was tagged with session_id (primary results are untouched —
@@ -318,9 +334,11 @@ private:
 
     // Strict-gate core (P1-6). Runs under results_mu_ (passed as a
     // unique_lock so the bounded wait can release it). Locks the stream's
-    // FIRST non-app layer — strict keeps single-source identity semantics
-    // and does not join the multi-layer draw. Returns the Layer to draw
-    // — null ships the frame clean — and sets *skip_ttl when the layer's
+    // FIRST non-app layer — strict's single-source frame lock covers the
+    // platform result only; app layers are NOT gated (they are
+    // command-driven, TTL-governed) and draw alongside whatever the gate
+    // returned. Returns the Layer to draw — null means no platform result
+    // and the app half draws alone — and sets *skip_ttl when the layer's
     // result belongs to this exact frame (LOCK_*: the validity window
     // does not apply there). The wait can grow/erase the layer vector, so
     // the caller must re-find the layer after each wake, never hold the
@@ -362,11 +380,33 @@ private:
     std::unordered_map<std::string, uint64_t> stream_epochs_;
 
     // Last frame sequence each bake site reported (under results_mu_),
-    // refreshed by every apply_overlay(current_seq > 0). Bounds the
-    // ingest-side late-command judgement — an app command whose
-    // frame_sequence is far past this anchor belongs to a dead frame
-    // generation (sequence restarted or raced ahead) and is rejected.
+    // refreshed by every apply_overlay(current_seq > 0). The sequence is
+    // the HAL frame's own counter (frame->sequence — the shared
+    // media-context counter the FD publisher and ai-runtime re-export),
+    // NOT the frame_router per-dispatch count: app commands carry the SDK
+    // frame_sequence sourced from the same HAL counter, so the
+    // ingest-side late-command judgement (cmd_seq vs this anchor) and the
+    // draw-side binding window (current_seq vs bound_seq) must stay in
+    // that one counter space. A per-stream router count diverges from it
+    // on any multi-stream deployment (shared counter ticks once per
+    // frontend callback for ALL streams) and would reject every bound
+    // annotation as a late command. Cleared by note_stream_restart — a
+    // pipeline rebuild can reset the HAL counter, and a stale anchor
+    // would expire every newly bound layer against the wrong window.
     std::unordered_map<std::string, uint64_t> last_seen_seq_;
+
+    // EMA of the HAL-counter distance between consecutive baked frames of
+    // each display stream (under results_mu_). The shared media-context
+    // counter ticks once per frontend callback for ALL streams, so on a
+    // main@30+sub@30+third@15 device a main frame spans ~2.5 counter
+    // steps — a frame-bind window expressed in raw steps (kFrameBindSlack
+    // alone) would be sub-frame there and every latency-carrying bound
+    // annotation would expire before drawing. The effective window is
+    // kFrameBindSlack display frames converted to steps via this EMA;
+    // 0 = not learned yet (single-frame history) → 1 step per frame.
+    // Cleared together with the anchor by note_stream_restart: a rebuilt
+    // pipeline re-learns its pace.
+    std::unordered_map<std::string, double> steps_per_frame_;
 
     // Signalled whenever a result lands in subscriber_loop — the strict
     // gate waits on it (with results_mu_) and wakes as soon as the

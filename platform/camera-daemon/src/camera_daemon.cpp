@@ -1853,6 +1853,13 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
                                 dispatch_name.c_str(), frame->width,
                                 frame->height);
             }
+            // Write-lease release (Fix-1): every path above has finished
+            // reading the injected pixels (compose or skip), so the SDK
+            // may rewrite this pool slot from the next PushFrame response
+            // on. Before this ack the id stays in the daemon's in-flight
+            // set even across an EOS/owner-disconnect session close that
+            // lands mid-bake.
+            injection_service_->note_bake_done(qf.buffer_id);
         }
     }
 
@@ -2018,13 +2025,18 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
     {
         std::shared_lock<std::shared_mutex> lk(op_mu_);
         if (ai_overlay_) {
-            // frame_router's per-dispatch counter is the frame-generation
-            // authority at the bake site: it anchors the app-command
-            // late-frame judgement and bounds frame-bound layer drawing.
+            // The HAL frame's own sequence (the shared media-context counter
+            // the FD publisher and ai-runtime both re-export verbatim) is the
+            // frame-generation authority at the bake site: it anchors the
+            // app-command late-frame judgement and bounds frame-bound layer
+            // drawing in the SAME counter space the SDK's frame_sequence
+            // metadata lives in. The frame_router's per-dispatch counter must
+            // NOT be used here: it counts only this stream's callbacks while
+            // the HAL counter ticks once per frontend callback across ALL
+            // streams — mixing the two spaces drops every bound annotation
+            // on a multi-stream deployment as a "late command".
             ai_overlay_->apply_overlay(dispatch_name, frame,
-                                       frame_router_
-                                           ? frame_router_->frame_sequence(dispatch_name)
-                                           : 0);
+                                       frame ? frame->sequence : 0);
         }
     }
 

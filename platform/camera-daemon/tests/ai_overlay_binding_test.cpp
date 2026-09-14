@@ -411,6 +411,162 @@ static void case_late_frame_sequence_rejected() {
     std::printf("  case_late_frame_sequence_rejected ok\n");
 }
 
+/* ---------------- Fix-2: HAL sequence-space unification ---------------- */
+
+static void case_dual_stream_shared_hal_counter() {
+    /* The HAL media-context frame counter is SHARED across streams: on a
+     * dual-stream deployment sub's frames advance the same counter main
+     * reads, so main's anchor (10) can lag sub's (19) by a wide margin.
+     * Fix-2 contract: apply_overlay's current_seq is that HAL counter's
+     * value for THIS stream's frame, and app commands carry the same
+     * counter's value via metadata — so each stream's in-flight binds
+     * compare against its OWN anchor and stay within kFrameBindSlack.
+     * (Pre-fix wiring fed the router's per-stream dispatch count here;
+     * mixing the two spaces rejected every bound app command from frame
+     * ~3 on. The wiring itself is camera_daemon.cpp compile-time — this
+     * pins the subscriber-side comparability contract.) */
+    AiOverlaySubscriber sub(base_cfg());
+    HalFrameBuffer fb = make_frame();
+
+    sub.apply_overlay("main", &fb, 10);
+    sub.apply_overlay("sub", &fb, 19); /* sub advanced the shared counter;
+                                          anchor updates predate any gate */
+
+    /* main-bound command from frame 11: 11 <= 10+2, admitted */
+    sub.handle_event("inference/main",
+                     {{"stream_id", "main"}, {"frame_sequence", "11"}},
+                     kZonePayload, "app-1");
+    assert(stats_of(sub, "main").overlay_layer_count == 1);
+    assert(stats_of(sub, "main").overlay_late_commands == 0);
+
+    /* sub-bound command from frame 21: 21 <= 19+2, admitted — judged
+     * against SUB's anchor, not main's */
+    sub.handle_event("inference/sub",
+                     {{"stream_id", "sub"}, {"frame_sequence", "21"}},
+                     kZonePayload, "app-2");
+    assert(stats_of(sub, "sub").overlay_layer_count == 1);
+    assert(stats_of(sub, "sub").overlay_late_commands == 0);
+
+    /* genuinely-future main command: 25 > 10+2, rejected + counted */
+    sub.handle_event("inference/main",
+                     {{"stream_id", "main"}, {"frame_sequence", "25"}},
+                     kZonePayload, "app-1");
+    assert(stats_of(sub, "main").overlay_late_commands == 1);
+    assert(stats_of(sub, "main").overlay_layer_count == 1);
+    std::printf("  case_dual_stream_shared_hal_counter ok\n");
+}
+
+static void case_adaptive_shared_counter_slack() {
+    /* On a multi-stream device the shared HAL counter advances once per
+     * frontend callback for ALL streams (e.g. main@30+sub@30+third@15
+     * => ~2.5 counter steps per main frame — measured on-device). A bind
+     * window of raw kFrameBindSlack steps is sub-frame there and every
+     * latency-carrying bound command expires before drawing (on-device:
+     * bake_skips == frames baked, layers held but never drawn). The
+     * window must scale by the learned steps-per-frame EMA; the ingest
+     * gate's past window scales with it and still rejects long-dead
+     * generations so late_commands keeps meaning. */
+    AiOverlaySubscriber sub(base_cfg());
+    HalFrameBuffer fb = make_frame();
+
+    sub.apply_overlay("main", &fb, 10);
+    sub.apply_overlay("main", &fb, 13); /* steps_per_frame(main)=3:
+                                           slack=2*3=6, past=10*3=30 */
+
+    /* latency-carrying command: 15 is 2 behind anchor 13 but within
+     * 13+6 — admitted (raw-step slack would still admit it, but the
+     * DRAW window below is what raw steps broke) */
+    sub.handle_event("inference/main",
+                     {{"stream_id", "main"}, {"frame_sequence", "15"}},
+                     kZonePayload, "app-1");
+    assert(stats_of(sub, "main").overlay_layer_count == 1);
+    assert(stats_of(sub, "main").overlay_late_commands == 0);
+
+    g_draw_calls = 0;
+    sub.apply_overlay("main", &fb, 16); /* 16 <= 15+6: draws */
+    assert(g_draw_calls == 1);
+    sub.apply_overlay("main", &fb, 20); /* 20 <= 21: still draws */
+    assert(g_draw_calls == 2);
+    sub.apply_overlay("main", &fb, 22); /* 22 > 21: expired, ships clean */
+    assert(g_draw_calls == 2);
+
+    /* far-past dead generation on a faster-paced stream: EMA 30 steps/
+     * frame => past window 300; a command 430 behind the anchor is
+     * late-rejected instead of silently admitted-and-expired */
+    sub.apply_overlay("aux", &fb, 1000);
+    sub.apply_overlay("aux", &fb, 1030);
+    sub.handle_event("inference/aux",
+                     {{"stream_id", "aux"}, {"frame_sequence", "600"}},
+                     kZonePayload, "app-2");
+    assert(stats_of(sub, "aux").overlay_late_commands == 1);
+    assert(stats_of(sub, "aux").overlay_layer_count == 0);
+    std::printf("  case_adaptive_shared_counter_slack ok\n");
+}
+
+static void case_hal_reset_after_restart() {
+    /* A pipeline rebuild (reconfigure) restarts the HAL media context
+     * and RESETS the shared frame counter. Post-Fix-2 the whole bind
+     * path — anchor, bound_seq, the bake site's current_seq — lives in
+     * that counter's space, and note_stream_restart drops the stream's
+     * stale anchor with its layers: a fresh-generation annotation bound
+     * at seq 4 draws on the frames that follow (5..6) and expires past
+     * the slack, instead of fighting the pre-restart 5000. */
+    AiOverlaySubscriber sub(base_cfg());
+    HalFrameBuffer fb = make_frame();
+
+    sub.apply_overlay("main", &fb, 5000); /* pre-restart generation */
+    sub.note_stream_restart("main");
+
+    sub.apply_overlay("main", &fb, 3); /* fresh generation's frame */
+    sub.handle_event("inference/main",
+                     {{"stream_id", "main"}, {"frame_sequence", "4"}},
+                     kZonePayload, "app-1");
+    assert(stats_of(sub, "main").overlay_layer_count == 1);
+    assert(stats_of(sub, "main").overlay_late_commands == 0);
+
+    g_draw_calls = 0;
+    sub.apply_overlay("main", &fb, 5); /* 5 <= 4+2: draws */
+    assert(g_draw_calls == 1);
+    sub.apply_overlay("main", &fb, 6); /* 6 <= 4+2: draws */
+    assert(g_draw_calls == 2);
+    sub.apply_overlay("main", &fb, 9); /* 9 > 4+2: expired, ships clean */
+    assert(g_draw_calls == 2);
+    std::printf("  case_hal_reset_after_restart ok\n");
+}
+
+/* ---------------- Fix-3: strict + app layers ---------------- */
+
+static void case_strict_draws_app_layers_alongside_and_alone() {
+    /* Strict narrows to the platform result's frame lock; app layers
+     * are command-driven and draw in BOTH shapes — on top of the locked
+     * platform layer, and alone when the gate SKIPs because no platform
+     * result exists. (Pre-fix, the strict branch returned right after
+     * the platform half and app annotations never drew: strict=0 vs
+     * non-strict=1.) */
+    AiOverlayConfig cfg = base_cfg();
+    cfg.strict_frame_lock = true;
+    cfg.legacy_auto_bind = true;
+    AiOverlaySubscriber sub(cfg);
+    HalFrameBuffer fb = make_frame();
+
+    /* app layer only: strict SKIPs (no platform layer) yet the app
+     * annotation still draws */
+    sub.handle_event("inference/main", md_stream(), kZonePayload, "app-1");
+    g_draw_calls = 0;
+    sub.apply_overlay("main", &fb, 10);
+    assert(g_draw_calls == 1); /* app drew despite the strict SKIP */
+    assert(stats_of(sub, "main").strict_skips >= 1);
+    assert(stats_of(sub, "main").bake_skips == 0); /* had something to draw */
+
+    /* platform layer arrives: both the locked platform result and the
+     * app annotation draw */
+    sub.handle_event("inference/main", md_stream(), kDetPayload);
+    g_draw_calls = 0;
+    sub.apply_overlay("main", &fb, 11);
+    assert(g_draw_calls == 2); /* locked platform + app on top */
+    std::printf("  case_strict_draws_app_layers_alongside_and_alone ok\n");
+}
+
 int main() {
     case_platform_dropped_by_default();
     case_legacy_auto_bind_admits();
@@ -424,6 +580,10 @@ int main() {
     case_session_end_erases_app_layers();
     case_epoch_reject_and_restart_purge();
     case_late_frame_sequence_rejected();
+    case_dual_stream_shared_hal_counter();
+    case_adaptive_shared_counter_slack();
+    case_hal_reset_after_restart();
+    case_strict_draws_app_layers_alongside_and_alone();
     std::printf("ai_overlay_binding_test: all assertions passed\n");
     return 0;
 }

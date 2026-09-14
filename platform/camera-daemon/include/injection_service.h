@@ -42,6 +42,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "dsp_service.h"
@@ -116,6 +117,13 @@ struct InjectionServiceStatus {
     uint64_t frames_injected = 0; /* taken by the encoder feed             */
     uint64_t frames_dropped = 0;  /* queue-full drops + rejects            */
     uint32_t queue_depth = 0;
+    /* Write-lease snapshot (buffer-release reporting): every registry id
+     * whose pixels the daemon may still read — queued frames plus frames
+     * handed to a bake thread whose compose has not finished. A pool slot
+     * is safe to rewrite only when its id is absent here. Reported on
+     * PushFrame responses and GetInjectionStatus so the SDK can size its
+     * in-flight set without a second RPC channel. */
+    std::vector<uint64_t> in_flight_buffer_ids;
 };
 
 class InjectionService {
@@ -193,6 +201,9 @@ public:
      *  the caller holds it for exactly the duration of the add_buffer use. */
     struct QueuedFrame {
         DspService::BufferPin pin;
+        uint64_t buffer_id = 0;    /* registry id (write-lease key; the bake
+                                      site reports it via note_bake_done
+                                      once the compose has finished)       */
         uint32_t width = 0;        /* injected content dims                */
         uint32_t height = 0;
         uint32_t stride = 0;
@@ -238,6 +249,19 @@ public:
     bool take_frame(const std::string& stream_name, uint32_t width,
                     uint32_t height, uint64_t frame_ts_ns, QueuedFrame& out);
 
+    /**
+     * Bake-completion ack (write-lease release): the bake site calls this
+     * with the QueuedFrame's buffer_id once its compose has finished and
+     * the frame's pixels are no longer read. Until then the id stays in
+     * status().in_flight_buffer_ids and the SDK must not rewrite the
+     * slot. Idempotent and safe for unknown ids (a dropped or already
+     * flushed frame reports nothing new). take_frame() itself inserts
+     * the id into the in-flight set, so a bake site that skips this call
+     * only makes the SDK conservative (slot never recycled), never
+     * corrupt — the wrong-direction failure is a leak, not a tear.
+     */
+    void note_bake_done(uint64_t buffer_id);
+
 private:
     /* caller holds mu_ */
     void close_session_locked(const char* why);
@@ -252,6 +276,15 @@ private:
 
     mutable std::mutex mu_;
     std::deque<QueuedFrame> queue_;
+    /* Write-lease half beyond the queue: ids handed to a bake thread via
+     * take_frame() whose note_bake_done() has not landed yet. Deliberately
+     * NOT cleared by close_session_locked(): a compose already handed out
+     * outlives the session (EOS/owner-disconnect can land mid-bake), and
+     * its pin is owned by the bake site's scope — only note_bake_done()
+     * clears the id, so a close can never make the SDK recycle a slot
+     * the daemon is still reading. Worst case of a missing ack is a
+     * leaked lease (visible, blocking), never a torn frame. */
+    std::unordered_set<uint64_t> baking_ids_;
     bool session_active_ = false;
     InjectionMode session_mode_ = InjectionMode::Replace;
     int session_owner_fd_ = -1;

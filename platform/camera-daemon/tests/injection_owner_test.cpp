@@ -21,6 +21,7 @@
  * pushes in production (injection_service.cpp:188 vs the argb path).
  */
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdint>
@@ -168,9 +169,66 @@ int main() {
         assert(st.session_id.empty());
     }
 
+    /* 7. Write-lease in-flight set (Fix-1): status() reports queued +
+     * mid-bake ids; take_frame moves the chosen id queue->baking;
+     * note_bake_done releases it. A session close (EOS) that lands
+     * mid-bake keeps the baking id reported — the SDK must not recycle
+     * a slot the daemon is still reading. */
+    {
+        const uint64_t pool[3] = {import_argb(dsp, 9), import_argb(dsp, 9),
+                                  import_argb(dsp, 9)};
+
+        /* All queued: the snapshot lists every id exactly once. */
+        for (int i = 0; i < 3; ++i)
+            assert(push_overlay(inj, pool[i]).rc == INJ_SVC_OK);
+        InjectionServiceStatus st = inj.status();
+        assert(st.in_flight_buffer_ids.size() == 3);
+        for (int i = 0; i < 3; ++i)
+            assert(std::count(st.in_flight_buffer_ids.begin(),
+                              st.in_flight_buffer_ids.end(),
+                              pool[i]) == 1);
+
+        /* Newest-due-wins take: the two superseded older frames drop
+         * out of the set; the chosen one MOVES to baking — still
+         * in flight until the bake site acks. */
+        InjectionService::QueuedFrame qf;
+        assert(inj.take_frame("sub", 64, 64, 0, qf));
+        assert(qf.buffer_id == pool[2]);
+        st = inj.status();
+        assert(st.in_flight_buffer_ids.size() == 1);
+        assert(st.in_flight_buffer_ids[0] == pool[2]);
+        assert(st.frames_injected == 1);
+        assert(st.frames_dropped == 2);
+
+        /* Bake-done ack: the slot becomes reusable. */
+        inj.note_bake_done(qf.buffer_id);
+        assert(inj.status().in_flight_buffer_ids.empty());
+
+        /* EOS landing mid-bake: the queued frame flushes out of the
+         * set, but a compose already handed out stays reported until
+         * its own ack (wrong-direction safety: leak, never a tear). */
+        assert(push_overlay(inj, pool[0]).rc == INJ_SVC_OK);
+        InjectionService::QueuedFrame mid;
+        assert(inj.take_frame("sub", 64, 64, 0, mid));
+        assert(push_overlay(inj, pool[1]).rc == INJ_SVC_OK);
+        InjectionFrameDesc eos;
+        eos.end_of_stream = true;
+        assert(inj.push_frame(eos).rc == INJ_SVC_OK);
+        st = inj.status();
+        assert(!st.active);
+        assert(st.in_flight_buffer_ids.size() == 1); /* mid-bake only */
+        assert(st.in_flight_buffer_ids[0] == mid.buffer_id);
+        inj.note_bake_done(mid.buffer_id);
+        assert(inj.status().in_flight_buffer_ids.empty());
+
+        /* Ack of an unknown id is a harmless no-op. */
+        inj.note_bake_done(0xdeadbeefULL);
+    }
+
     inj.stop();
     dsp.release_client_buffers(7);
     dsp.release_client_buffers(8);
+    dsp.release_client_buffers(9);
     dsp.stop();
 
     std::printf("injection_owner_test: all assertions passed\n");

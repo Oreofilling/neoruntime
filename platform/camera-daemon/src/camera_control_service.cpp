@@ -2072,6 +2072,20 @@ CameraControlServiceImpl::~CameraControlServiceImpl() {
 // end_of_stream request closes the session, a clean half-close without
 // one keeps it.
 
+namespace {
+/* Write-lease reporting (Fix-1): mirror InjectionServiceStatus's
+ * in-flight snapshot (queued + mid-bake registry ids) into a response.
+ * Works for both PushFrameResponse and InjectionStatusResponse — the
+ * field name/number are identical by design. Old SDKs ignore the
+ * unknown field; the SDK detects the protocol via
+ * InjectionStatusResponse.reports_in_flight_buffers. */
+template <typename ResponseT>
+void fill_in_flight(const InjectionServiceStatus& st, ResponseT* response) {
+    for (uint64_t id : st.in_flight_buffer_ids)
+        response->add_in_flight_buffer_ids(id);
+}
+} // namespace
+
 grpc::Status CameraControlServiceImpl::PushFrame(
     grpc::ServerContext* context,
     const aipc::camera::PushFrameRequest* request,
@@ -2115,6 +2129,9 @@ grpc::Status CameraControlServiceImpl::PushFrame(
                                                       * caller's tag for
                                                       * correlating this
                                                       * reply, "" untagged */
+    /* Post-push lease snapshot: this frame's id is in the set (queued);
+     * ids absent since the last response are free to rewrite. */
+    fill_in_flight(inj->status(), response);
 
     /* Per-frame RPC: log rejections only — session open/close is already
      * INFO-logged inside InjectionService, and a per-accept INFO line would
@@ -2195,6 +2212,7 @@ grpc::Status CameraControlServiceImpl::PushFrameStream(
             response->set_error_code(res.rc);
             response->set_accepted_frame_count(accepted);
             response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
             return grpc::Status::OK;
         }
         if (desc.end_of_stream) {
@@ -2203,6 +2221,7 @@ grpc::Status CameraControlServiceImpl::PushFrameStream(
             response->set_message(res.message);
             response->set_accepted_frame_count(accepted);
             response->set_session_id(last_session_id);
+            fill_in_flight(inj->status(), response);
             return grpc::Status::OK;
         }
         ++accepted;
@@ -2213,6 +2232,11 @@ grpc::Status CameraControlServiceImpl::PushFrameStream(
     response->set_message("client half-close: injection session kept open");
     response->set_accepted_frame_count(accepted);
     response->set_session_id(last_session_id);
+    /* Final-response snapshot only: client-streaming has no per-frame
+     * acks, so a lease-aware SDK paces the generator on
+     * GetInjectionStatus polling instead (the snapshot field exists on
+     * both messages for exactly that reason). */
+    fill_in_flight(inj->status(), response);
     return grpc::Status::OK;
 }
 
@@ -2245,6 +2269,11 @@ grpc::Status CameraControlServiceImpl::GetInjectionStatus(
     response->set_frames_dropped(st.frames_dropped);
     response->set_queue_depth(st.queue_depth);
     response->set_session_id(st.session_id);
+    fill_in_flight(st, response);
+    /* Capability flag: this daemon speaks the write-lease protocol. A
+     * lease-aware SDK that sees false (old daemon) falls back to
+     * depth-only pacing guidance and warns once. */
+    response->set_reports_in_flight_buffers(true);
     return grpc::Status::OK;
 }
 
@@ -2282,5 +2311,10 @@ grpc::Status CameraControlServiceImpl::StopInjection(
     response->set_queue_depth(st.queue_depth);
     response->set_session_id(st.session_id); /* "" here: close clears the
                                               * tag with the session */
+    /* Post-flush lease snapshot: queue ids are gone; any remaining ids
+     * are mid-bake composes the daemon is still reading — the SDK must
+     * not recycle those pool slots yet. */
+    fill_in_flight(st, response);
+    response->set_reports_in_flight_buffers(true);
     return grpc::Status::OK;
 }

@@ -333,6 +333,21 @@ void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
     // "no sequence authority here" (tests, odd call sites) — no anchor.
     if (frame != nullptr && current_seq > 0) {
         std::lock_guard<std::mutex> anchor_lock(results_mu_);
+        auto prev = last_seen_seq_.find(stream_name);
+        if (prev != last_seen_seq_.end() && prev->second > 0 &&
+            current_seq > prev->second && current_seq - prev->second < 1024) {
+            // Learn the counter distance between this stream's consecutive
+            // frames: the shared HAL counter advances once per frontend
+            // callback across ALL streams, so this distance (not 1) is how
+            // many steps one display frame is worth here.
+            const double delta =
+                static_cast<double>(current_seq - prev->second);
+            auto ema = steps_per_frame_.find(stream_name);
+            if (ema == steps_per_frame_.end())
+                steps_per_frame_[stream_name] = delta;
+            else
+                ema->second = 0.7 * ema->second + 0.3 * delta;
+        }
         last_seen_seq_[stream_name] = current_seq;
     }
 
@@ -390,45 +405,107 @@ void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
         draw_result_polygons(sr.polygons, frame, config_.draw_ops, draw_labels);
     };
 
+    // Collect the drawable layers routed onto this display stream, split
+    // app/platform, applying the TTL and frame-binding windows. Shared by
+    // the strict branch (app half only — plat_out may be null) and the
+    // multi-layer path below: one set of expiry rules, two compositions.
+    // App layers come back newest-first; platform layers keep storage
+    // order. `now` is refreshed by the caller after any bounded wait (the
+    // strict gate parks) so ages are measured against post-wait time.
+    auto now = std::chrono::steady_clock::now();
+    auto collect_fresh_layers = [&](std::vector<Layer*>& app_out,
+                                    std::vector<Layer*>* plat_out,
+                                    bool* have_unbound_app) {
+        if (have_unbound_app) *have_unbound_app = false;
+        for (const std::string& key : routed_keys(stream_name, config_)) {
+            auto lit = results_.find(key);
+            if (lit == results_.end()) continue;
+            for (Layer& l : lit->second) {
+                if (!l.sr.valid) continue;
+                const uint32_t ttl_ms =
+                    resolve_result_ttl_ms(l.sr.ttl_ms, stream_name, config_);
+                const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - l.sr.last_update_time);
+                if (age > std::chrono::milliseconds(ttl_ms)) {
+                    l.sr.valid = false;  // expired: drops out until re-seeded
+                    continue;
+                }
+                // Frame-bound layer: draws only while the bake site is at or
+                // before bound_seq + slack — past that the command is from a
+                // dead frame generation. Validity is untouched here: binding
+                // expiry governs drawing, TTL governs storage. The slack is
+                // in HAL-counter steps scaled to display frames (see
+                // bind_slack_steps): a shared multi-stream counter makes raw
+                // steps sub-frame.
+                if (l.bound && current_seq != 0 &&
+                    current_seq > l.bound_seq + bind_slack_steps(stream_name)) {
+                    continue;
+                }
+                if (l.is_app) {
+                    app_out.push_back(&l);
+                    if (have_unbound_app && !l.bound) *have_unbound_app = true;
+                } else if (plat_out) {
+                    plat_out->push_back(&l);
+                }
+            }
+        }
+        std::sort(app_out.begin(), app_out.end(),
+                  [](const Layer* a, const Layer* b) {
+                      return a->sr.last_update_time > b->sr.last_update_time;
+                  });
+    };
+
     bool skip_ttl = false;
     if (strict) {
-        // Strict keeps single-source identity semantics — one layer, one
-        // draw — and owns its own bake-skip / TTL accounting.
+        // Strict frame-locks the stream's own platform result (the gate
+        // below); app layers are not part of that lock — they are
+        // command-driven and TTL-governed — so they draw in BOTH shapes:
+        // on top of the locked platform layer, or alone when the gate
+        // SKIPs / the locked result aged out. Strict never suppresses the
+        // locked platform layer (the frame-sync guarantee is the point of
+        // the mode) and never admits cross-fed platform layers (the
+        // multi-layer path's plat half stays closed here).
         Layer* gated = strict_gate(lock, stream_name, frame, strict_wait_cap_ms,
                                    &skip_ttl);
-        if (gated == nullptr) {
-            // Bake skip #1: strict SKIP — the frame ships clean. Strict
-            // SKIPs are also tallied in strict_skips; bake_skips is the
-            // layer-neutral observable the encode side reconciles against.
+        now = std::chrono::steady_clock::now();  // post-wait age base
+        StreamResult* locked_sr = nullptr;
+        if (gated != nullptr) {
+            StreamResult& sr = gated->sr;
+            if (!skip_ttl) {
+                const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     now - sr.last_update_time);
+                // Validity window is per-stream resolvable: event override >
+                // stream override > global config > 2x frame period >
+                // fallback; stream_name is the display stream. LOCK_* draws
+                // skip it: the result belongs to this exact frame, so its
+                // age is the inference latency, not staleness.
+                const uint32_t ttl_ms =
+                    resolve_result_ttl_ms(sr.ttl_ms, stream_name, config_);
+                if (age > std::chrono::milliseconds(ttl_ms)) {
+                    sr.valid = false;  // degraded: app half may still draw
+                } else {
+                    locked_sr = &sr;
+                }
+            } else {
+                locked_sr = &sr;
+            }
+        }
+        std::vector<Layer*> app_layers;
+        collect_fresh_layers(app_layers, nullptr, nullptr);
+        if (locked_sr == nullptr && app_layers.empty()) {
+            // Bake skip #1: strict SKIP / degraded with nothing else to
+            // draw — the frame ships clean. Strict SKIPs are also tallied
+            // in strict_skips; bake_skips is the layer-neutral observable
+            // the encode side reconciles against.
             ++stream_stats_[stream_name].bake_skips;
             return;
-        }
-        StreamResult& sr = gated->sr;
-        if (!skip_ttl) {
-            const auto now = std::chrono::steady_clock::now();
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 now - sr.last_update_time);
-            // Validity window is per-stream resolvable: event override >
-            // stream override > global config > 2x frame period > fallback.
-            // stream_name is the display stream — the same key
-            // stream_result_ttls / stream_fps are configured by.
-            // LOCK_* draws skip it: the result belongs to this exact
-            // frame, so its age is the inference latency, not staleness.
-            const uint32_t ttl_ms =
-                resolve_result_ttl_ms(sr.ttl_ms, stream_name, config_);
-            if (age > std::chrono::milliseconds(ttl_ms)) {
-                sr.valid = false;
-                // Bake skip #2: the freshest stored result aged out — the
-                // frame ships clean rather than drawing stale boxes.
-                ++stream_stats_[stream_name].bake_skips;
-                return;
-            }
         }
         if (!config_.draw_ops) {
             warn_no_draw_ops();
             return;
         }
-        draw_layer(sr);
+        if (locked_sr != nullptr) draw_layer(*locked_sr);
+        for (const Layer* l : app_layers) draw_layer(l->sr);
         return;
     }
 
@@ -447,36 +524,7 @@ void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
     // instead (they decorate a specific frame, not the stream).
     std::vector<Layer*> app_fresh, plat_fresh;
     bool have_fresh_app_suppressor = false;
-    const auto now = std::chrono::steady_clock::now();
-    for (const std::string& key : routed_keys(stream_name, config_)) {
-        auto lit = results_.find(key);
-        if (lit == results_.end()) continue;
-        for (Layer& l : lit->second) {
-            if (!l.sr.valid) continue;
-            const uint32_t ttl_ms =
-                resolve_result_ttl_ms(l.sr.ttl_ms, stream_name, config_);
-            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 now - l.sr.last_update_time);
-            if (age > std::chrono::milliseconds(ttl_ms)) {
-                l.sr.valid = false;  // expired: drops out until re-seeded
-                continue;
-            }
-            // Frame-bound layer: draws only while the bake site is at or
-            // before bound_seq + slack — past that the command is from a
-            // dead frame generation. Validity is untouched here: binding
-            // expiry governs drawing, TTL governs storage.
-            if (l.bound && current_seq != 0 &&
-                current_seq > l.bound_seq + kFrameBindSlack) {
-                continue;
-            }
-            if (l.is_app) {
-                app_fresh.push_back(&l);
-                if (!l.bound) have_fresh_app_suppressor = true;
-            } else {
-                plat_fresh.push_back(&l);
-            }
-        }
-    }
+    collect_fresh_layers(app_fresh, &plat_fresh, &have_fresh_app_suppressor);
 
     if (app_fresh.empty() && plat_fresh.empty()) {
         // Bake skip #1 (layer path): nothing drawable — the frame ships
@@ -494,10 +542,6 @@ void AiOverlaySubscriber::apply_overlay(const std::string& stream_name,
     // Fixed draw order: app layers newest-first, then platform layers in
     // storage order (suppressed while a fresh unbound app layer owns the
     // stream).
-    std::sort(app_fresh.begin(), app_fresh.end(),
-              [](const Layer* a, const Layer* b) {
-                  return a->sr.last_update_time > b->sr.last_update_time;
-              });
     for (const Layer* l : app_fresh) draw_layer(l->sr);
     if (!have_fresh_app_suppressor) {
         for (const Layer* l : plat_fresh) draw_layer(l->sr);
@@ -732,6 +776,18 @@ size_t AiOverlaySubscriber::polygon_count(const std::string& stream_id) const {
     return n;
 }
 
+uint64_t AiOverlaySubscriber::bind_slack_steps(const std::string& stream) const {
+    auto it = steps_per_frame_.find(stream);
+    const uint64_t spf = it == steps_per_frame_.end() ? 1 : std::max<uint64_t>(1, static_cast<uint64_t>(it->second + 0.5));
+    return kFrameBindSlack * spf;
+}
+
+uint64_t AiOverlaySubscriber::bind_past_steps(const std::string& stream) const {
+    auto it = steps_per_frame_.find(stream);
+    const uint64_t spf = it == steps_per_frame_.end() ? 1 : std::max<uint64_t>(1, static_cast<uint64_t>(it->second + 0.5));
+    return kFrameBindPastFrames * spf;
+}
+
 void AiOverlaySubscriber::note_stream_restart(const std::string& stream) {
     std::lock_guard<std::mutex> lock(results_mu_);
     // Ensure seeded, then bump: results and commands of the old generation
@@ -740,6 +796,16 @@ void AiOverlaySubscriber::note_stream_restart(const std::string& stream) {
     lazy_stream_epoch(stream_epochs_, stream);
     ++stream_epochs_[stream];
     results_.erase(stream);
+    // The late-command anchor belongs to the same generation: a pipeline
+    // rebuild can reset the HAL counter to small values while a surviving
+    // stale anchor would (a) wrongly admit nothing and (b) expire every
+    // newly bound layer against the wrong window. Dropping it returns the
+    // stream to the no-authority state until the next bake re-seeds it.
+    last_seen_seq_.erase(stream);
+    // The frame pace is equally generation-bound: the rebuilt pipeline may
+    // run a different stream set, so the old steps-per-frame EMA would
+    // mis-scale the bind window until re-learned.
+    steps_per_frame_.erase(stream);
     result_cv_.notify_all();
 }
 
@@ -896,10 +962,17 @@ void AiOverlaySubscriber::handle_event(
             // a command for a dead frame generation (sequence restarted
             // or raced ahead). Judged only when an anchor exists — before
             // the first bake the daemon has no authority to call it late.
+            // The window is symmetric in display frames: too-future
+            // commands (beyond the bind slack) and long-dead commands
+            // (older than kFrameBindPastFrames frames of latency budget)
+            // are both rejected, so late_commands keeps meaning "the
+            // pipeline is nowhere near that frame" while results that
+            // merely carry a few frames of inference latency pass.
             if (have_cmd_seq) {
                 auto anc = last_seen_seq_.find(stream_id);
                 if (anc != last_seen_seq_.end() && anc->second > 0 &&
-                    cmd_seq > anc->second + kFrameBindSlack) {
+                    (cmd_seq > anc->second + bind_slack_steps(stream_id) ||
+                     cmd_seq + bind_past_steps(stream_id) < anc->second)) {
                     ++stream_stats_[stream_id].late_commands;
                     return;
                 }
