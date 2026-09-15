@@ -585,6 +585,87 @@ bool repack_nv12_planes(const ReceivedFrame& f,
                               out, why);
 }
 
+// ─── P1-2: buffer_id direct-bind ─────────────────────────────────────────────
+
+// Borrowed resources behind a direct-bound input frame. The registry lease
+// and the dup'd plane fds must outlive the NPU read, so ownership rides with
+// the request (Infer: on_complete lambda capture; InferBatch: the item ctx)
+// and this destructor returns everything exactly once.
+struct DmaInputLease {
+    ModelManager*                  mgr = nullptr;  // free_tensor for bound inputs
+    std::vector<HalTensor>         bound;          // canonical priv owners
+    std::vector<int>               fds;            // dup'd plane fds from lookup()
+    BufferLookupClient*            lookup = nullptr;
+    std::vector<uint64_t>          buffer_ids;     // pinned registry ids
+    ~DmaInputLease() {
+        if (mgr)
+            for (auto& t : bound) mgr->free_tensor(&t);
+        for (int fd : fds) close(fd);
+        if (lookup)
+            for (uint64_t id : buffer_ids) lookup->release(id);
+    }
+};
+
+// Try fd direct-bind for a Tensor.buffer_id input. When the looked-up frame
+// is a compact NV12 dmabuf whose geometry matches the model's first input,
+// bind_dma_frame() returns a zero-CPU-copy tensor and the mmap+memcpy repack
+// is skipped entirely. Any contract mismatch (padding, geometry, format)
+// returns false and the caller falls back to the repack unchanged. On
+// success `lease` accumulates the borrowed fds + registry pin; the caller
+// must keep it alive until the inference has completed.
+bool try_bind_dma_input(HalInferenceSession* sess, ModelManager* mgr,
+                        const BufferLookupClient::LookupResult& r,
+                        uint64_t buffer_id, BufferLookupClient* lookup,
+                        HalTensor& ht, std::shared_ptr<DmaInputLease>& lease) {
+    constexpr uint32_t kHalPixFmtNv12 = 0;  // HalPixelFormat NV12
+    if (!sess || !mgr || r.format != kHalPixFmtNv12 ||
+        r.width == 0 || r.height == 0 || r.fds.empty())
+        return false;
+    const HalInferenceOps* ops = mgr->infer_ops();
+    if (!ops || !ops->bind_dma_frame)
+        return false;
+
+    HalDmaFrameDesc desc{};
+    desc.format   = HAL_PIX_FMT_NV12;
+    desc.width    = r.width;
+    desc.height   = r.height;
+    desc.borrowed = 1;  // fds stay owned by the lease
+    const uint32_t rows[HAL_MAX_PLANES] = {r.height, r.height / 2, 0};
+    for (uint32_t p = 0; p < r.num_planes && p < HAL_MAX_PLANES; p++) {
+        desc.fd[p]         = r.fds[p];
+        desc.offset[p]     = 0;  // registry plane fds are whole dmabufs
+        desc.stride[p]     = r.strides[p];
+        desc.bytes_used[p] = (uint64_t)r.strides[p] * rows[p];
+    }
+    for (uint32_t p = r.num_planes < HAL_MAX_PLANES ? r.num_planes : HAL_MAX_PLANES;
+         p < HAL_MAX_PLANES; p++)
+        desc.fd[p] = -1;
+    if (r.num_planes == 1)
+        desc.bytes_used[0] = (uint64_t)r.width * r.height * 3 / 2;
+
+    HalTensor bound{};
+    if (ops->bind_dma_frame(sess, &desc, &bound) != HAL_OK)
+        return false;  // off-contract → repack fallback, fds still ours to close
+
+    static std::atomic<bool> s_bind_logged{false};
+    if (!s_bind_logged.exchange(true))
+        LOG_INFO("buffer_id direct-bind engaged (%ux%u NV12, zero repack)",
+                 (unsigned)r.width, (unsigned)r.height);
+
+    ht = bound;
+    if (!lease) {
+        lease         = std::make_shared<DmaInputLease>();
+        lease->mgr    = mgr;
+        lease->lookup = lookup;
+    }
+    lease->bound.push_back(bound);
+    // fd ownership moves into the lease: the descriptor copied the fd NUMBERS,
+    // the lease closes them after the NPU read completes.
+    lease->fds.insert(lease->fds.end(), r.fds.begin(), r.fds.end());
+    lease->buffer_ids.push_back(buffer_id);
+    return true;
+}
+
 }  // namespace
 
 // ─── Infer (synchronous single-shot) ─────────────────────────────────────────
@@ -654,6 +735,9 @@ grpc::Status AIRuntimeServiceImpl::Infer(
     // and invalidate previously stored data() pointers.
     auto input_data_holder = std::make_shared<std::vector<std::string>>();
     input_data_holder->resize(num_inputs);
+    // P1-2: owns borrowed fds + registry pins for direct-bound buffer_id
+    // inputs; captured by on_complete so they outlive the NPU read.
+    std::shared_ptr<DmaInputLease> dma_lease;
     auto input_tensors = std::make_shared<std::vector<HalTensor>>(num_inputs);
     for (int i = 0; i < num_inputs; i++) {
         auto& pb_t = req->inputs(i);
@@ -687,26 +771,39 @@ grpc::Status AIRuntimeServiceImpl::Infer(
                 return grpc::Status::OK;
             }
             std::string why;
-            bool repacked = repack_nv12_planes(lr, (*input_data_holder)[i], why);
-            for (int fd : lr.fds) close(fd);
-            // Lease dropped once our own copy exists (or cannot be made).
-            buffer_lookup_->release(pb_t.buffer_id());
-            if (!repacked) {
-                resp->mutable_status()->set_success(false);
-                resp->mutable_status()->set_message(
-                    "Tensor.buffer_id repack failed: " + why);
-                return grpc::Status::OK;
+            // P1-2: fd direct-bind first — a compact layout matching the
+            // model's first input skips the mmap+memcpy repack entirely
+            // (bind_dma_frame validates the contract; padding / geometry
+            // mismatch / non-NV12 falls through to the repack unchanged).
+            // First input only: bind_dma_frame validates against input 0.
+            const bool bound = i == 0 &&
+                try_bind_dma_input(snap->infer_session, model_mgr_, lr,
+                                   pb_t.buffer_id(), buffer_lookup_, ht,
+                                   dma_lease);
+            if (!bound) {
+                bool repacked = repack_nv12_planes(lr, (*input_data_holder)[i], why);
+                for (int fd : lr.fds) close(fd);
+                // Lease dropped once our own copy exists (or cannot be made).
+                buffer_lookup_->release(pb_t.buffer_id());
+                if (!repacked) {
+                    resp->mutable_status()->set_success(false);
+                    resp->mutable_status()->set_message(
+                        "Tensor.buffer_id repack failed: " + why);
+                    return grpc::Status::OK;
+                }
+                const uint32_t w = lr.width, h = lr.height;
+                ht.data      = const_cast<char*>((*input_data_holder)[i].data());
+                ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+                ht.dma_fd    = -1;
+                // Geometry comes from the daemon's registry, not the wire, so a
+                // mismatched client-declared shape never reaches the NPU.
+                ht.dtype     = HAL_DTYPE_UINT8;
+                ht.ndim      = 2;
+                ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+                ht.shape[1]  = static_cast<int32_t>(w);
             }
-            const uint32_t w = lr.width, h = lr.height;
-            ht.data      = const_cast<char*>((*input_data_holder)[i].data());
-            ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
-            ht.dma_fd    = -1;
-            // Geometry comes from the daemon's registry, not the wire, so a
-            // mismatched client-declared shape never reaches the NPU.
-            ht.dtype     = HAL_DTYPE_UINT8;
-            ht.ndim      = 2;
-            ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
-            ht.shape[1]  = static_cast<int32_t>(w);
+            // dtype/shape/byte_size of a bound tensor come from
+            // bind_dma_frame (desc-derived); both arms carry frame geometry.
             frame_geometry = true;
         } else {
             // Assign to pre-allocated slot — no reallocation
@@ -737,7 +834,7 @@ grpc::Status AIRuntimeServiceImpl::Infer(
 
     inf_req->on_complete = [this, promise, response_ptr, post_session,
                             enable_post, model_id, infer_session,
-                            input_tensors, session_id](
+                            input_tensors, session_id, dma_lease](
         int rc, HalTensor* outputs, int num_outputs,
         uint64_t infer_us, uint64_t queue_us,
         bool model_acquired) {
@@ -866,6 +963,9 @@ struct InferBatchItemCtx {
     pb::InferResponse              response;
     std::vector<std::string>       input_data;   // owns CPU input payloads
     std::vector<HalTensor>         inputs;        // inputs[k].data -> input_data[k] or dma_fd
+    // P1-2: borrowed fds + registry pins for direct-bound buffer_id inputs;
+    // freed when the last ctx reference drops (late callbacks included).
+    std::shared_ptr<struct DmaInputLease> dma_lease;
     std::vector<HalTensor>         outputs;       // HAL-align output buffers (priv-owned)
     int                            max_outputs = 0;
     std::optional<ModelSnapshot>   snap;
@@ -1238,24 +1338,35 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
                     break;
                 }
                 std::string why;
-                bool repacked = repack_nv12_planes(lr, c->input_data[j], why);
-                for (int fd : lr.fds) close(fd);
-                // Lease dropped once our own copy exists (or cannot be made).
-                buffer_lookup_->release(pb_t.buffer_id());
-                if (!repacked) {
-                    item_failed = true;
-                    fail_msg = "Tensor.buffer_id repack failed: " + why;
-                    break;
+                // P1-2: fd direct-bind first (first input, single-frame
+                // models only — NPU-batch grouping needs contiguous CPU
+                // frames). Off-contract frames repack as before.
+                const bool bound = j == 0 && c->snap->batch_size == 1 &&
+                    try_bind_dma_input(c->snap->infer_session, model_mgr_, lr,
+                                       pb_t.buffer_id(), buffer_lookup_, ht,
+                                       c->dma_lease);
+                if (!bound) {
+                    bool repacked = repack_nv12_planes(lr, c->input_data[j], why);
+                    for (int fd : lr.fds) close(fd);
+                    // Lease dropped once our own copy exists (or cannot be made).
+                    buffer_lookup_->release(pb_t.buffer_id());
+                    if (!repacked) {
+                        item_failed = true;
+                        fail_msg = "Tensor.buffer_id repack failed: " + why;
+                        break;
+                    }
+                    const uint32_t w = lr.width, h = lr.height;
+                    ht.data      = const_cast<char*>(c->input_data[j].data());
+                    ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
+                    ht.dma_fd    = -1;
+                    // Geometry comes from the daemon's registry, not the wire.
+                    ht.dtype     = HAL_DTYPE_UINT8;
+                    ht.ndim      = 2;
+                    ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
+                    ht.shape[1]  = static_cast<int32_t>(w);
                 }
-                const uint32_t w = lr.width, h = lr.height;
-                ht.data      = const_cast<char*>(c->input_data[j].data());
-                ht.byte_size = static_cast<uint32_t>(w) * h * 3 / 2;
-                ht.dma_fd    = -1;
-                // Geometry comes from the daemon's registry, not the wire.
-                ht.dtype     = HAL_DTYPE_UINT8;
-                ht.ndim      = 2;
-                ht.shape[0]  = static_cast<int32_t>(h * 3 / 2);
-                ht.shape[1]  = static_cast<int32_t>(w);
+                // dtype/shape/byte_size of a bound tensor come from
+                // bind_dma_frame; both arms carry frame geometry.
                 frame_geometry = true;
             } else {
                 c->input_data[j].assign(pb_t.data().data(), pb_t.data().size());

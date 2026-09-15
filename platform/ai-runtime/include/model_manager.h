@@ -159,6 +159,11 @@ public:
 
     bool has_post_ops() const;
 
+    /// HAL inference ops table — for service-layer tensor manipulation that
+    /// needs ops beyond the wrapped helpers (e.g. bind_dma_frame on
+    /// buffer_id inputs). May be null only before load.
+    const HalInferenceOps* infer_ops() const { return infer_ops_; }
+
     /// Check if HAL supports async inference (run_async != nullptr).
     bool has_async() const;
 
