@@ -1,6 +1,7 @@
 #include "grpc_service.h"
 #include "log.h"
 #include "common.h"
+#include "dsp_client.h"
 
 #include "hal_inference.h"
 #include "hal_postprocess.h"
@@ -29,6 +30,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     BufferLookupClient* buffer_lookup,
     EventBusClient* event_bus,
     PostprocessPool* postprocess_pool,
+    DspClient* dsp_client,
     const HalClipTextEncoderOps* clip_enc_ops,
     const HalGenaiOps* genai_ops)
     : cfg_(cfg)
@@ -39,6 +41,7 @@ AIRuntimeServiceImpl::AIRuntimeServiceImpl(
     , buffer_lookup_(buffer_lookup)
     , event_bus_(event_bus)
     , postprocess_pool_(postprocess_pool)
+    , dsp_client_(dsp_client)
     , clip_enc_ops_(clip_enc_ops)
     , genai_ops_(genai_ops) {}
 
@@ -1729,6 +1732,48 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                  stream_id.c_str());
     }
 
+    // ── 级2 DSP preprocess pool (P1-3, opt-in via cfg.stream_dsp_preprocess) ──
+    // Frames whose geometry does not match the model input are resized on the
+    // camera-daemon DSP into this private model-geometry pool and fd-bound
+    // (zero CPU pixel copies) — the case that today dies at the HAL input
+    // size check (-2811) after a wasted repack. Matching-geometry frames keep
+    // the CPU repack path for now (their direct bind is P1-4). The pool is
+    // destroyed at stream exit AFTER the bounded drain below; leases that
+    // outlive a drain timeout self-clean (see StreamPreprocessPool).
+    std::optional<StreamPreprocessPool> dsp_pool_storage;
+    StreamPreprocessPool* dsp_pool = nullptr;
+    if (cfg_.stream_dsp_preprocess && dsp_client_ && fd_path) {
+        const auto& mi = snap->model_info;
+        // Model input geometry is only trusted when the NV12 reconciliation
+        // in the HAL left an unambiguous shape[1]/shape[2] that multiplies
+        // out to byte_size (guards against odd metadata → wrong pool size).
+        if (mi.num_inputs >= 1 && mi.inputs[0].is_nv12 &&
+            mi.inputs[0].ndim >= 4 &&
+            mi.inputs[0].shape[1] > 0 && mi.inputs[0].shape[2] > 0 &&
+            static_cast<uint64_t>(static_cast<uint64_t>(mi.inputs[0].shape[2]) *
+                                  static_cast<uint64_t>(mi.inputs[0].shape[1]) *
+                                  3 / 2) ==
+                static_cast<uint64_t>(mi.inputs[0].byte_size)) {
+            const uint32_t model_in_w = static_cast<uint32_t>(mi.inputs[0].shape[2]);
+            const uint32_t model_in_h = static_cast<uint32_t>(mi.inputs[0].shape[1]);
+            dsp_pool_storage.emplace(*dsp_client_, model_mgr_,
+                                     cfg_.stream_preprocess_job_ms);
+            if (dsp_pool_storage->init(model_in_w, model_in_h,
+                                       cfg_.stream_preprocess_slots) == 0 &&
+                dsp_pool_storage->usable()) {
+                dsp_pool = &*dsp_pool_storage;
+                LOG_INFO("StreamInfer: dsp preprocess armed (model %ux%u NV12, "
+                         "%u slot(s), timeout %ums)",
+                         (unsigned)model_in_w, (unsigned)model_in_h,
+                         (unsigned)cfg_.stream_preprocess_slots,
+                         (unsigned)cfg_.stream_preprocess_job_ms);
+            } else {
+                LOG_WARN("StreamInfer: dsp preprocess pool unusable (alloc or "
+                         "layout); mismatched frames fall back to repack");
+            }
+        }
+    }
+
     // FPS interval
     auto fps = req->fps_limit() > 0 ? req->fps_limit() : 30;
     auto frame_interval = Milliseconds(1000 / fps);
@@ -1775,6 +1820,37 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 continue;
             }
 
+            const int num_inputs = 1;
+            HalTensor inputs[1] = {};
+
+            // ── Input preparation: 级2 DSP arm or CPU repack ──
+            // Geometry-mismatched NV12 frames take the DSP private-pool path:
+            // DSP_IMPORT the source, RESIZE into a free model-geometry slot
+            // (BACKGROUND priority), fd-bind the slot — zero CPU pixel
+            // copies, and the source frame returns to the camera pool right
+            // after the resize instead of riding the request. Any DSP step
+            // failure falls back to the repack below with the source frame
+            // still held (= pre-P1-3 behavior for that frame). Matching
+            // geometry keeps the repack path; its direct bind is P1-4.
+            constexpr uint32_t kStreamPixFmtNv12 = 0;  // HalPixelFormat NV12
+            std::shared_ptr<StreamPreprocessPool::SlotLease> pp_lease;
+            bool dsp_arm = false;
+            bool early_released = false;  // source frame already returned
+            uint64_t dsp_us = 0;
+            if (dsp_pool && frame.format == kStreamPixFmtNv12 &&
+                (frame.width != dsp_pool->width() ||
+                 frame.height != dsp_pool->height())) {
+                pp_lease = dsp_pool->prepare(frame, &dsp_us);
+                if (pp_lease) {
+                    if (dsp_pool->bind(snap->infer_session, pp_lease.get(),
+                                       &inputs[0])) {
+                        dsp_arm = true;
+                    } else {
+                        pp_lease.reset();  // slot returned, nothing bound
+                    }
+                }
+            }
+
             // Repack the daemon-fed frame into a tight NV12 CPU buffer and
             // bind one CPU tensor — HAL v2 accepts CPU-pointer inputs only,
             // so the dma_fd-only tensors this path used to build were
@@ -1785,28 +1861,35 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             // on_complete lambda until the request completes.
             auto nv12 = std::make_shared<std::string>();
             std::string repack_why;
-            const uint64_t repack_t0 = now_us();
-            const bool repack_ok = repack_nv12_planes(frame, *nv12, repack_why);
-            const uint64_t repack_us = now_us() - repack_t0;
-            if (!repack_ok) {
+            uint64_t repack_us = 0;
+            if (!dsp_arm) {
+                const uint64_t repack_t0 = now_us();
+                const bool repack_ok = repack_nv12_planes(frame, *nv12, repack_why);
+                repack_us = now_us() - repack_t0;
+                if (!repack_ok) {
+                    fd_receiver_->release_frame(stream_id, frame.frame_id);
+                    resp.set_frame_sequence(frame.sequence);
+                    resp.set_timestamp_ns(frame.timestamp_ns);
+                    resp.mutable_status()->set_success(false);
+                    resp.mutable_status()->set_message(
+                        "Frame repack failed: " + repack_why);
+                    if (!writer->Write(resp)) break;
+                    continue;
+                }
+                inputs[0].data      = const_cast<char*>(nv12->data());
+                inputs[0].byte_size = static_cast<uint32_t>(nv12->size());
+                inputs[0].dma_fd    = -1;
+                inputs[0].dtype     = HAL_DTYPE_UINT8;
+                inputs[0].ndim      = 2;
+                inputs[0].shape[0]  = static_cast<int32_t>(frame.height * 3 / 2);
+                inputs[0].shape[1]  = static_cast<int32_t>(frame.width);
+            } else {
+                // The resized pixels live in the private DSP slot; return the
+                // source frame to the camera pool now (~one frame of shared
+                // pool capacity back per in-flight request).
                 fd_receiver_->release_frame(stream_id, frame.frame_id);
-                resp.set_frame_sequence(frame.sequence);
-                resp.set_timestamp_ns(frame.timestamp_ns);
-                resp.mutable_status()->set_success(false);
-                resp.mutable_status()->set_message(
-                    "Frame repack failed: " + repack_why);
-                if (!writer->Write(resp)) break;
-                continue;
+                early_released = true;
             }
-            const int num_inputs = 1;
-            HalTensor inputs[1] = {};
-            inputs[0].data      = const_cast<char*>(nv12->data());
-            inputs[0].byte_size = static_cast<uint32_t>(nv12->size());
-            inputs[0].dma_fd    = -1;
-            inputs[0].dtype     = HAL_DTYPE_UINT8;
-            inputs[0].ndim      = 2;
-            inputs[0].shape[0]  = static_cast<int32_t>(frame.height * 3 / 2);
-            inputs[0].shape[1]  = static_cast<int32_t>(frame.width);
 
             resp.set_frame_sequence(frame.sequence);
             resp.set_timestamp_ns(frame.timestamp_ns);
@@ -1827,7 +1910,12 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             std::memcpy(inf_req->inputs, inputs, sizeof(HalTensor) * num_inputs);
             inf_req->priority   = 5;
             inf_req->timeout_ms = 1000;
-            inf_req->resource_holder = frame.fd_group;
+            // What must outlive the NPU read: the DSP slot lease (which
+            // frees the bound tensor and returns the slot) on the dsp arm,
+            // the source frame's fd dups on the repack arm.
+            inf_req->resource_holder =
+                dsp_arm ? std::shared_ptr<void>(pp_lease)
+                        : std::shared_ptr<void>(frame.fd_group);
             inf_req->owns_outputs = true;
 
             auto frame_id = frame.frame_id;
@@ -1838,26 +1926,30 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                                     enable_post, model_id, stream_id,
                                     frame_id, frame_seq, ts_ns, in_flight,
                                     fd_receiver = fd_receiver_, session,
-                                    nv12, repack_us](
+                                    nv12, repack_us, dsp_us, early_released](
                 int rc, HalTensor* outputs, int num_outputs,
                 uint64_t infer_us, uint64_t queue_us,
                 bool model_acquired) {
 
-                // Release frame back to camera-daemon
-                fd_receiver->release_frame(stream_id, frame_id);
+                // Release frame back to camera-daemon — unless the DSP
+                // preprocess arm already returned it right after the resize
+                // (exactly-once).
+                if (!early_released)
+                    fd_receiver->release_frame(stream_id, frame_id);
 
                 // Record stats (single source of truth)
                 session_mgr_->record_inference(session.get(), infer_us);
 
                 // Perf segments known at completion (also on failure —
                 // partial data beats none when diagnosing a dropped frame).
-                // dsp_us stays 0 (no stream DSP stage yet, P1-3);
-                // hw_infer_us stays 0 (HAL does not expose NPU-only
+                // dsp_us is the stream DSP resize wall time (0 on the repack
+                // arm); hw_infer_us stays 0 (HAL does not expose NPU-only
                 // latency; NV12 models skip the measurement flag);
                 // post_us set at the post branch, write_us lags one
                 // response (set by the writer below).
                 auto* perf = stream_resp->mutable_perf();
                 perf->set_repack_us(repack_us);
+                perf->set_dsp_us(dsp_us);
                 perf->set_queue_us(queue_us);
                 perf->set_infer_us(infer_us);
 
@@ -1949,7 +2041,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             in_flight->fetch_add(1);
 
             if (!scheduler_->submit(std::move(inf_req))) {
-                fd_receiver_->release_frame(stream_id, frame_id);
+                // (early_released guard: the dsp arm already returned the
+                // source; inf_req destruction releases the slot lease.)
+                if (!early_released)
+                    fd_receiver_->release_frame(stream_id, frame_id);
                 in_flight->fetch_sub(1);
                 resp.mutable_status()->set_success(false);
                 resp.mutable_status()->set_message("Scheduler queue full");

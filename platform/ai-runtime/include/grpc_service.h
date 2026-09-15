@@ -18,6 +18,8 @@
 
 namespace aipc::ai_runtime {
 
+class DspClient;
+
 class AIRuntimeServiceImpl final
     : public aipc::inference::InferenceService::Service {
 public:
@@ -29,6 +31,7 @@ public:
                          BufferLookupClient* buffer_lookup,
                          EventBusClient* event_bus,
                          PostprocessPool* postprocess_pool,
+                         DspClient* dsp_client,
                          const HalClipTextEncoderOps* clip_enc_ops,
                          const HalGenaiOps* genai_ops);
 
@@ -156,6 +159,7 @@ private:
     BufferLookupClient*  buffer_lookup_;
     EventBusClient*      event_bus_;
     PostprocessPool*     postprocess_pool_;
+    DspClient*           dsp_client_;      // stream DSP preprocess (级2)
     const HalClipTextEncoderOps* clip_enc_ops_;
     const HalGenaiOps* genai_ops_;
     std::mutex genai_mu_;
