@@ -1963,8 +1963,8 @@ const (
 	eventQueryTimeout      = time.Second
 	lightDeltaMv           = 50
 	lightDeltaRelPct       = 5
-	socTempAlertC   = 85.0
-	socTempClearC   = 80.0
+	socTempAlertC          = 85.0
+	socTempClearC          = 80.0
 	eventSubscriberBacklog = 16
 )
 

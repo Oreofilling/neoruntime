@@ -1341,11 +1341,11 @@ func (h *MediaHandlers) UpdateAiOverlay(c *gin.Context) {
 	defer cancel()
 
 	resp, err := client.UpdateAiOverlay(ctx, &camerapb.AiOverlayConfig{
-		Enabled:         req.Enabled,
-		ShowLabel:       req.ShowLabel,
-		ShowConfidence:  req.ShowConfidence,
-		LineThickness:   req.LineThickness,
-		EnableFaceBlur:  req.EnableFaceBlur,
+		Enabled:        req.Enabled,
+		ShowLabel:      req.ShowLabel,
+		ShowConfidence: req.ShowConfidence,
+		LineThickness:  req.LineThickness,
+		EnableFaceBlur: req.EnableFaceBlur,
 	})
 
 	if err != nil {
