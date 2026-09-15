@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include <sstream>
 #include <atomic>
 #include <thread>
@@ -497,6 +498,106 @@ static void fill_proto_post_result(pb::PostResult* out, const HalPostprocessResu
     default:
         break;
     }
+}
+
+// ─── Helper: on-demand result shaping (P1-5) ────────────────────────────
+// Filter / truncate / strip an already-filled proto PostResult per the
+// stream request's shaping fields. Model-agnostic, applied AFTER
+// post-process so it works for every plugin. Returns whether any result
+// survived (the only_nonempty decision).
+static bool apply_result_filters(pb::PostResult* pr,
+                                 uint32_t max_results,
+                                 float min_confidence,
+                                 const std::vector<int32_t>& class_filter,
+                                 bool omit_labels) {
+    if (pr == nullptr) return false;
+    const bool has_conf_gate = min_confidence > 0.0f;
+    const bool has_class_gate = !class_filter.empty();
+    auto class_ok = [&](int32_t cid) {
+        return !has_class_gate ||
+               std::find(class_filter.begin(), class_filter.end(), cid)
+                   != class_filter.end();
+    };
+    auto conf_ok = [&](float c) {
+        return !has_conf_gate || c >= min_confidence;
+    };
+    // Confidence-descending order for top-k truncation.
+    auto by_conf_desc = [](const auto& a, const auto& b) {
+        return a.confidence() > b.confidence();
+    };
+
+    // detections: confidence + class gates
+    {
+        auto* dets = pr->mutable_detections();
+        dets->erase(std::remove_if(dets->begin(), dets->end(),
+                                   [&](const pb::Detection& d) {
+                                       return !conf_ok(d.confidence()) ||
+                                              !class_ok(d.class_id());
+                                   }),
+                    dets->end());
+        if (max_results > 0) {
+            std::stable_sort(dets->begin(), dets->end(), by_conf_desc);
+            if (static_cast<uint32_t>(dets->size()) > max_results)
+                dets->DeleteSubrange(static_cast<int>(max_results),
+                                     static_cast<int>(dets->size()) -
+                                         static_cast<int>(max_results));
+        }
+        if (omit_labels)
+            for (auto& d : *dets) d.clear_label();
+    }
+    // classifications: confidence + class gates
+    {
+        auto* clss = pr->mutable_classifications();
+        clss->erase(std::remove_if(clss->begin(), clss->end(),
+                                   [&](const pb::Classification& c) {
+                                       return !conf_ok(c.confidence()) ||
+                                              !class_ok(c.class_id());
+                                   }),
+                    clss->end());
+        if (max_results > 0) {
+            std::stable_sort(clss->begin(), clss->end(), by_conf_desc);
+            if (static_cast<uint32_t>(clss->size()) > max_results)
+                clss->DeleteSubrange(static_cast<int>(max_results),
+                                     static_cast<int>(clss->size()) -
+                                         static_cast<int>(max_results));
+        }
+        if (omit_labels)
+            for (auto& c : *clss) c.clear_label();
+    }
+    // segmentation masks: class gate (no confidence on the proto mask)
+    {
+        auto* masks = pr->mutable_masks();
+        masks->erase(std::remove_if(masks->begin(), masks->end(),
+                                    [&](const pb::SegmentationMask& m) {
+                                        return !class_ok(m.class_id());
+                                    }),
+                     masks->end());
+        if (omit_labels)
+            for (auto& m : *masks) m.clear_label();
+    }
+    // ocr lines: confidence gate only (no class id)
+    {
+        auto* lines = pr->mutable_ocr_lines();
+        lines->erase(std::remove_if(lines->begin(), lines->end(),
+                                    [&](const pb::OcrLine& l) {
+                                        return !conf_ok(l.confidence());
+                                    }),
+                     lines->end());
+        if (max_results > 0) {
+            std::stable_sort(lines->begin(), lines->end(), by_conf_desc);
+            if (static_cast<uint32_t>(lines->size()) > max_results)
+                lines->DeleteSubrange(static_cast<int>(max_results),
+                                      static_cast<int>(lines->size()) -
+                                          static_cast<int>(max_results));
+        }
+    }
+    // landmarks / embeddings / depth maps carry no per-result confidence or
+    // class identity — left unfiltered (shaping those is out of scope).
+
+    return pr->detections_size() > 0 || pr->classifications_size() > 0 ||
+           pr->landmarks_size() > 0 || pr->masks_size() > 0 ||
+           pr->ocr_lines_size() > 0 || pr->embeddings_size() > 0 ||
+           pr->depth_maps_size() > 0;
 }
 
 namespace {
@@ -1707,6 +1808,17 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
     auto model_id = req->model_id();
     auto stream_id = req->stream_id();
 
+    // ── On-demand result shaping (P1-5): by-value captures for the
+    // per-frame on_complete. Absent fields default to "no filtering" —
+    // wire-compatible with older clients that never set them.
+    const uint32_t flt_max_results = req->max_detections();
+    const float flt_min_confidence = req->min_confidence();
+    const std::vector<int32_t> flt_class_filter(req->class_filter().begin(),
+                                                req->class_filter().end());
+    const bool flt_omit_labels = req->omit_labels();
+    const bool flt_only_nonempty = req->only_nonempty();
+    uint32_t suppressed_responses = 0;  // only_nonempty drops (logged at end)
+
     // Subscribe to FdReceiver for zero-copy DMA-BUF frames
     std::mutex frame_mu;
     std::condition_variable frame_cv;
@@ -1902,6 +2014,9 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
             stream_resp->set_timestamp_ns(frame.timestamp_ns);
             auto promise = std::make_shared<std::promise<bool>>();
             auto future = promise->get_future();
+            // only_nonempty decision crosses from on_complete to the writer
+            // (the promise only says "response built", not "send it").
+            auto resp_suppressed = std::make_shared<std::atomic<bool>>(false);
 
             auto inf_req = std::make_unique<InferRequest>();
             inf_req->model_id   = model_id;
@@ -1926,7 +2041,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                                     enable_post, model_id, stream_id,
                                     frame_id, frame_seq, ts_ns, in_flight,
                                     fd_receiver = fd_receiver_, session,
-                                    nv12, repack_us, dsp_us, early_released](
+                                    nv12, repack_us, dsp_us, early_released,
+                                    flt_max_results, flt_min_confidence,
+                                    flt_class_filter, flt_omit_labels,
+                                    flt_only_nonempty, resp_suppressed](
                 int rc, HalTensor* outputs, int num_outputs,
                 uint64_t infer_us, uint64_t queue_us,
                 bool model_acquired) {
@@ -2005,9 +2123,24 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     stream_resp->mutable_status()->set_success(true);
                 }
 
-                // Publish to event-bus
+                // On-demand shaping (P1-5): threshold / top-k / strip labels
+                // on the filled post-result, then decide whole-response
+                // suppression. Applied before the event-bus publish so the
+                // bus sees the same shaped view as this subscriber.
+                if (enable_post && stream_resp->has_post_result()) {
+                    const bool any_result = apply_result_filters(
+                        stream_resp->mutable_post_result(), flt_max_results,
+                        flt_min_confidence, flt_class_filter,
+                        flt_omit_labels);
+                    if (!any_result && flt_only_nonempty)
+                        resp_suppressed->store(true);
+                }
+
+                // Publish to event-bus (a suppressed response publishes
+                // nothing — the shaping is this subscription's semantics)
                 if (cfg_.event_bus_auto_publish
-                    && stream_resp->has_post_result()) {
+                    && stream_resp->has_post_result()
+                    && !resp_suppressed->load()) {
                     publish_result(stream_id, model_id,
                                    frame_seq, ts_ns,
                                    stream_resp->post_result());
@@ -2079,6 +2212,13 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
 
             future.get();  // check for exceptions
             resp = std::move(*stream_resp);
+            // only_nonempty: response intentionally not sent — the frame
+            // still went through the full pipeline (perf/skew recorded),
+            // only the wire write is dropped.
+            if (resp_suppressed->load()) {
+                suppressed_responses++;
+                continue;
+            }
         } else {
             // Simulation mode (no frame source)
             std::this_thread::sleep_for(frame_interval);
@@ -2135,6 +2275,10 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
         }
     }
 
+    if (suppressed_responses > 0) {
+        LOG_INFO("StreamInfer: %s suppressed %u empty response(s) "
+                 "(only_nonempty)", stream_id.c_str(), suppressed_responses);
+    }
     LOG_INFO("StreamInfer: ended for %s (subscriber=%s)",
              stream_id.c_str(), session_id.c_str());
     return grpc::Status::OK;
