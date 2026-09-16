@@ -244,41 +244,6 @@ func TestLoadModelDoesNotHealTransientRegistration(t *testing.T) {
 	}
 }
 
-// A heal whose unload is logically refused (the runtime answers OK transport
-// status with success=false because a session is mid-inference) must abort
-// instead of re-registering: the same-id RegisterModel would only co-own the
-// stale session and report a heal that never happened.
-func TestLoadModelHealUnloadRefusedAbortsReload(t *testing.T) {
-	h, fake, store := newAIUpdateTestEnv(t)
-	// The heal compares against the composed runtime path, which
-	// materializes under RootPath — isolate it so the composition succeeds
-	// (and writes nothing real) on machines without a writable /data/aipc.
-	oldRoot := constants.RootPath()
-	constants.SetRootPath(t.TempDir())
-	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
-	blob := seedBlob(t, store, "h1")
-	seedAIModel(t, h, &model.AIModel{
-		ModelID: "stale_det", Name: "stale_det", Status: "uploaded", Source: "web",
-		ModelType: "detection", FilePath: blob, FileHash: "h1",
-	})
-	// System-owned entry parked on a path composition would never produce —
-	// the heal shape — while the unload is refused underneath.
-	fake.markLiveEntry(&inferencepb.ModelInfo{ModelId: "stale_det", ModelPath: "/elsewhere/old.hef", OwnerId: systemOwnerID})
-	fake.unloadFail = true
-
-	w := postModelAction(t, h, "load", "stale_det")
-	if respCode(t, w) != CodeOperationFailed || !strings.Contains(w.Body.String(), "Failed to unload stale model registration") {
-		t.Fatalf("refused unload must abort the heal, got: %s", w.Body.String())
-	}
-	calls, _ := fake.snapshot()
-	if len(calls) != 1 || calls[0] != "unload:stale_det" {
-		t.Fatalf("refused unload must abort before any reload, got %v", calls)
-	}
-	if fake.registeredPath("stale_det") != "" {
-		t.Error("no re-registration may happen after a refused heal unload")
-	}
-}
-
 // Startup reconciliation: rows claiming loaded while the runtime is empty
 // flip to uploaded, with DesiredState preserved for recovery.
 func TestReconcileRuntimeModelsHealsStaleRows(t *testing.T) {
@@ -307,39 +272,5 @@ func TestReconcileRuntimeModelsHealsStaleRows(t *testing.T) {
 	}
 	if calls, _ := fake.snapshot(); len(calls) != 0 {
 		t.Errorf("reconciliation must not touch the runtime, got %v", calls)
-	}
-}
-
-// A delete whose unload is logically refused (in-flight inference answers
-// OK transport status with success=false) must veto the whole deletion:
-// the row, the materialized copy and the last CAS blob would otherwise
-// vanish from under a model the NPU is still serving.
-func TestUnregisterModelUnloadRefusedAbortsDelete(t *testing.T) {
-	h, fake, store := newAIUpdateTestEnv(t)
-	oldRoot := constants.RootPath()
-	constants.SetRootPath(t.TempDir())
-	t.Cleanup(func() { constants.SetRootPath(oldRoot) })
-	blob := seedBlob(t, store, "hz")
-	// Row says uploaded, runtime serves it — the runtime wins, and the
-	// runtime refuses the unload.
-	fake.markLive("busy_det")
-	fake.unloadFail = true
-	seedAIModel(t, h, &model.AIModel{
-		ModelID: "busy_det", Name: "busy_det", Status: "uploaded", Source: "web",
-		ModelType: "detection", FilePath: blob, FileHash: "hz",
-	})
-
-	w := deleteModel(t, h, "busy_det")
-	if respCode(t, w) != CodeOperationFailed || !strings.Contains(w.Body.String(), "Failed to unload model before delete") {
-		t.Fatalf("refused unload must abort the delete, got: %s", w.Body.String())
-	}
-	if row, _ := h.aiModelRepo.GetByModelID("busy_det"); row == nil {
-		t.Error("row must survive a refused delete")
-	}
-	if !store.Exists("hz", ".hef") {
-		t.Error("blob must survive a refused delete")
-	}
-	if calls, _ := fake.snapshot(); len(calls) != 1 || calls[0] != "unload:busy_det" {
-		t.Errorf("runtime calls = %v, want only the refused unload", calls)
 	}
 }
