@@ -14,7 +14,11 @@ import (
 // managed manifests root. manifest.Validate only rejects empty IDs, so
 // this is the only thing stopping an ID like "../bin" from turning
 // into a path.
-var safeAppIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var (
+	safeAppIDPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	appStagingTokenPattern  = regexp.MustCompile(`^[0-9]{10,20}_[0-9a-f]{8}$`)
+	appInflightTokenPattern = regexp.MustCompile(`^inflight-[A-Za-z0-9._-]+-[0-9]+$`)
+)
 
 // requireSafePathSegment guards app IDs and model aliases before they become
 // directory names under the data root (appModelsDir/<alias>). Install runs
@@ -64,23 +68,87 @@ func managedManifestDir(manifestPath, appID string) (string, bool) {
 // unknown fields survive); the caller-owned source file is left in
 // place.
 func canonicalizeManifest(manifestPath, appID string) (string, error) {
-	if !safeAppIDPattern.MatchString(appID) {
-		return "", fmt.Errorf("app id %q is not usable as a manifest directory name", appID)
-	}
-	canonical := filepath.Join(managedManifestsRoot(), appID, "app.yaml")
-	if filepath.Clean(manifestPath) == canonical {
-		return canonical, nil
-	}
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read manifest %s: %w", manifestPath, err)
 	}
+	return canonicalizeManifestBytes(data, manifestPath, appID)
+}
+
+// canonicalizeManifestBytes publishes an immutable manifest snapshot. Async
+// installs read caller-owned staging before returning a task id, so a later
+// cancel/TTL cleanup cannot change the bytes that eventually commit.
+func canonicalizeManifestBytes(data []byte, sourcePath, appID string) (string, error) {
+	if !safeAppIDPattern.MatchString(appID) {
+		return "", fmt.Errorf("app id %q is not usable as a manifest directory name", appID)
+	}
+	canonical := filepath.Join(managedManifestsRoot(), appID, "app.yaml")
+	if filepath.Clean(sourcePath) == canonical {
+		return canonical, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(canonical), 0755); err != nil {
 		return "", fmt.Errorf("failed to create manifest dir %s: %w", filepath.Dir(canonical), err)
 	}
-	if err := os.WriteFile(canonical, data, 0644); err != nil {
+	if err := atomicWriteManifest(canonical, data); err != nil {
 		return "", fmt.Errorf("failed to write canonical manifest %s: %w", canonical, err)
 	}
-	logger.Info("Manifest canonicalized: %s -> %s", manifestPath, canonical)
+	logger.Info("Manifest canonicalized: %s -> %s", sourcePath, canonical)
 	return canonical, nil
+}
+
+func atomicWriteManifest(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".app.yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// manifestPublishRollback snapshots the previous canonical manifest and returns
+// an idempotent compensation function. Install callers invoke the returned
+// rollback if any step after canonicalizeManifest fails.
+func manifestPublishRollback(appID string) (func(), error) {
+	if !safeAppIDPattern.MatchString(appID) {
+		return nil, fmt.Errorf("app id %q is not usable as a manifest directory name", appID)
+	}
+	canonical := filepath.Join(managedManifestsRoot(), appID, "app.yaml")
+	old, err := os.ReadFile(canonical)
+	existed := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	var once bool
+	return func() {
+		if once {
+			return
+		}
+		once = true
+		if existed {
+			if err := atomicWriteManifest(canonical, old); err != nil {
+				logger.Warn("Rollback: failed to restore canonical manifest %s: %v", canonical, err)
+			}
+			return
+		}
+		if err := os.Remove(canonical); err != nil && !os.IsNotExist(err) {
+			logger.Warn("Rollback: failed to remove canonical manifest %s: %v", canonical, err)
+		}
+		_ = os.Remove(filepath.Dir(canonical))
+	}, nil
 }

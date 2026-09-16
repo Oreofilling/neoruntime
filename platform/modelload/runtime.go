@@ -246,10 +246,7 @@ func DetectionVariantJSON(m *model.AIModel) (string, error) {
 		return "", err
 	}
 	profileDef, _ := model.LookupDetectionProfile(profile)
-	threshold := m.Threshold
-	if threshold <= 0 {
-		threshold = defaultDetectionThreshold
-	}
+	threshold := detectionThreshold(m)
 	maxBoxes := m.MaxDetections
 	if maxBoxes <= 0 {
 		maxBoxes = defaultMaxDetections
@@ -271,13 +268,36 @@ func DetectionVariantJSON(m *model.AIModel) (string, error) {
 	return string(blob), nil
 }
 
+// detectionThreshold resolves the confidence threshold with explicit-zero
+// support. The field schema allows threshold: 0 (retain every detection),
+// so zero is honored when the row's config JSON carries the key — every
+// detection row the register/update/upload paths writes does, because the
+// schema default merge puts it there. Rows without the key are legacy:
+// their zero column means "never set" and keeps the platform default.
+func detectionThreshold(m *model.AIModel) float32 {
+	if m.Config != "" {
+		var cfg map[string]interface{}
+		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
+			if v, ok := cfg["threshold"].(float64); ok {
+				return float32(v)
+			}
+		}
+	}
+	if m.Threshold <= 0 {
+		return defaultDetectionThreshold
+	}
+	return m.Threshold
+}
+
 // detectionNmsThreshold reads nms_threshold from the schema-driven Config
-// JSON, falling back to the schema default for rows without one.
+// JSON, falling back to the schema default for rows without one. An
+// explicit 0 (disable NMS filtering) is a legal schema value and is
+// preserved — presence of the key decides, not the value's sign.
 func detectionNmsThreshold(m *model.AIModel) float64 {
 	if m.Config != "" {
 		var cfg map[string]interface{}
 		if err := json.Unmarshal([]byte(m.Config), &cfg); err == nil {
-			if v, ok := cfg["nms_threshold"].(float64); ok && v > 0 {
+			if v, ok := cfg["nms_threshold"].(float64); ok {
 				return v
 			}
 		}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -120,5 +121,54 @@ func TestFreeBytesSane(t *testing.T) {
 	}
 	if free == 0 {
 		t.Error("a fresh temp dir on a real filesystem should report free space")
+	}
+}
+
+// Concurrent uploads against a shared budget: unsynchronized admissions can
+// each observe the same UsageBytes, pass the check, and then publish —
+// overshooting maxTotalBytes. The check-through-publish section is
+// serialized, so with N same-size writes and a budget of ⌊N/2⌋+0.5 sizes,
+// exactly ⌊N/2⌋ succeed and usage stays inside the budget.
+func TestSaveWithHashConcurrentAdmissionsRespectBudget(t *testing.T) {
+	const writers = 4
+	const payload = 64
+	store := newQuotaStore(t, 0, payload*2+payload/2) // fits 2, refuses the 3rd
+
+	contents := make([][]byte, writers)
+	for i := range contents {
+		contents[i] = bytes.Repeat([]byte{byte('a' + i)}, payload)
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = saveBytes(t, store, contents[i])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	succeeded := 0
+	for i, err := range errs {
+		if err == nil {
+			succeeded++
+		} else if !strings.Contains(err.Error(), "quota exceeded") {
+			t.Errorf("writer %d failed for a non-quota reason: %v", i, err)
+		}
+	}
+	if succeeded != 2 {
+		t.Errorf("succeeded writes = %d, want exactly 2 under a %d-byte budget", succeeded, payload*2+payload/2)
+	}
+	usage, err := store.UsageBytes()
+	if err != nil {
+		t.Fatalf("UsageBytes: %v", err)
+	}
+	if usage != payload*2 {
+		t.Errorf("usage = %d, want %d (budget %d must hold)", usage, payload*2, payload*2+payload/2)
 	}
 }

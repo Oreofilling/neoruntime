@@ -109,12 +109,29 @@ func TestDetectionVariantJSON(t *testing.T) {
 			},
 		},
 		{
-			name: "zero tuning values fall back to schema defaults",
+			name: "legacy zero tuning values without config fall back to schema defaults",
 			m:    &model.AIModel{ModelType: "detection"},
 			want: map[string]interface{}{
 				"backend_function":    "hailo_yolov8n",
 				"iou_threshold":       0.45,
 				"detection_threshold": 0.25,
+				"output_activation":   "none",
+				"label_offset":        float64(1),
+				"max_boxes":           float64(64),
+				"labels":              defaultVariantLabels,
+			},
+		},
+		{
+			name: "explicit zero confidence and nms thresholds are preserved",
+			m: &model.AIModel{
+				ModelType: "detection",
+				Threshold: 0,
+				Config:    `{"threshold":0,"nms_threshold":0}`,
+			},
+			want: map[string]interface{}{
+				"backend_function":    "hailo_yolov8n",
+				"iou_threshold":       float64(0),
+				"detection_threshold": float64(0),
 				"output_activation":   "none",
 				"label_offset":        float64(1),
 				"max_boxes":           float64(64),

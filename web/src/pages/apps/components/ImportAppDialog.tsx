@@ -30,7 +30,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { aiApi, streamsApi, appsApi, filesApi } from '@/services/api';
+import { aiApi, streamsApi, appsApi } from '@/services/api';
 import { useWizardInstall, useInstallProgress } from '@/hooks';
 import type { WizardConfig } from '@/services/types';
 import {
@@ -306,9 +306,9 @@ export default function ImportAppDialog({
     const uniq = Array.from(new Set(paths.filter(Boolean)));
     if (uniq.length === 0) return;
     try {
-      await filesApi.batchDelete(uniq);
+      await appsApi.abandonStaging(uniq);
     } catch {
-      // best-effort cleanup
+      // best-effort cleanup; TTL cleanup handles process/browser loss
     }
   };
 
@@ -347,12 +347,26 @@ export default function ImportAppDialog({
   // Fetch existing apps for duplicate check
   const { data: existingAppsData } = useQuery({
     queryKey: ['apps'],
-    queryFn: () => appsApi.list().then(res => res.data || {}),
+    queryFn: () => appsApi.list().then(res => res.data || []),
     enabled: open,
   });
+  const existingApps = Array.isArray(existingAppsData)
+    ? existingAppsData
+    : existingAppsData?.apps || [];
   const existingAppIds: Set<string> = new Set(
-    (existingAppsData?.apps || []).map((a: any) => a.id || a.app_id)
+    existingApps.map((a: any) => a.id || a.app_id)
   );
+
+  const confirmForceInstall = (appId: string): boolean => {
+    if (!existingAppIds.has(appId)) return false;
+    return window.confirm(
+      t(
+        'sys.apps.import.duplicate_confirm',
+        `App ID "${appId}" already exists. Replace the installed app?`,
+        { appId }
+      )
+    );
+  };
 
   // Fetch available models
   const { data: modelsData, isSuccess: modelsLoaded } = useQuery({
@@ -694,6 +708,10 @@ export default function ImportAppDialog({
       return;
     }
 
+    const duplicate = existingAppIds.has(effectiveConfig.metadata.id);
+    if (duplicate && !confirmForceInstall(effectiveConfig.metadata.id)) return;
+    const force = duplicate;
+
     if (sourceType === 'local' && effectiveManifestPath) {
       // Manifest mode: patch the uploaded manifest with the wizard's
       // edits (when possible), then install from it.
@@ -702,6 +720,7 @@ export default function ImportAppDialog({
           .installPackage({
             manifest_path: effectiveManifestPath,
             image_path: imageTarPath || undefined,
+            force,
           })
           .then((res: any) => {
             const tid = res?.data?.task_id;
@@ -760,8 +779,9 @@ export default function ImportAppDialog({
             ...effectiveConfig,
             image_path: imageTarPath,
             image: imageTarName || effectiveConfig.image,
+            force,
           }
-        : effectiveConfig;
+        : { ...effectiveConfig, force };
     installMutation.mutate(installConfig, {
       onSuccess: (data: any) => {
         const tid = data?.task_id;

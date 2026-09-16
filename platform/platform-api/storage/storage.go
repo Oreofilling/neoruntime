@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -25,9 +26,10 @@ var (
 
 // ModelStorage manages model binary files using Content Addressable Storage (CAS).
 type ModelStorage struct {
-	blobDir       string // directory for hash-named blobs
-	minFreeBytes  uint64 // minimum free disk space to allow writes
-	maxTotalBytes uint64 // cap on total blob bytes; 0 = uncapped
+	blobDir       string     // directory for hash-named blobs
+	minFreeBytes  uint64     // minimum free disk space to allow writes
+	maxTotalBytes uint64     // cap on total blob bytes; 0 = uncapped
+	writeMu       sync.Mutex // serializes SaveWithHash admission through publish
 }
 
 // HEFInfo holds metadata extracted from a HEF file via hailortcli.
@@ -64,6 +66,15 @@ type SaveResult struct {
 // SaveWithHash streams the reader content to a temporary file, computes SHA256,
 // and atomically renames it to blobs/<hash><ext>. Returns dedup info.
 func (s *ModelStorage) SaveWithHash(r io.Reader, ext string, size int64) (*SaveResult, error) {
+	// Admission must be atomic with publishing: two concurrent uploads that
+	// each pass an unsynchronized quota check can both stream and rename
+	// their blob, overshooting maxTotalBytes (and the free-space floor)
+	// by however many raced. Serializing the check-through-rename section
+	// keeps the budget exact; model uploads are rare admin operations, so
+	// the coarse lock costs nothing in practice.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	// Check disk quota before writing, counting the claimed payload against
 	// the free-space floor. Uploads know their real size (multipart
 	// FileHeader.Size, package length), so a disk near minFreeBytes is refused

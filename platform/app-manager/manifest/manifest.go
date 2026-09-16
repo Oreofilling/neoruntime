@@ -417,7 +417,10 @@ func (m *AppManifest) Validate() error {
 // from the app image when the id is not found on the platform); it must be
 // an absolute, clean container path pointing at an AMPK .bin package.
 func (m *AppManifest) ValidateModels() error {
-	for alias, mapping := range m.Spec.Models {
+	pathsByID := make(map[string]string, len(m.Spec.Models))
+	aliasesByID := make(map[string]string, len(m.Spec.Models))
+	for _, alias := range sortedModelAliases(m.Spec.Models) {
+		mapping := m.Spec.Models[alias]
 		if !modelAliasPattern.MatchString(alias) {
 			return fmt.Errorf("spec.models alias %q must match %s", alias, modelAliasPattern.String())
 		}
@@ -427,18 +430,18 @@ func (m *AppManifest) ValidateModels() error {
 		if mapping.ID == "" {
 			return fmt.Errorf("spec.models.%s.id is required", alias)
 		}
-		if mapping.Path == "" {
-			continue
+		if mapping.Path != "" {
+			if !filepath.IsAbs(mapping.Path) || filepath.Clean(mapping.Path) != mapping.Path || mapping.Path == "/" {
+				return fmt.Errorf("spec.models.%s.path must be an absolute container path without '.', '..' or redundant separators (got %q)", alias, mapping.Path)
+			}
+			if ext := filepath.Ext(mapping.Path); ext != ".bin" {
+				return fmt.Errorf("spec.models.%s.path must be a .bin AMPK model package (got %q); bare .hef bundling is no longer supported", alias, mapping.Path)
+			}
 		}
-		// Bundled-model fallback declared: validate the in-image path.
-		if !filepath.IsAbs(mapping.Path) || filepath.Clean(mapping.Path) != mapping.Path || mapping.Path == "/" {
-			return fmt.Errorf("spec.models.%s.path must be an absolute container path without '.', '..' or redundant separators (got %q)",
-				alias, mapping.Path)
+		if old, ok := pathsByID[mapping.ID]; ok && old != mapping.Path {
+			return fmt.Errorf("spec.models aliases %q and %q declare model id %q with conflicting paths", aliasesByID[mapping.ID], alias, mapping.ID)
 		}
-		if ext := filepath.Ext(mapping.Path); ext != ".bin" {
-			return fmt.Errorf("spec.models.%s.path must be a .bin AMPK model package (got %q); bare .hef bundling is no longer supported",
-				alias, mapping.Path)
-		}
+		pathsByID[mapping.ID], aliasesByID[mapping.ID] = mapping.Path, alias
 	}
 	return nil
 }

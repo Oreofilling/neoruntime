@@ -59,12 +59,10 @@ func (h *APIHandlers) importModelPackage(file multipart.File, pkgSize int64) (*s
 		return nil, nil, fmt.Errorf("failed to stage package HEF: %w", err)
 	}
 	// The metadata may pin the HEF content hash; a mismatch means the package
-	// lied about its payload. Only a freshly created blob is deleted — a
-	// dedup hit is shared with existing rows and must stay.
+	// lied about its payload. Cleanup follows the shared fail-closed reference
+	// rule, so an adjacent model already pointing at these bytes keeps them.
 	if meta.HEF.SHA256 != "" && meta.HEF.SHA256 != result.Hash {
-		if !result.Existed {
-			h.modelStore.Delete(result.Hash, ".hef")
-		}
+		h.cleanupStagedBlob(result.Hash, ".hef", result.Existed)
 		return nil, nil, fmt.Errorf("package HEF sha256 mismatch (metadata says %s, payload hashes to %s)", meta.HEF.SHA256, result.Hash)
 	}
 	return meta, result, nil

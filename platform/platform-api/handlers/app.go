@@ -1,11 +1,11 @@
 package handlers
 
 import (
-	"aipc/platform/common/constants"
 	"aipc/platform/common/utils"
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,35 @@ import (
 	"aipc/platform/common/events"
 	"aipc/platform/common/logger"
 )
+
+// safeAppIDRE bounds app IDs the moment they become directory names under
+// the managed manifests root: manifest.Validate only rejects empty IDs, so
+// without this a metadata.id like "../../x" would make MkdirAll/WriteFile
+// act outside the root. Mirrors app-manager's safeAppIDPattern
+// (manifest_guard.go) so upload accepts exactly what install will.
+var safeAppIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// requireSafeAppID rejects a manifest app ID that cannot serve as a single
+// path segment.
+func requireSafeAppID(id string) error {
+	if !safeAppIDRE.MatchString(id) {
+		return fmt.Errorf("app id %q is not usable as a manifest directory name (letters, digits, '.', '_', '-' only; must start with a letter or digit)", id)
+	}
+	return nil
+}
+
+// uploadToken makes upload artifact names unique across concurrent requests.
+// A second-granularity timestamp alone collides (same second, same generated
+// name), and the later os.Create then truncates the other upload's
+// half-written file — one install can end up with another package's image.
+func uploadToken() string {
+	b := make([]byte, 4)
+	if _, err := cryptorand.Read(b); err != nil {
+		// crypto/rand failing is exotic; nanos still de-conflict in practice.
+		return fmt.Sprintf("%d_00000000", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d_%x", time.Now().Unix(), b)
+}
 
 // AppPermissions mirrors the manifest permissions for JSON response.
 type AppPermissions struct {
@@ -727,18 +757,24 @@ func (h *APIHandlers) UploadImage(c *gin.Context) {
 	defer file.Close()
 
 	// Validate file extension
-	filename := header.Filename
+	filename := filepath.Base(header.Filename)
 	if !strings.HasSuffix(filename, ".tar") && !strings.HasSuffix(filename, ".tar.gz") && !strings.HasSuffix(filename, ".tgz") {
 		Resp(c).FailMsg(CodeInvalidRequest, "Only .tar, .tar.gz or .tgz files are allowed")
 		return
 	}
 
-	// Create upload directory
-	uploadDir := constants.RootPath() + "/images"
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create upload directory: "+err.Error())
+	// Keep every request's artifacts together in a private staging directory.
+	uploadDir, err := newAppStagingDir()
+	if err != nil {
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create staging directory: "+err.Error())
 		return
 	}
+	stagingCommitted := false
+	defer func() {
+		if !stagingCommitted {
+			os.RemoveAll(uploadDir)
+		}
+	}()
 
 	// Refuse early when the target partition cannot hold the file plus
 	// unpack headroom — failing here is far cheaper than failing at install.
@@ -753,8 +789,8 @@ func (h *APIHandlers) UploadImage(c *gin.Context) {
 	}
 
 	// Generate unique filename
-	timestamp := time.Now().Unix()
-	savedName := fmt.Sprintf("%d_%s", timestamp, filename)
+	savedName := fmt.Sprintf("%s_%s", uploadToken(), filename)
+
 	savedPath := filepath.Join(uploadDir, savedName)
 
 	// Save file
@@ -790,6 +826,7 @@ func (h *APIHandlers) UploadImage(c *gin.Context) {
 	}
 
 	logger.Info("Image uploaded: %s (%d bytes)", savedPath, written)
+	stagingCommitted = true
 
 	// Extract image name from tar manifest.json
 	imageName := utils.ExtractImageNameFromTar(savedPath)
@@ -842,17 +879,23 @@ func (h *APIHandlers) UploadManifest(c *gin.Context) {
 		Resp(c).FailMsg(CodeInvalidRequest, "manifest metadata.id is required")
 		return
 	}
-
-	// Save the ORIGINAL bytes untouched (fidelity first: comments and
-	// unknown fields survive; canonicalization never happens on write).
-	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", appManifest.Metadata.ID)
-	if err := os.MkdirAll(manifestDir, 0755); err != nil {
-		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
+	// Before the ID becomes a directory name — the install-time guard in
+	// app-manager runs too late to prevent the out-of-root write here.
+	if err := requireSafeAppID(appManifest.Metadata.ID); err != nil {
+		Resp(c).FailMsg(CodeInvalidRequest, err.Error())
 		return
 	}
 
+	// Save the ORIGINAL bytes untouched in request-private staging. The live
+	// canonical manifest is published only by app-manager after install checks.
+	manifestDir, err := newAppStagingDir()
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, "Failed to create staging directory: "+err.Error())
+		return
+	}
 	manifestPath := filepath.Join(manifestDir, "app.yaml")
 	if err := os.WriteFile(manifestPath, data, 0644); err != nil {
+		os.RemoveAll(manifestDir)
 		Resp(c).FailMsg(CodeServiceError, "Failed to save manifest: "+err.Error())
 		return
 	}
@@ -918,12 +961,19 @@ func (h *APIHandlers) UploadPackage(c *gin.Context) {
 		return
 	}
 
-	// Create upload directory (shared with upload-image)
-	uploadDir := constants.RootPath() + "/images"
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create upload directory: "+err.Error())
+	// Keep package, extracted image and manifest under one request-private
+	// staging directory so cancellation/TTL cleanup can remove ownership as a unit.
+	uploadDir, err := newAppStagingDir()
+	if err != nil {
+		Resp(c).FailMsg(CodeFileUploadFailed, "Failed to create staging directory: "+err.Error())
 		return
 	}
+	stagingCommitted := false
+	defer func() {
+		if !stagingCommitted {
+			os.RemoveAll(uploadDir)
+		}
+	}()
 
 	// Refuse early when the target partition cannot hold the package plus
 	// the unpacked image plus headroom (worst case: package + 2× image).
@@ -937,9 +987,9 @@ func (h *APIHandlers) UploadPackage(c *gin.Context) {
 		}
 	}
 
-	timestamp := time.Now().Unix()
-	pkgPath := filepath.Join(uploadDir, fmt.Sprintf("%d_pkg_%s", timestamp, filename))
-	imageTarPath := filepath.Join(uploadDir, fmt.Sprintf("%d_image.tar", timestamp))
+	token := uploadToken()
+	pkgPath := filepath.Join(uploadDir, fmt.Sprintf("%s_pkg_%s", token, filename))
+	imageTarPath := filepath.Join(uploadDir, fmt.Sprintf("%s_image.tar", token))
 
 	// cleanup removes every partial artifact on failure paths; success
 	// removes only the package (the extracted image tar is the payload).
@@ -1073,24 +1123,25 @@ func (h *APIHandlers) UploadPackage(c *gin.Context) {
 		fail("manifest metadata.id is required")
 		return
 	}
-
-	// Save the ORIGINAL manifest bytes untouched (fidelity first), exactly
-	// like upload-manifest.
-	manifestDir := fmt.Sprintf(constants.RootPath()+"/apps/manifests/%s", appManifest.Metadata.ID)
-	if err := os.MkdirAll(manifestDir, 0755); err != nil {
-		cleanup(false)
-		Resp(c).FailMsg(CodeServiceError, "Failed to create manifest directory: "+err.Error())
+	// Before the ID becomes a directory name — the install-time guard in
+	// app-manager runs too late to prevent the out-of-root write here.
+	if err := requireSafeAppID(appManifest.Metadata.ID); err != nil {
+		fail(err.Error())
 		return
 	}
-	manifestPath := filepath.Join(manifestDir, "app.yaml")
+
+	// Save the ORIGINAL manifest bytes untouched beside the extracted image.
+	manifestPath := filepath.Join(uploadDir, "app.yaml")
 	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
 		cleanup(false)
 		Resp(c).FailMsg(CodeServiceError, "Failed to save manifest: "+err.Error())
 		return
 	}
 
-	// Success: the package file itself is no longer needed.
+	// Success: the package file itself is no longer needed; staging ownership
+	// remains with the caller until install begins or it is abandoned.
 	cleanup(true)
+	stagingCommitted = true
 
 	imageName := utils.ExtractImageNameFromTar(imageTarPath)
 	logger.Info("Package uploaded: %s (app_id=%s, image=%s, %d bytes)",
@@ -1140,11 +1191,28 @@ func (h *APIHandlers) InstallPackage(c *gin.Context) {
 		return
 	}
 
-	// Verify manifest exists
-	if _, err := os.Stat(req.ManifestPath); os.IsNotExist(err) {
-		Resp(c).FailMsg(CodeInvalidRequest, "Manifest file not found: "+req.ManifestPath)
+	// The web package endpoint consumes only request-owned staging. CLI and
+	// other external-path compatibility remains at app-manager's gRPC surface.
+	manifestPath, manifestDir, err := safeStagingArtifact(req.ManifestPath)
+	if err != nil || filepath.Base(manifestPath) != "app.yaml" {
+		Resp(c).FailMsg(CodeInvalidParameter, "manifest_path must be a staged app.yaml")
 		return
 	}
+	if _, err := safeStagingManifest(manifestPath); err != nil {
+		Resp(c).FailMsg(CodeInvalidParameter, err.Error())
+		return
+	}
+	var imageDir string
+	if req.ImagePath != "" {
+		imagePath, dir, err := safeStagingArtifact(req.ImagePath)
+		if err != nil {
+			Resp(c).FailMsg(CodeInvalidParameter, "image_path must be a staged upload artifact")
+			return
+		}
+		imageDir = dir
+		req.ImagePath = imagePath
+	}
+	req.ManifestPath = manifestPath
 
 	client := apppb.NewAppManagerClient(h.grpcClients.AppManager)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1156,6 +1224,11 @@ func (h *APIHandlers) InstallPackage(c *gin.Context) {
 		Force:        req.Force,
 	})
 	if err != nil {
+		// Ownership has not transferred because no task was accepted.
+		os.RemoveAll(manifestDir)
+		if imageDir != "" && imageDir != manifestDir {
+			os.RemoveAll(imageDir)
+		}
 		Resp(c).FailMsg(CodeAppInstallFailed, err.Error())
 		return
 	}

@@ -711,3 +711,62 @@ func TestImageReferences(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateModelsDuplicateIDPathContract(t *testing.T) {
+	tests := []struct {
+		name    string
+		models  map[string]ModelMapping
+		wantErr bool
+	}{
+		{
+			name: "aliases_without_paths_share_runtime_id",
+			models: map[string]ModelMapping{
+				"primary": {ID: "shared"},
+				"backup":  {ID: "shared", Required: true},
+			},
+		},
+		{
+			name: "aliases_with_same_path_share_bundled_source",
+			models: map[string]ModelMapping{
+				"primary": {ID: "shared", Path: "/app/models/shared.bin"},
+				"backup":  {ID: "shared", Path: "/app/models/shared.bin"},
+			},
+		},
+		{
+			name: "different_paths_are_ambiguous",
+			models: map[string]ModelMapping{
+				"primary": {ID: "shared", Path: "/app/models/a.bin"},
+				"backup":  {ID: "shared", Path: "/app/models/b.bin"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "path_and_no_path_are_ambiguous",
+			models: map[string]ModelMapping{
+				"primary": {ID: "shared", Path: "/app/models/shared.bin"},
+				"backup":  {ID: "shared"},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &AppManifest{Spec: Spec{Models: tt.models}}
+			err := m.ValidateModels()
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "conflicting paths")) {
+				t.Fatalf("ValidateModels error = %v, want conflicting paths", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("ValidateModels unexpected error: %v", err)
+			}
+		})
+	}
+
+	m := &AppManifest{Spec: Spec{Models: map[string]ModelMapping{
+		"primary": {ID: "shared"},
+		"backup":  {ID: "shared"},
+	}}}
+	if got := m.ModelEnvVars(); !reflect.DeepEqual(got, []string{"AIPC_MODEL_backup=shared", "AIPC_MODEL_primary=shared"}) {
+		t.Fatalf("ModelEnvVars = %v, want both aliases", got)
+	}
+}

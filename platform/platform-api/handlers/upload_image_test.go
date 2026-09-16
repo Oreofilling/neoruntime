@@ -101,21 +101,21 @@ func decodeUploadResponse(t *testing.T, w *httptest.ResponseRecorder) (int, stri
 }
 
 // uploadImageTestRoot redirects the platform root to a temp dir and returns
-// the images dir plus a restore func.
+// the app staging root plus a restore func.
 func uploadImageTestRoot(t *testing.T) (string, func()) {
 	t.Helper()
 	oldRoot := constants.RootPath()
 	root := t.TempDir()
 	constants.SetRootPath(root)
-	images := filepath.Join(root, "images")
-	if err := os.MkdirAll(images, 0755); err != nil {
+	staging := filepath.Join(root, "apps", "staging")
+	if err := os.MkdirAll(staging, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	return images, func() { constants.SetRootPath(oldRoot) }
+	return staging, func() { constants.SetRootPath(oldRoot) }
 }
 
-func tarResidue(imagesDir string) []string {
-	matches, _ := filepath.Glob(filepath.Join(imagesDir, "*.tar"))
+func tarResidue(stagingRoot string) []string {
+	matches, _ := filepath.Glob(filepath.Join(stagingRoot, "*", "*.tar"))
 	return matches
 }
 
