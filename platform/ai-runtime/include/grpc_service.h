@@ -144,12 +144,6 @@ private:
     static void fill_tensor_specs(const HalModelInfo& mi,
                                   aipc::inference::ModelInfo* info);
 
-    // Copies HAL tensor specs onto a protobuf ModelInfo. Shared by
-    // ListModels and GetModelInfo so the list path carries the same
-    // per-tensor facts as the detail path.
-    static void fill_tensor_specs(const HalModelInfo& mi,
-                                  aipc::inference::ModelInfo* info);
-
     // Completion callback for InferBatch async inference, threaded through the
     // HAL via userdata (an InferBatchCbState* defined in grpc_service.cpp).
     // Static so its address is a plain function pointer fit for
