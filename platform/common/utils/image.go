@@ -188,3 +188,47 @@ func ExtractImageNameFromTar(tarPath string) string {
 	}
 	return ""
 }
+
+// ExtractAllImageNamesFromTar returns every RepoTag of every image in the
+// archive's manifest.json — `docker save img1 img2` bundles several images
+// in one tar, and containerd's importer brings them all in on a single
+// Import. The install reconcile uses this to tell "the archive carries this
+// reference" (bind it to its own archived image) from "the archive lacks it"
+// (must fail instead of being papered over by a retag from an unrelated
+// image). Order follows the archive. Gzip archives are handled
+// transparently. Read-only.
+func ExtractAllImageNamesFromTar(tarPath string) []string {
+	tr, closer, err := openTarStream(tarPath)
+	if err != nil {
+		return nil
+	}
+	defer closer.Close()
+
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return nil
+		}
+		if strings.TrimPrefix(hdr.Name, "./") != "manifest.json" {
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(tr, maxDockerManifestBytes+1))
+		if err != nil || int64(len(data)) > maxDockerManifestBytes {
+			return nil
+		}
+		var manifests []struct {
+			RepoTags []string `json:"RepoTags"`
+		}
+		if err := json.Unmarshal(data, &manifests); err != nil {
+			return nil
+		}
+		var tags []string
+		for _, m := range manifests {
+			tags = append(tags, m.RepoTags...)
+		}
+		return tags
+	}
+}

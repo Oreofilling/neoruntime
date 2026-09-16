@@ -249,6 +249,32 @@ func (c *Client) TagImage(ctx context.Context, sourceRef, targetRef string) erro
 	return nil
 }
 
+// EnsureImageUnpacked unpacks an already-imported image into overlayfs
+// snapshots when it has none. ImportImage only unpacks the first image of a
+// multi-image archive, so references satisfied from later entries still need
+// their snapshots before CreateContainer can use them. Like ImportImage, an
+// unpack error is not fatal here — the image may already be unpacked, and a
+// genuinely broken unpack resurfaces at container creation.
+func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
+	ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+	image, err := c.client.GetImage(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("failed to get image %s: %w", ref, err)
+	}
+	unpacked, err := image.IsUnpacked(ctx, "overlayfs")
+	if err != nil {
+		return fmt.Errorf("failed to check unpack state for %s: %w", ref, err)
+	}
+	if unpacked {
+		return nil
+	}
+	if err := image.Unpack(ctx, "overlayfs"); err != nil {
+		logger.Warn("Failed to unpack image %s (may already be unpacked): %v", ref, err)
+	}
+	return nil
+}
+
 // SaveImageTar copies the image tar file to the persistent images directory
 // for self-healing recovery after power loss.
 func SaveImageTar(appID, srcPath string) error {

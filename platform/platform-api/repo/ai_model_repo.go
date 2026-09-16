@@ -20,6 +20,32 @@ func (r *AIModelRepo) Create(m *model.AIModel) error {
 	return r.db.Create(m).Error
 }
 
+// CreatePreservingZeroThreshold inserts a model while preserving an explicit
+// threshold of zero. AIModel's GORM default tag intentionally maps an omitted
+// zero value to 0.25 for legacy/runtime-discovered rows, but the detection
+// schema also defines 0 as a valid user value (retain every detection). The
+// handlers call this only after schema-default merging has made that intent
+// explicit in Config; the corrective update stays in the same transaction so
+// readers can never observe the substituted default.
+func (r *AIModelRepo) CreatePreservingZeroThreshold(m *model.AIModel) error {
+	intended := m.Threshold
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(m).Error; err != nil {
+			return err
+		}
+		if intended != 0 {
+			return nil
+		}
+		if err := tx.Model(&model.AIModel{}).
+			Where("id = ?", m.ID).
+			UpdateColumn("threshold", 0).Error; err != nil {
+			return err
+		}
+		m.Threshold = 0
+		return nil
+	})
+}
+
 // GetByModelID retrieves a model by its business ID.
 func (r *AIModelRepo) GetByModelID(modelID string) (*model.AIModel, error) {
 	var m model.AIModel
