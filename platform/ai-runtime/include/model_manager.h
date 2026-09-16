@@ -164,6 +164,13 @@ public:
     /// buffer_id inputs). May be null only before load.
     const HalInferenceOps* infer_ops() const { return infer_ops_; }
 
+    /// Tail-member availability under the ops-table ABI guard: pass
+    /// offsetof(HalInferenceOps, <member>). With no loader (ops tables
+    /// injected directly in tests) the table is assumed complete.
+    bool has_infer_op(size_t member_offset) const {
+        return loader_ ? loader_->has_infer_op(member_offset) : true;
+    }
+
     /// Check if HAL supports async inference (run_async != nullptr).
     bool has_async() const;
 

@@ -570,7 +570,13 @@ bool StreamPreprocessPool::bind(HalInferenceSession* sess, SlotLease* lease,
     if (!sess || !lease || !lease->impl || !lease->impl->shared || !out)
         return false;
     const HalInferenceOps* ops = mgr_->infer_ops();
-    if (!ops || !ops->bind_dma_frame) return false;
+    // ABI guard: an older HAL's table ends before bind_dma_frame — reading
+    // the slot picks up adjacent rodata, not NULL, so the pointer check
+    // alone cannot catch it (R1 SIGILL, dsp_client.cpp:594).
+    if (!ops ||
+        !mgr_->has_infer_op(offsetof(HalInferenceOps, bind_dma_frame)) ||
+        !ops->bind_dma_frame)
+        return false;
     if (lease->impl->fds.size() < lease->impl->num_planes) return false;
 
     HalDmaFrameDesc desc{};
