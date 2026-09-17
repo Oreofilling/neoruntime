@@ -5685,6 +5685,7 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
             info->set_last_packet_seq(ds.last_packet_seq);
             info->set_publisher_clients(ds.clients);
         }
+
         AiOverlaySubscriber::OverlayStreamStats os{};
         if (ai_overlay_) {
             ai_overlay_->snapshot_stream_stats(ec.stream_name, &os);

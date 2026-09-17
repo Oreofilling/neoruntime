@@ -155,14 +155,53 @@ int ModelManager::register_model(const std::string& model_id,
                                  const std::string& owner_id,
                                  bool transient,
                                  const std::string& variant,
+                                 const std::string& model_type,
+                                 std::string* why,
                                  uint32_t batch_size) {
     std::unique_lock lock(mu_);
 
     if (models_.count(model_id)) {
-        // Model already loaded — add co-ownership if owner_id is provided.
-        // The stored transient flag wins: a model already registered under a
-        // visibility contract (e.g. system-visible) keeps it even when a
-        // transient re-registration arrives for the same id.
+        if (models_[model_id].path != model_path) {
+            // Same id under a different file is a collision, not
+            // co-ownership: accepting it would serve the incumbent's
+            // weights to the new registrant, and the caller's
+            // init_post_process would then rewire the incumbent's
+            // postprocess session to the new variant. Two apps bundling
+            // their own model under the same id must collide loudly.
+            LOG_ERROR("Model %s: refusing registration from %s — already "
+                      "registered from %s",
+                      model_id.c_str(), model_path.c_str(),
+                      models_[model_id].path.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered from a different path (" +
+                       models_[model_id].path + ")";
+            }
+            return -1;
+        }
+        if (models_[model_id].model_type != model_type ||
+            models_[model_id].variant != variant) {
+            // Same id and file but a different decoding configuration is
+            // equally a collision: accepting it as co-ownership would let
+            // the gRPC layer's init_post_process rewire the shared
+            // postprocess session to this variant/type — at least one owner
+            // would then read mis-decoded output. The refusal names both
+            // configurations so the operator can see what clashed.
+            LOG_ERROR("Model %s: refusing registration from owner '%s' — "
+                      "already registered with a different configuration "
+                      "(type='%s' variant='%s' vs type='%s' variant='%s')",
+                      model_id.c_str(), owner_id.c_str(),
+                      models_[model_id].model_type.c_str(),
+                      models_[model_id].variant.c_str(),
+                      model_type.c_str(), variant.c_str());
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered with a different "
+                       "configuration (type='" + models_[model_id].model_type +
+                       "' variant='" + models_[model_id].variant + "')";
+            }
+            return -1;
+        }
         const uint32_t want_batch = batch_size > 0 ? batch_size : 1;
         const uint32_t have_batch = models_[model_id].batch_size;
         if (want_batch != have_batch) {
@@ -173,8 +212,18 @@ int ModelManager::register_model(const std::string& model_id,
             LOG_ERROR("Model %s already registered with batch=%u; "
                       "re-registration requested batch=%u (rejected)",
                       model_id.c_str(), have_batch, want_batch);
+            if (why) {
+                *why = "model id '" + model_id +
+                       "' is already registered with batch=" +
+                       std::to_string(have_batch) + "; re-registration " +
+                       "requested batch=" + std::to_string(want_batch);
+            }
             return -1;
         }
+        // Model already loaded — add co-ownership if owner_id is provided.
+        // The stored transient flag wins: a model already registered under a
+        // visibility contract (e.g. system-visible) keeps it even when a
+        // transient re-registration arrives for the same id.
         if (transient != models_[model_id].transient) {
             LOG_INFO("Model %s: registration transient=%d differs from stored "
                      "transient=%d, keeping stored flag",
@@ -184,11 +233,11 @@ int ModelManager::register_model(const std::string& model_id,
             owners_[model_id].insert(owner_id);
             LOG_INFO("Model %s: added co-owner '%s' (total owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), owners_[model_id].size());
-            return 0;
+            return 1;  // existing entry: gRPC must not reinitialize postprocess
         }
 
         LOG_INFO("Model %s already loaded, skipping", model_id.c_str());
-        return 0;
+        return 1;  // existing entry: gRPC must not reinitialize postprocess
     }
 
     // Check if the same file is already loaded under a different model_id
@@ -203,6 +252,13 @@ int ModelManager::register_model(const std::string& model_id,
                           "alias '%s' requested batch=%u (rejected)",
                           model_path.c_str(), existing_id.c_str(),
                           entry.batch_size, model_id.c_str(), want_batch);
+                if (why) {
+                    *why = "model file '" + model_path +
+                           "' is already loaded as '" + existing_id +
+                           "' with batch=" + std::to_string(entry.batch_size) +
+                           "; alias '" + model_id + "' requested batch=" +
+                           std::to_string(want_batch);
+                }
                 return -1;
             }
             LOG_INFO("Model file %s already loaded as '%s', aliasing as '%s'",
@@ -216,6 +272,8 @@ int ModelManager::register_model(const std::string& model_id,
             alias.id        = model_id;   // alias must carry its own id, not the original's
             alias.name      = model_id;   // display name must match the alias id
             alias.transient = transient;  // visibility is per-id, follows this registration
+            alias.model_type = model_type; // decoding identity is per-id too: init_post_process
+            alias.variant    = variant;    // gives the alias its own postprocess session
             // The alias is a fresh registry entry: snapshot refcount starts at
             // 0 (the copy inherited the original's in-flight count). Shared
             // HAL session lifetimes are tracked separately by infer_refs_/
@@ -234,11 +292,12 @@ int ModelManager::register_model(const std::string& model_id,
     // HAL v2: session-based inference
     HalInferenceConfig infer_cfg{};
     std::strncpy(infer_cfg.model_path, model_path.c_str(), HAL_MAX_MODEL_PATH - 1);
-    // NPU batch: 0 normalizes to 1 (single-frame). >1 asks HailoRT for a
-    // batched session (set_batch_size). HailoRT accepts the value silently
-    // (void return; with the scheduler active it is only a burst-size hint),
-    // so misconfiguration is NOT caught at create() — the geometry check
-    // after get_model_info below rejects a batch the HEF does not serve.
+    // NPU batch: 0 normalizes to 1 (single-frame). >1 asks the backend for a
+    // batched session (HailoRT set_batch_size). HailoRT accepts the value
+    // silently (void return; with the scheduler active it is only a
+    // burst-size hint), so misconfiguration is NOT caught at create() — the
+    // geometry check after get_model_info below rejects a batch the HEF does
+    // not serve.
     infer_cfg.batch_size = batch_size > 0 ? batch_size : 1;
     infer_cfg.timeout_ms = 5000;
     infer_cfg.use_dma = true;
@@ -296,6 +355,8 @@ int ModelManager::register_model(const std::string& model_id,
     entry.name       = model_id;
     entry.path       = model_path;
     entry.transient  = transient;
+    entry.model_type = model_type;
+    entry.variant    = variant;
     entry.batch_size = infer_cfg.batch_size;
     entry.ref_count  = 0;
     entry.load_time  = std::time(nullptr);
@@ -305,13 +366,12 @@ int ModelManager::register_model(const std::string& model_id,
         infer_ops_->get_model_info(session, &entry.model_info);
     }
 
-    // NPU batch geometry check. Verified on-device (2026-09-14): on a
-    // batch=1-compiled HEF, set_batch_size(4) is accepted silently while the
-    // session keeps serving single frames (byte_size stays 1 frame). A
-    // batch>1 registration whose input byte_size did not scale to
-    // batch x single-frame would let InferBatch pack B partial frames into
-    // ONE real frame and slice one output B ways — confident garbage.
-    // Reject at registration instead.
+    // NPU batch geometry check. On a batch=1-compiled HEF, set_batch_size(4)
+    // is accepted silently while the session keeps serving single frames
+    // (byte_size stays 1 frame). A batch>1 registration whose input byte_size
+    // did not scale to batch x single-frame would let InferBatch pack B
+    // partial frames into ONE real frame and slice one output B ways —
+    // confident garbage. Reject at registration instead.
     if (infer_cfg.batch_size > 1) {
         for (uint32_t k = 0; k < entry.model_info.num_inputs; k++) {
             const HalModelTensorInfo &t = entry.model_info.inputs[k];
@@ -324,6 +384,12 @@ int ModelManager::register_model(const std::string& model_id,
                           t.name[0] ? t.name : "(unnamed)",
                           t.byte_size, infer_cfg.batch_size,
                           (unsigned long long)one, infer_cfg.batch_size);
+                if (why) {
+                    *why = "model '" + model_id + "' batch=" +
+                           std::to_string(infer_cfg.batch_size) +
+                           " rejected: input byte_size does not equal batch x "
+                           "single-frame (HEF likely compiled batch=1)";
+                }
                 infer_ops_->destroy(session);
                 return -1;
             }
@@ -583,25 +649,23 @@ int ModelManager::unregister_model(const std::string& model_id,
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
 
-    // Owner-scoped release must be transactional with physical unload
-    // (upstream #66 semantics, return codes kept fork-convention: 0 ok,
-    // -1 refused). A request for an owner that is not present is an
-    // idempotent no-op — it must never fall through and unload somebody
-    // else's registration. If this is the last owner, retain it while an
-    // active inference prevents unload so a refused request does not
-    // leave an ownerless live model.
+    // Owner-scoped release must be transactional with physical unload.
+    // A request for an owner that is not present is an idempotent no-op — it
+    // must never fall through and unload somebody else's registration. If
+    // this is the last owner, retain it while an active inference prevents
+    // unload so a refused request does not leave an ownerless live model.
     if (!owner_id.empty()) {
         auto oit = owners_.find(model_id);
         if (oit == owners_.end() || oit->second.count(owner_id) == 0) {
             LOG_INFO("Model %s: owner '%s' already absent, scoped unregister is a no-op",
                      model_id.c_str(), owner_id.c_str());
-            return 0;  // logical success; physical model unchanged
+            return 1;  // logical success; physical model remains unchanged
         }
         if (oit->second.size() > 1) {
             oit->second.erase(owner_id);
             LOG_INFO("Model %s: removed owner '%s' (remaining owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), oit->second.size());
-            return 0;  // logical release; co-owners keep the physical model
+            return 1;  // logical success; co-owners keep the physical model
         }
         if (it->second.ref_count > 0) {
             LOG_ERROR("Cannot unregister %s for last owner '%s': ref_count=%d "
@@ -612,8 +676,8 @@ int ModelManager::unregister_model(const std::string& model_id,
         oit->second.erase(owner_id);
         owners_.erase(oit);
     } else if (it->second.ref_count > 0) {
-        // Ownerless requests are the system-level force-unload path, but
-        // still respect live inference references.
+        // Ownerless requests are the system-level force-unload path, but still
+        // respect live inference references.
         LOG_ERROR("Cannot unregister %s: ref_count=%d (still in use by active sessions)",
                   model_id.c_str(), it->second.ref_count);
         return -1;

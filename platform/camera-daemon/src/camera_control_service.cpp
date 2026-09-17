@@ -1638,11 +1638,10 @@ grpc::Status CameraControlServiceImpl::SubmitDspJob(
     response->set_message(ok && result.message.empty() ? "OK" : result.message);
     response->set_error_code(result.rc);
     response->set_elapsed_ms(result.elapsed_ms);
-    // Server-side trace for failed DSP jobs. Before this, a firmware-level
-    // failure (e.g. the M13b full-rate + yolov5m degradation) surfaced only
-    // on the client — the daemon journal kept zero evidence, so
-    // post-mortems had nothing to correlate. Successes stay at INFO above;
-    // failures log at ERROR with rc + service message.
+    // Server-side trace for failed DSP jobs: without it a firmware-level
+    // failure surfaced only on the client and the daemon journal kept zero
+    // evidence for post-mortems. Successes stay at INFO above; failures
+    // log at ERROR with rc + service message.
     if (!ok) {
         HAL_LOG_ERROR("[CameraControl] SubmitDspJob FAILED: op=%d src=%lu "
                       "dsts=%zu rects=%zu rc=%d elapsed_ms=%u msg='%s'",
@@ -1690,7 +1689,7 @@ grpc::Status CameraControlServiceImpl::SubmitDspJobAsync(
     response->set_error_code(result.rc);
     response->set_job_id(job_id);
     response->set_done(false); /* enqueued, not executed */
-    // Same server-side failure trace as the sync path (整改: DSP 错误留痕).
+    // Same server-side failure trace as the sync path.
     if (!ok) {
         HAL_LOG_ERROR("[CameraControl] SubmitDspJobAsync FAILED: op=%d src=%lu "
                       "dsts=%zu rects=%zu rc=%d msg='%s'",
@@ -1762,8 +1761,7 @@ grpc::Status CameraControlServiceImpl::WaitDspJob(
     response->set_done(ok);
     // Failure trace — but skip ERR_TIMEOUT: clients poll wait_job in a loop
     // and a timeout return is the normal "still pending" poll result, not a
-    // job failure. Logging it would recreate the per-frame journal flood
-    // this remediation is removing.
+    // job failure. Logging it would flood the journal once per poll.
     if (!ok && result.rc != DSP_SVC_ERR_TIMEOUT) {
         HAL_LOG_ERROR("[CameraControl] WaitDspJob FAILED: job_id=%lu rc=%d "
                       "elapsed_ms=%u msg='%s'",

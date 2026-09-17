@@ -840,6 +840,8 @@ void FdPublisher::disconnect_client(int client_fd) {
     // is the registry key and could be reused by a new client after close().
     if (dsp_service_) {
         dsp_service_->release_client_buffers(client_fd);
+        // Drop any cross-process lookup leases this borrower still holds.
+        // Same fd-number recycling argument as release_client_buffers.
         dsp_service_->lookup_release_all(client_fd);
     }
 
@@ -919,7 +921,7 @@ FdPublisher::send_frame_to_client(ClientState* client, ManagedFrame* mf) {
     }
 
     msg.num_fds = num_fds;
-    msg.flags = mf->flags;   // FD_PUB_FRAME_FLAG_* baked-metadata (P1-7)
+    msg.flags = mf->flags;   // FD_PUB_FRAME_FLAG_* baked-metadata
 
     if (num_fds == 0) {
         // No DMA-BUF fds — this frame type doesn't support FD passing

@@ -286,25 +286,42 @@ void test_model_manager() {
 
     ModelManager mgr(loader.infer_ops(), loader.post_ops(), loader.draw_ops(), &loader);
 
-    // Register with the full identity used by the gRPC path. Fork API: the
-    // NPU batch rides the 6th register_model arg; model_type reaches the
-    // manager through init_post_process, not register_model.
+    // Register with the full identity used by the gRPC path.
     const std::string variant =
         R"({"backend_function":"hailo_yolov8n","detection_threshold":0.25})";
     int rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-a",
-                                true, variant);
+                                true, variant, "detection");
     ASSERT_EQ(rc, 0, "register_model failed");
 
-    // Same id/path/config from another owner is legitimate co-ownership
-    // (fork semantics: success, not a distinct existing-entry status).
+    // Same id/path/config from another owner is legitimate co-ownership.
     rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-b",
-                            true, variant);
-    ASSERT_EQ(rc, 0, "same-config co-ownership should succeed");
+                            true, variant, "detection");
+    ASSERT_EQ(rc, 1, "same-config co-ownership should return existing-entry status");
 
-    // Same id at a different batch is refused: the entry keeps its HAL
-    // session, so a silent accept would serve the stored batch.
+    // Same id/path but a different decoder identity must collide: accepting
+    // either request would let the gRPC layer rewire the incumbent's shared
+    // postprocess session after register_model returns.
+    std::string why;
     rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-c",
-                            true, variant, /*batch_size=*/2);
+                            true, variant, "classification", &why);
+    ASSERT_TRUE(rc != 0, "different model_type should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "type collision should carry a useful reason");
+
+    why.clear();
+    rc = mgr.register_model(
+        "yolo_test", "/fake/model.hef", "app-d", true,
+        R"({"backend_function":"hailo_yolov8s","detection_threshold":0.25})",
+        "detection", &why);
+    ASSERT_TRUE(rc != 0, "different variant should be refused");
+    ASSERT_TRUE(why.find("different configuration") != std::string::npos,
+                "variant collision should carry a useful reason");
+
+    // Same id/path/decoder at a different NPU batch is refused too: the
+    // entry keeps its HAL session, so a silent accept would serve the
+    // stored batch instead of the requested one.
+    rc = mgr.register_model("yolo_test", "/fake/model.hef", "app-c",
+                            true, variant, "detection", nullptr, 2);
     ASSERT_TRUE(rc != 0, "different batch should be refused");
 
     // Get model via snapshot (rehash-safe)
@@ -368,18 +385,18 @@ void test_owner_scoped_unregister() {
     int rc = mgr.register_model("owned", "/fake/owned.hef", "app-a");
     ASSERT_EQ(rc, 0, "initial owner registration failed");
     rc = mgr.register_model("owned", "/fake/owned.hef", "app-b");
-    ASSERT_EQ(rc, 0, "second owner should co-own existing entry");
+    ASSERT_EQ(rc, 1, "second owner should co-own existing entry");
 
     // A foreign/duplicate scoped release is a no-op, never a force unload.
     rc = mgr.unregister_model("owned", "not-an-owner");
-    ASSERT_EQ(rc, 0, "absent owner release should keep the physical model");
+    ASSERT_EQ(rc, 1, "absent owner release should keep the physical model");
     ASSERT_TRUE(mgr.is_owner("owned", "app-a"), "app-a ownership was disturbed");
     ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b ownership was disturbed");
     ASSERT_EQ(g_mock_destroys, 0, "absent owner must not destroy the model");
 
     // Releasing one of two owners keeps the shared registration resident.
     rc = mgr.unregister_model("owned", "app-a");
-    ASSERT_EQ(rc, 0, "co-owner release should keep the physical model");
+    ASSERT_EQ(rc, 1, "co-owner release should keep the physical model");
     ASSERT_TRUE(!mgr.is_owner("owned", "app-a"), "app-a should be released");
     ASSERT_TRUE(mgr.is_owner("owned", "app-b"), "app-b must remain");
     ASSERT_EQ(g_mock_destroys, 0, "co-owner release must not destroy the model");
@@ -512,7 +529,7 @@ void test_model_alias_refcount() {
     PASS();
 }
 
-// ─── Test: StreamInfer config ────────────────────────────────────────────────
+// ─── Test: NPU batch models ──────────────────────────────────────────────────
 
 void test_batch_model() {
     TEST(batch_model);
@@ -529,7 +546,8 @@ void test_batch_model() {
     const uint32_t per_frame_in  = 640 * 640 * 3;
     const uint32_t per_frame_out = 1024 * sizeof(float);
 
-    int rc = mgr.register_model("batch4", "/fake/batch4.hef", "", false, "", B);
+    int rc = mgr.register_model("batch4", "/fake/batch4.hef",
+                                "", false, "", "", nullptr, B);
     ASSERT_EQ(rc, 0, "register_model(batch=4) failed");
 
     auto snap = mgr.acquire_model_snapshot("batch4");
@@ -593,13 +611,16 @@ void test_batch_model() {
 
     // Re-registering an id (or aliasing a file) at a DIFFERENT batch must be
     // rejected: both paths share the existing HAL session, so a silent accept
-    // would serve the stored batch (fake success — the on-device trap that
-    // motivated the checks in model_manager).
-    rc = mgr.register_model("batch4", "/fake/batch4.hef", "", false, "", 2);
+    // would serve the stored batch (fake success — the trap that motivated
+    // the checks in model_manager).
+    rc = mgr.register_model("batch4", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 2);
     ASSERT_NE(rc, 0, "same-id re-registration with batch=2 must fail");
-    rc = mgr.register_model("batch4b", "/fake/batch4.hef", "", false, "", 1);
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 1);
     ASSERT_NE(rc, 0, "alias of a batch=4 file at batch=1 must fail");
-    rc = mgr.register_model("batch4b", "/fake/batch4.hef", "", false, "", 4);
+    rc = mgr.register_model("batch4b", "/fake/batch4.hef",
+                            "", false, "", "", nullptr, 4);
     ASSERT_EQ(rc, 0, "alias at the SAME batch should still succeed");
     mgr.unregister_model("batch4b");
 
@@ -609,6 +630,8 @@ void test_batch_model() {
 
     PASS();
 }
+
+// ─── Test: StreamInfer config ────────────────────────────────────────────────
 
 void test_stream_infer_config() {
     TEST(stream_infer_config);
@@ -1006,9 +1029,9 @@ void test_inference_scheduler() {
     int result_rc = -999;
     uint64_t infer_us = 0;
 
-    // Merged stub validates input[0].byte_size == 640*640*3*batch (fork
-    // batch-contract check), so the dummy payload must carry the stub's
-    // single-frame geometry even though the scheduler never reads it.
+    // The stub validates input[0].byte_size == 640*640*3*batch (the batch
+    // contract check in stub_infer_run), so the dummy payload must carry the
+    // stub's single-frame geometry even though the scheduler never reads it.
     HalTensor input{};
     std::vector<uint8_t> dummy(640 * 640 * 3, 0);
     input.data = dummy.data();
@@ -1569,7 +1592,7 @@ void test_dma_fd_infer() {
     ASSERT_TRUE(snap.has_value(), "model not found");
 
     // Simulate DMA-BUF path: data=NULL, dma_fd=fake (stub ignores actual fd).
-    // byte_size must match the stub's single-frame geometry (fork batch
+    // byte_size must match the stub's single-frame geometry (the batch
     // contract check in stub_infer_run).
     HalTensor input{};
     input.data      = nullptr;

@@ -490,7 +490,7 @@ static DaemonConfig load_config(const std::string& path) {
         } else if (section == "injection") {
             // P0-P2: app frame injection knobs (defaults live in
             // injection_service.h). `enabled` is the master gate and ships
-            // false: flip per rig once the bake-site wiring lands.
+            // false: opt-in, enable per deployment.
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.injection.enabled = (val == "true" || val == "1");
             else if (trimmed.find("queue_capacity:") != std::string::npos)
@@ -498,7 +498,7 @@ static DaemonConfig load_config(const std::string& path) {
             else if (trimmed.find("allowed_apps:") != std::string::npos) {
                 // P2-12 manifest permission gate: comma-separated app
                 // identities (SO_PEERCRED cmdline basenames). Empty/missing
-                // = allow all (rig/dev default).
+                // = allow all (development default).
                 cfg.injection.allowed_apps.clear();
                 size_t pos = 0;
                 while (pos <= val.size()) {

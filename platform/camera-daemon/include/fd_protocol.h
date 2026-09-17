@@ -80,14 +80,16 @@ typedef struct {
     char stream_name[FD_PUB_MAX_STREAM_NAME];
 } FdPubSubscribeMsg;
 
-/* Frame metadata flags (FdPubFrameMsg.flags). Coarse "bake active" truth
- * captured at dispatch time, not per-frame draw outcome: bit0 says the
- * overlay pass ran on the dispatching path (AiOverlay enabled+running),
- * bit1 says the DPM render block ran (DPM enabled+running and the HAL
- * exposes a draw op). Per-frame "did anything actually draw" would flap
- * with empty scenes and can never promise a clean frame — every router
- * stream is a potential overlay display, so the flag answers "is this
- * stream in the baked set" (cross-check against stream_map config). */
+/* ========== Frame delivery flags (FdPubFrameMsg.flags) ==========
+ * Per-frame metadata telling the SDK client what was already baked into
+ * the pixels it receives, so it can skip its own pass (or warn about
+ * double-draw). Baked-ness is a property of the STREAM, not the frame:
+ * overlay admission is decided at bind time (a stream only enters the
+ * baked set when something exposes a draw op). Per-frame "did anything
+ * actually draw" would flap with empty scenes and can never promise a
+ * clean frame — every router stream is a potential overlay display, so
+ * the flag answers "is this stream in the baked set" (cross-check
+ * against stream_map config). */
 #define FD_PUB_FRAME_FLAG_OVERLAY_BAKED 0x1u
 #define FD_PUB_FRAME_FLAG_DPM_BAKED     0x2u
 

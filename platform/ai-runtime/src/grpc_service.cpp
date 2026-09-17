@@ -222,24 +222,25 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         owner_id = "<system>";
     }
 
+    std::string why;
     int rc = model_mgr_->register_model(req->model_id(), req->model_path(),
                                         owner_id, req->transient(),
                                         req->model_variant(),
+                                        req->model_type(), &why,
                                         req->batch_size());
     if (rc < 0) {
         resp->mutable_status()->set_success(false);
         resp->mutable_status()->set_message(
-            req->batch_size() > 1
-                ? "Failed to register model: batch_size=" +
-                      std::to_string(req->batch_size()) +
-                      " rejected (HEF not compiled for this batch, or the "
-                      "model is already loaded at a different batch)"
-                : "Failed to register model");
+            "Failed to register model '" + req->model_id() + "': " +
+            (why.empty() ? std::string("internal error") : why));
         return grpc::Status::OK;
     }
 
-    // Initialize post-processing if model_type is provided
-    if (!req->model_type().empty() && model_mgr_->has_post_ops()) {
+    // Initialize post-processing only for a fresh entry. rc==1 is an
+    // identical same-id/path/config co-owner: its shared postprocess session
+    // is already initialized, and replacing it during an active inference is
+    // unnecessary even though the requested configuration is equivalent.
+    if (rc == 0 && !req->model_type().empty() && model_mgr_->has_post_ops()) {
         int post_rc = model_mgr_->init_post_process(
             req->model_id(), req->model_type(), req->model_variant());
         if (post_rc != 0 && req->transient()) {
@@ -291,8 +292,10 @@ grpc::Status AIRuntimeServiceImpl::UnregisterModel(
         // touched by any late callback.
         session_mgr_->destroy_sessions_by_model(req->model_id());
     }
-    resp->set_success(rc == 0);
-    resp->set_message(rc == 0 ? "Unregistered" : "Failed to unregister");
+    resp->set_success(rc >= 0);
+    resp->set_message(rc == 0 ? "Unregistered" :
+                      rc > 0 ? "Owner released; model remains registered" :
+                               "Failed to unregister");
     return grpc::Status::OK;
 }
 
@@ -1926,11 +1929,11 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
             continue;
         }
 
-        // fork NPU-batch models (batch>1) do not submit inline: consecutive
+        // NPU-batch models (batch>1) do not submit inline: consecutive
         // same-model frames are grouped into one NPU job by the grouped
         // submit phase after the per-frame validation pass. Disarm the
         // guard — the model ref rides with the item until the group's
-        // post tasks release it (fork semantics, pre-#66 tree).
+        // post tasks release it.
         if (c->snap->batch_size > 1) {
             model_ref_guard.disarm();
             continue;
@@ -2011,7 +2014,7 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         cb_state->release_owner();  // submitter owner
     }
 
-    // ── Per-frame size validation for batch models (fork NPU-batch) ──────────
+    // ── Per-frame size validation for batch models (NPU-batch) ────────────
     // A batch>1 session expects each item to carry exactly the per-frame
     // byte count (model_info sizes are B x per-frame). Fail mismatched items
     // up front so grouping never builds a torn batch buffer. Inline-submitted
@@ -2053,14 +2056,13 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         }
     }
 
-    // ── Grouped NPU-batch submit phase (fork batch>1 models) ──────────────────
+    // ── Grouped NPU-batch submit phase (batch>1 models) ────────────────────
     // Single-frame items were submitted inline in the materialization loop
-    // above (upstream #66 architecture). Here, consecutive same-model items
-    // of a batch>1 model collapse into ONE NPU job per B frames: the array
-    // runs all B frames in parallel inside a single InferJob instead of B
-    // serialized jobs. Grouped jobs predate the #66 external-async
-    // accounting and stay outside it — their teardown is self-sufficient
-    // (sync->remaining + pending_posts).
+    // above. Here, consecutive same-model items of a batch>1 model collapse
+    // into ONE NPU job per B frames: the array runs all B frames in parallel
+    // inside a single job instead of B serialized jobs. Grouped jobs predate
+    // the external-async accounting and stay outside it — their teardown is
+    // self-sufficient (sync->remaining + pending_posts).
     int i = 0;
     while (i < num_requests) {
         auto& c = ctxs[i];
@@ -2174,6 +2176,7 @@ grpc::Status AIRuntimeServiceImpl::InferBatch(
         }
         i = j;
     }
+
     // Wait for callbacks with a single timeout. Items not done by
     // then are reported as "Batch timeout". Late callbacks still fire
     // and release their own refs (via PostprocessPool).
@@ -2861,11 +2864,11 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                                    stream_resp->post_result());
                 }
 
-                // Skew (success only, fork P1-8): result-ready (here —
-                // response fully built, post-process done) minus frame
-                // capture. Both stamps are CLOCK_MONOTONIC: the daemon's
-                // frame stamp comes from the media pipeline and now_us() is
-                // steady_clock. Failures keep skew_us = 0 ("not measured").
+                // Skew (success only): result-ready (here — response fully
+                // built, post-process done) minus frame capture. Both stamps
+                // are CLOCK_MONOTONIC: the daemon's frame stamp comes from
+                // the media pipeline and now_us() is steady_clock. Failures
+                // keep skew_us = 0 ("not measured").
                 if (!pp_failed) {
                     uint64_t ready_us = now_us();
                     uint64_t capture_us = ts_ns / 1000;
@@ -3061,8 +3064,7 @@ grpc::Status AIRuntimeServiceImpl::GetStats(
     // Sampling window for the blocking HAL queries below (device/CPU/DSP
     // utilization is measured, not read). 0 = server default 500ms — the
     // pre-parameterization behavior, also what an Empty-sending legacy
-    // client gets. Clamped to [1,5000]: the perf suite measured a 536ms
-    // watermark at the default, so cheap snapshots ask for 1-50ms.
+    // client gets. Clamped to [1,5000].
     uint32_t window_ms = req ? req->sampling_window_ms() : 0;
     if (window_ms == 0) {
         window_ms = 500;

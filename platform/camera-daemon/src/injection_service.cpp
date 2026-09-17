@@ -234,7 +234,7 @@ InjectionPushResult InjectionService::push_frame(
      * The pin's owner fd anchors the app identity: a pinned buffer
      * implies a live UDS connection, whose SO_PEERCRED identity the
      * FdPublisher captured at accept time. An empty allow-list allows
-     * all (rig/dev default). */
+     * all (development default). */
     if (!cfg_.allowed_apps.empty()) {
         const std::string identity =
             identity_resolver_ ? identity_resolver_(pin.owner_fd()) : "";

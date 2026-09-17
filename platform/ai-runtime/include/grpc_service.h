@@ -142,7 +142,6 @@ private:
     // sessions have nothing tagged to sweep) or when the bus is down.
     void publish_session_end(const std::string& client_session_id);
 
-
     // Copies HAL tensor specs onto a protobuf ModelInfo. Shared by
     // ListModels and GetModelInfo so the list path carries the same
     // per-tensor facts as the detail path.

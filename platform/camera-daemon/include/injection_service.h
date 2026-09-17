@@ -70,7 +70,7 @@ struct InjectionServiceConfig {
     uint32_t max_height = 2160;
     /* Manifest permission gate: allowed app identities (SO_PEERCRED
      * cmdline basename of the UDS connection that owns the buffer).
-     * EMPTY = allow all (rig/dev default); non-empty rejects everyone
+     * EMPTY = allow all (development default); non-empty rejects everyone
      * not listed with INJ_SVC_ERR_PERMISSION. */
     std::vector<std::string> allowed_apps;
 };

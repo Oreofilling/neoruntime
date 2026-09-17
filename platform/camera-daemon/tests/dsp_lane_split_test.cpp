@@ -18,8 +18,7 @@
  *
  * Host-only harness: fake HalDspOps records the device_priority of every
  * init and the ctx every resize ran on; fake HalFrameBufferOps hands out
- * plain-heap NV12 pool buffers (imported memfd plays the source, exactly
- * like injection_owner_test).
+ * plain-heap NV12 pool buffers (imported memfd plays the source).
  */
 
 #include <cassert>

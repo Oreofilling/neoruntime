@@ -412,7 +412,6 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     )
     target_link_libraries(ai-overlay-binding-test PRIVATE pthread)
     add_test(NAME ai-overlay-binding-test COMMAND ai-overlay-binding-test)
-
     # keep_fd read-only contract guard: imported buffers are source-only
     # (the one exception: BLEND ARGB32 overlay dst). Guards existing
     # validate_and_pin policy; no production change. Host-only.
