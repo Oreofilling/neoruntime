@@ -348,20 +348,22 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(ai-overlay-session-test PRIVATE pthread)
     add_test(NAME ai-overlay-session-test COMMAND ai-overlay-session-test)
 
-    add_executable(injection-owner-test
-        tests/injection_owner_test.cpp
-        src/injection_service.cpp
-        src/dsp_service.cpp
+    # Output-isolation scope cut: admission/layers/suppression/[] clear/
+    # epoch + frame-binding expiry. Host-only; counting fake draw_result.
+    add_executable(ai-overlay-binding-test
+        tests/ai_overlay_binding_test.cpp
+        src/ai_overlay_subscriber.cpp
+        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
         ${HAL_COMMON_DIR}/hal_log.c
     )
-    target_include_directories(injection-owner-test PRIVATE
+    target_include_directories(ai-overlay-binding-test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${HAL_V2_INC}
         ${HAL_V2_INC}/common
         ${HAL_V2_INC}/model
     )
-    target_link_libraries(injection-owner-test PRIVATE pthread rt)
-    add_test(NAME injection-owner-test COMMAND injection-owner-test)
+    target_link_libraries(ai-overlay-binding-test PRIVATE pthread)
+    add_test(NAME ai-overlay-binding-test COMMAND ai-overlay-binding-test)
 
     # P1-9: per-lane vendor priority split (NORMAL ctx at cfg priority,
     # BACKGROUND ctx at 0). Host-only; fake HalDspOps/ fb_ops.
@@ -396,22 +398,6 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(dsp-pool-retention-test PRIVATE pthread rt)
     add_test(NAME dsp-pool-retention-test COMMAND dsp-pool-retention-test)
 
-    # Output-isolation scope cut: admission/layers/suppression/[] clear/
-    # epoch + frame-binding expiry. Host-only; counting fake draw_result.
-    add_executable(ai-overlay-binding-test
-        tests/ai_overlay_binding_test.cpp
-        src/ai_overlay_subscriber.cpp
-        ${HAL_COMMON_DIR}/hal_draw_cpu.cpp
-        ${HAL_COMMON_DIR}/hal_log.c
-    )
-    target_include_directories(ai-overlay-binding-test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${HAL_V2_INC}
-        ${HAL_V2_INC}/common
-        ${HAL_V2_INC}/model
-    )
-    target_link_libraries(ai-overlay-binding-test PRIVATE pthread)
-    add_test(NAME ai-overlay-binding-test COMMAND ai-overlay-binding-test)
     # keep_fd read-only contract guard: imported buffers are source-only
     # (the one exception: BLEND ARGB32 overlay dst). Guards existing
     # validate_and_pin policy; no production change. Host-only.
@@ -428,6 +414,21 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     )
     target_link_libraries(dsp-import-write-target-test PRIVATE pthread rt)
     add_test(NAME dsp-import-write-target-test COMMAND dsp-import-write-target-test)
+
+    add_executable(injection-owner-test
+        tests/injection_owner_test.cpp
+        src/injection_service.cpp
+        src/dsp_service.cpp
+        ${HAL_COMMON_DIR}/hal_log.c
+    )
+    target_include_directories(injection-owner-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${HAL_V2_INC}
+        ${HAL_V2_INC}/common
+        ${HAL_V2_INC}/model
+    )
+    target_link_libraries(injection-owner-test PRIVATE pthread rt)
+    add_test(NAME injection-owner-test COMMAND injection-owner-test)
 
     add_executable(fg2009-position-test
         tests/fg2009_position_test.cpp
