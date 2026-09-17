@@ -41,8 +41,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -77,21 +79,36 @@ struct DspServiceConfig {
      * single-op resize ~1500 ops/s, multi-crop N=7 ~6500 rects/s. */
     double quota_jobs_per_sec = 100.0;
     double quota_mpix_per_sec = 120.0;
+    double quota_total_jobs_per_sec = 400.0;
+    double quota_total_mpix_per_sec = 480.0;
     uint32_t job_timeout_ms = 2000;
-    /* Registry caps per owning UDS client. 16 MPix ≈ 24 MB NV12. */
+    /* Registry caps per owning process incarnation. The legacy `pixels`
+     * config names are ABI/config compatibility aliases for retained bytes.
+     * Allocation accounting uses the actual returned plane sizes and charges
+     * the HAL geometry pool capacity, not only the requested buffer count. */
     uint32_t max_buffers_per_client = 128;
-    uint64_t max_client_pixels = 16777216; /* 16 MPix outstanding */
-    /* Zero-copy source imports (DSP_IMPORT) per client. Imports hold no
-     * daemon pixel budget — the memory is the client's own — but each one
-     * pins a descriptor and dup'd fds, so cap them separately. */
+    uint64_t max_client_pixels = 2147483648ULL; /* 2 GiB retained pool capacity */
+    uint32_t max_total_buffers = 512;
+    uint64_t max_total_buffer_pixels = 4294967296ULL; /* 4 GiB service-wide */
+    /* Imports pin descriptors and may copy unsealed USERPTR planes into sealed
+     * daemon-owned memfds. Bound both count and declared bytes before any dup,
+     * copy, mmap, or allocation. */
     uint32_t max_imports_per_client = 64;
+    uint64_t max_import_bytes_per_client = 67108864; /* 64 MiB */
+    uint32_t max_total_imports = 256;
+    uint64_t max_total_import_bytes = 268435456; /* 256 MiB */
     /* Cross-process read leases (DSP_LOOKUP) per connection. A lease pins
      * the buffer and holds dup'd fds until released; a stuck borrower must
      * not be able to pin the registry unboundedly. */
     uint32_t max_lookups_per_client = 16;
-    /* P2: outstanding SubmitDspJobAsync jobs per owner. Bounds the jobs_
-     * registry (each entry holds a JobItem + pins until waited/reaped). */
+    /* P2: outstanding SubmitDspJobAsync jobs per owner and service. Bounds
+     * the registry/queues (each entry holds a JobItem + pins until retired). */
     uint32_t max_async_jobs_per_client = 32;
+    uint32_t max_total_async_jobs = 128;
+    /* Bound synchronous WaitDspJob handlers independently of job count. */
+    uint32_t max_waiters_per_job = 4;
+    uint32_t max_total_waiters = 64;
+    uint32_t max_wait_job_timeout_ms = 30000;
     /* P1-9: vendor device priority of the NORMAL lane's HAL context
      * (dsp_set_priority — the vendor runs higher-priority queued work
      * first). 1 puts app jobs ahead of same-priority stream-side DSP work
@@ -159,13 +176,18 @@ class DspService {
 public:
     DspService(HalDspOps* dsp_ops, HalFrameBufferOps* fb_ops,
                const DspServiceConfig& cfg = DspServiceConfig());
-    ~DspService();
+    ~DspService() noexcept;
 
     DspService(const DspService&) = delete;
     DspService& operator=(const DspService&) = delete;
 
     /** Init the HAL DSP context and start the worker thread. */
     bool start();
+    /**
+     * Stop workers and synchronously drain lifecycle users. This blocks until
+     * every BufferPin is released; callers must release pins held by the
+     * calling thread before invoking stop() or destroying the service.
+     */
     void stop();
     bool is_running() const { return running_.load(); }
 
@@ -245,12 +267,13 @@ public:
      * RAII pin of one registered buffer, for daemon-internal one-shot ops
      * (EncodeImage). Same lifecycle semantics as job pins: a concurrent
      * release detaches the id; the HAL buffer stays alive until this pin
-     * drops. Move-only.
+     * drops. Move-only. A pin must not be retained by a thread that calls
+     * stop() or destroys the owning DspService, because shutdown waits for it.
      */
     class BufferPin {
     public:
         BufferPin() = default;
-        ~BufferPin();
+        ~BufferPin() noexcept;
         BufferPin(BufferPin&& other) noexcept;
         BufferPin& operator=(BufferPin&& other) noexcept;
         BufferPin(const BufferPin&) = delete;
@@ -263,7 +286,7 @@ public:
 
     private:
         friend class DspService;
-        void release_pin();
+        void release_pin() noexcept;
 
         DspService* svc_ = nullptr;
         void* entry_ = nullptr; /* BufferEntry* — opaque outside the .cpp */
@@ -304,14 +327,163 @@ public:
      * *done_out = false. Unknown/reaped ids return DSP_SVC_ERR_NO_BUFFER.
      */
     DspJobResult wait_job(uint64_t job_id, uint32_t timeout_ms, bool& done_out);
+    uint32_t max_wait_job_timeout_ms() const noexcept {
+        return cfg_.max_wait_job_timeout_ms;
+    }
 
     DspServiceStats stats() const;
 
+#ifdef DSP_SERVICE_TESTING
+    /** Test-only fences around async registration. */
+    void set_after_async_pin_hook(std::function<void()> hook);
+    void set_after_async_register_hook(std::function<void()> hook);
+    void set_after_wait_job_lookup_hook(std::function<void()> hook);
+    void set_before_buffer_register_hook(std::function<void()> hook);
+    void set_before_pin_bookkeeping_hook(std::function<void()> hook);
+    void set_random_id_failure_for_test(bool fail);
+    size_t async_job_count_for_test();
+    size_t async_owner_slot_count_for_test();
+    uint32_t client_async_job_count_for_test(int client_fd);
+    bool quota_try_consume_process_for_test(int pid,
+                                            uint64_t process_start_time_ticks);
+    bool quota_try_consume_legacy_fd_for_test(int fd);
+    uint64_t retained_buffer_bytes_for_test();
+#endif
+
 private:
+    enum class LifecycleState : uint8_t { Stopped, Running, Stopping };
+
+    AllocResult alloc_buffers_impl(int client_fd, uint32_t width,
+                                   uint32_t height, HalPixelFormat format,
+                                   uint32_t count);
+    ImportResult import_buffer_impl(int client_fd, uint32_t width,
+                                    uint32_t height, HalPixelFormat format,
+                                    uint32_t num_planes,
+                                    const uint32_t* strides,
+                                    const uint32_t* sizes, const int* fds);
+    DspJobResult submit_job_impl(const DspJobDesc& desc);
+    DspJobResult submit_job_async_impl(const DspJobDesc& desc,
+                                       uint64_t& job_id_out);
+    DspJobResult wait_job_impl(uint64_t job_id, uint32_t timeout_ms,
+                               bool& done_out);
+
+    struct ClientRegistration {
+        int fd = -1;
+        uint64_t generation = 0;
+
+        bool operator==(const ClientRegistration& other) const noexcept {
+            return fd == other.fd && generation == other.generation;
+        }
+    };
+
+    struct ClientRegistrationHash {
+        size_t operator()(const ClientRegistration& registration) const noexcept;
+    };
+
+    struct ClientSession {
+        uint64_t generation = 0;
+        uint64_t device = 0;
+        uint64_t inode = 0;
+        bool connected = false;
+    };
+
+    bool begin_async_submission();
+    void end_async_submission() noexcept;
+    int begin_buffer_registration(int client_fd,
+                                  ClientRegistration& registration) noexcept;
+    void end_buffer_registration() noexcept;
+    bool client_registration_active_locked(
+        const ClientRegistration& registration) const noexcept;
+    bool begin_buffer_pin() noexcept;
+    void end_buffer_pin() noexcept;
+
+    struct AsyncSubmissionGuard {
+        explicit AsyncSubmissionGuard(DspService* service_in)
+            : service(service_in) {}
+        AsyncSubmissionGuard(const AsyncSubmissionGuard&) = delete;
+        AsyncSubmissionGuard& operator=(const AsyncSubmissionGuard&) = delete;
+        ~AsyncSubmissionGuard() noexcept {
+            if (service) service->end_async_submission();
+        }
+        DspService* service;
+    };
+
+    struct BufferRegistrationGuard {
+        explicit BufferRegistrationGuard(DspService* service_in)
+            : service(service_in) {}
+        BufferRegistrationGuard(const BufferRegistrationGuard&) = delete;
+        BufferRegistrationGuard& operator=(const BufferRegistrationGuard&) = delete;
+        ~BufferRegistrationGuard() noexcept {
+            if (service) service->end_buffer_registration();
+        }
+        DspService* service;
+    };
+
+    struct QuotaKey {
+        enum class Kind : uint8_t { LegacyFd, Process };
+
+        Kind kind = Kind::LegacyFd;
+        int legacy_fd = -1;
+        int pid = 0;
+        uint64_t process_start_time_ticks = 0;
+
+        static QuotaKey for_legacy_fd(int fd) {
+            return {Kind::LegacyFd, fd, 0, 0};
+        }
+        static QuotaKey for_process(int process_pid, uint64_t start_time_ticks) {
+            return {Kind::Process, -1, process_pid, start_time_ticks};
+        }
+        bool operator==(const QuotaKey& other) const {
+            return kind == other.kind && legacy_fd == other.legacy_fd &&
+                   pid == other.pid &&
+                   process_start_time_ticks == other.process_start_time_ticks;
+        }
+    };
+
+    struct QuotaKeyHash {
+        size_t operator()(const QuotaKey& key) const noexcept;
+    };
+
+    struct BufferPoolKey {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        HalPixelFormat format = HAL_PIX_FMT_NV12;
+        uint32_t max_buffers = 0;
+        uint64_t bytes_per_buffer = 0;
+
+        bool operator==(const BufferPoolKey& other) const noexcept {
+            return width == other.width && height == other.height &&
+                   format == other.format && max_buffers == other.max_buffers &&
+                   bytes_per_buffer == other.bytes_per_buffer;
+        }
+    };
+
+    struct BufferPoolKeyHash {
+        size_t operator()(const BufferPoolKey& key) const noexcept;
+    };
+
+    struct BufferPoolOwnerKey {
+        QuotaKey owner = QuotaKey::for_legacy_fd(-1);
+        BufferPoolKey pool;
+
+        bool operator==(const BufferPoolOwnerKey& other) const noexcept {
+            return owner == other.owner && pool == other.pool;
+        }
+    };
+
+    struct BufferPoolOwnerKeyHash {
+        size_t operator()(const BufferPoolOwnerKey& key) const noexcept;
+    };
+
     struct BufferEntry {
         uint64_t id = 0;
         int client_fd = -1;
+        ClientRegistration client_registration;
+        QuotaKey quota_key = QuotaKey::for_legacy_fd(-1);
+        QuotaKey resource_key = QuotaKey::for_legacy_fd(-1);
+        BufferPoolKey pool_key;
         HalFrameBuffer* fb = nullptr;
+        uint64_t retained_import_bytes = 0;
         uint32_t pins = 0;      /* held by queued/running jobs            */
         bool detached = false;  /* removed from registry, pending free    */
         bool imported = false;  /* DSP_IMPORT descriptor, not a HAL pool buffer */
@@ -320,12 +492,22 @@ private:
     struct JobItem {
         DspJobDesc desc;
         DspPriority priority = DspPriority::Normal;
-        int owner_fd = -1;         /* quota owner (src buffer's client)   */
+        int owner_fd = -1;         /* lifecycle owner (src buffer client) */
+        ClientRegistration owner_registration;
+        QuotaKey quota_key = QuotaKey::for_legacy_fd(-1);
+        QuotaKey resource_key = QuotaKey::for_legacy_fd(-1);
         double charge_mpix = 0.0;
         std::vector<BufferEntry*> pinned; /* resolved at validation       */
         DspJobResult result;
+        std::string cancellation_message;
         bool done = false;
-        bool abandoned = false;    /* submitter timed out; discard result */
+        uint32_t active_waiters = 0;       /* guarded by done_mu_          */
+        bool async_slot_released = false; /* guarded by done_mu_          */
+        /* Set by another thread (submitter timeout / owner disconnect)
+         * while the worker may be reading it at the execute_job tail —
+         * atomic because a plain bool read there is a data race, however
+         * "benign" the outcome looks. */
+        std::atomic<bool> abandoned{false};
     };
     using JobRef = std::shared_ptr<JobItem>;
 
@@ -335,27 +517,74 @@ private:
         std::chrono::steady_clock::time_point last;
     };
 
+    struct RetainedUsage {
+        uint32_t buffers = 0;
+        uint64_t buffer_bytes = 0;
+        uint32_t pending_buffers = 0;
+        uint64_t pending_buffer_bytes = 0;
+        uint32_t imports = 0;
+        uint64_t import_bytes = 0;
+    };
+
+    struct BufferAdmission {
+        QuotaKey owner = QuotaKey::for_legacy_fd(-1);
+        uint32_t buffers = 0;
+        uint64_t owner_bytes = 0;
+        uint64_t total_bytes = 0;
+        bool active = false;
+    };
+
+    struct BufferPoolUsage {
+        uint32_t refs = 0;
+        uint64_t retained_bytes = 0;
+    };
+
     // Validation + resolution (caller: any thread; takes registry lock).
-    int validate_and_pin(DspJobDesc desc, JobRef& job_out, std::string& why);
+    int validate_and_pin(const DspJobDesc& desc, JobRef& job_out,
+                         std::string& why);
     bool resolve_pin_buffer(uint64_t id, int& owner_fd_out, BufferEntry*& entry);
-    void unpin_entries(const std::vector<BufferEntry*>& entries);
-    /* caller holds buffers_mu_; on the last pin of a non-imported buffer
-     * parks it for retention (parked_out, when given, counts parks) or
-     * appends fb to `to_free` */
-    void detach_entry_locked(BufferEntry* entry,
-                             std::vector<HalFrameBuffer*>& to_free,
-                             size_t* parked_out = nullptr);
+    void unpin_entry(BufferEntry* entry) noexcept;
+    void unpin_entries(const std::vector<BufferEntry*>& entries) noexcept;
+    struct DetachedFrame {
+        HalFrameBuffer* fb = nullptr;
+        bool imported = false;
+    };
+    /* caller holds buffers_mu_; returned frame is released after unlock */
+    DetachedFrame detach_entry_locked(BufferEntry* entry) noexcept;
+    static void release_detached_frame(HalFrameBufferOps* fb_ops,
+                                       DetachedFrame frame) noexcept;
+    QuotaKey resource_owner_key(const QuotaKey& quota_key) const;
+    int reserve_buffer_admission(const QuotaKey& resource_key,
+                                 uint32_t width, uint32_t height,
+                                 HalPixelFormat format, uint32_t max_buffers,
+                                 uint32_t count, BufferAdmission& admission,
+                                 std::string& why) noexcept;
+    void release_buffer_admission(BufferAdmission& admission) noexcept;
+    void release_buffer_admission_locked(BufferAdmission& admission) noexcept;
+    int reserve_buffer_usage_locked(const QuotaKey& resource_key,
+                                    const BufferPoolKey& pool_key,
+                                    uint32_t count, std::string& why) noexcept;
+    void release_buffer_usage_locked(const QuotaKey& resource_key,
+                                     const BufferPoolKey& pool_key,
+                                     uint32_t count) noexcept;
+    int reserve_import_usage(const QuotaKey& resource_key, uint64_t bytes,
+                             std::string& why) noexcept;
+    void release_import_usage(const QuotaKey& resource_key, uint32_t count,
+                              uint64_t bytes) noexcept;
+    void release_entry_usage_locked(const BufferEntry* entry) noexcept;
 
-    bool quota_try_consume(int owner_fd, double mpix, std::string& why);
+    bool quota_try_consume(const QuotaKey& quota_key, double mpix,
+                           std::string& why);
     void quota_forget(int owner_fd);
-    /* Quota identity: translate a client fd into its owning PROCESS via
-     * SO_PEERCRED, so one process with many connections shares a single
-     * bucket (P0-4 — removes the fresh-client-per-call quota dodge).
-     * Returns -pid (negative namespace, cannot collide with fd keys), or
-     * owner_fd unchanged when the peer cannot be resolved (anonymous /
-     * daemon-internal owners keep the legacy per-fd bucket). */
-    int quota_owner_key(int owner_fd);
+    /* Resolve a live UDS peer once at buffer registration. A process key uses
+     * both SO_PEERCRED PID and /proc/<pid>/stat start time, so connections from
+     * one process share quota while a later PID incarnation cannot inherit it.
+     * If either identity component is unavailable, preserve legacy per-fd
+     * behavior in a separately tagged namespace. */
+    QuotaKey quota_owner_key(int owner_fd);
 
+    void release_async_job_slot_locked(const JobRef& job) noexcept;
+    void cancel_queued_jobs(const ClientRegistration& registration) noexcept;
     void worker_loop();
     void execute_job(const JobRef& job);
 
@@ -390,6 +619,14 @@ private:
     void* dsp_ctx_background_ = nullptr;
     std::thread worker_;
     std::atomic<bool> running_{false};
+    std::mutex lifecycle_mu_;
+    std::condition_variable lifecycle_cv_;
+    LifecycleState lifecycle_state_ = LifecycleState::Stopped;
+    size_t active_async_submissions_ = 0;
+    size_t active_buffer_registrations_ = 0;
+    size_t active_buffer_pins_ = 0;
+    uint64_t next_client_generation_ = 1;
+    std::unordered_map<int, ClientSession> client_sessions_;
 
     // Job queue (FIFO; NORMAL drains before BACKGROUND).
     std::mutex q_mu_;
@@ -404,15 +641,32 @@ private:
     std::mutex done_mu_;
     std::condition_variable done_cv_;
     std::unordered_map<uint64_t, JobRef> jobs_;
-    std::unordered_map<int, uint32_t> client_async_jobs_;
+    std::unordered_map<QuotaKey, uint32_t, QuotaKeyHash> client_async_jobs_;
+    uint32_t total_async_jobs_ = 0;
+    uint32_t total_waiters_ = 0;
+#ifdef DSP_SERVICE_TESTING
+    std::function<void()> after_async_pin_hook_;
+    std::function<void()> after_async_register_hook_;
+    std::function<void()> after_wait_job_lookup_hook_;
+    std::function<void()> before_buffer_register_hook_;
+    std::function<void()> before_pin_bookkeeping_hook_;
+#endif
 
     // Buffer registry (keys are unpredictable random ids; 0 is never valid).
     std::mutex buffers_mu_;
     std::unordered_map<uint64_t, BufferEntry*> buffers_;
-    std::unordered_map<int, uint32_t> client_buffer_count_;
-    std::unordered_map<int, uint64_t> client_pixels_;
-    std::unordered_map<int, uint32_t> client_import_count_;
-    uint64_t next_buffer_id_ = 1; /* starts at 1; 0 is never a valid id */
+    std::unordered_map<QuotaKey, RetainedUsage, QuotaKeyHash> retained_usage_;
+    std::unordered_map<BufferPoolKey, BufferPoolUsage, BufferPoolKeyHash>
+        buffer_pools_;
+    std::unordered_map<BufferPoolOwnerKey, uint32_t,
+                       BufferPoolOwnerKeyHash>
+        buffer_pool_owner_refs_;
+    uint32_t total_buffers_ = 0;
+    uint64_t total_buffer_bytes_ = 0;
+    uint32_t pending_buffers_ = 0;
+    uint64_t pending_buffer_bytes_ = 0;
+    uint32_t total_imports_ = 0;
+    uint64_t total_import_bytes_ = 0;
 
     // P1-9 pool retention: released NON-imported pool buffers parked by
     // geometry {width, height, format} for cfg.pool_retention_ms, reused
@@ -428,13 +682,20 @@ private:
     std::deque<ParkedGeometry> parked_order_; /* first-park order — whole-
                                                * geometry LRU eviction */
     uint64_t parked_footprint_ = 0; /* chunk-accurate bytes parked        */
-    /* caller holds buffers_mu_; parks fb or frees it via to_free, then
-     * evicts whole oldest geometries while parked_footprint_ exceeds the
-     * cap (evictions appended to to_free). Refuses when not running or
-     * retention is disabled — fb goes straight to to_free. */
-    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb,
-                             std::vector<HalFrameBuffer*>& to_free,
-                             size_t* parked_out = nullptr);
+    /* Queued by park_or_free_locked under buffers_mu_ (refused inputs +
+     * eviction victims + the retention-disabled case); released to HAL by
+     * drain_pending_releases() after the lock drops. Reserved in start()
+     * because detach_entry_locked pushes here on a noexcept path. */
+    std::vector<HalFrameBuffer*> pending_release_;
+    /* caller holds buffers_mu_; parks fb or queues it into
+     * pending_release_, then evicts whole oldest geometries while
+     * parked_footprint_ exceeds the cap (evictions queued the same
+     * way). Refuses when not running or retention is disabled — fb is
+     * queued for release instead. */
+    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb);
+    /* swaps pending_release_ under buffers_mu_ and HAL-releases outside
+     * it; call only with buffers_mu_ NOT held */
+    void drain_pending_releases() noexcept;
     /* takes buffers_mu_ itself (alloc path runs lock-free): drops expired
      * front entries of g (HAL-released after unlock), pops one reusable
      * buffer or returns nullptr. Counts retention_reuses on a hit. */
@@ -453,7 +714,8 @@ private:
 
     // Per-owner token buckets.
     std::mutex quota_mu_;
-    std::unordered_map<int, QuotaBucket> quotas_;
+    std::unordered_map<QuotaKey, QuotaBucket, QuotaKeyHash> quotas_;
+    QuotaBucket global_quota_;
 
     // Stats.
     mutable std::mutex stats_mu_;

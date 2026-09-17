@@ -583,25 +583,37 @@ int ModelManager::unregister_model(const std::string& model_id,
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
 
-    // If owner_id is provided, remove only that owner
+    // Owner-scoped release must be transactional with physical unload
+    // (upstream #66 semantics, return codes kept fork-convention: 0 ok,
+    // -1 refused). A request for an owner that is not present is an
+    // idempotent no-op — it must never fall through and unload somebody
+    // else's registration. If this is the last owner, retain it while an
+    // active inference prevents unload so a refused request does not
+    // leave an ownerless live model.
     if (!owner_id.empty()) {
         auto oit = owners_.find(model_id);
-        if (oit != owners_.end()) {
+        if (oit == owners_.end() || oit->second.count(owner_id) == 0) {
+            LOG_INFO("Model %s: owner '%s' already absent, scoped unregister is a no-op",
+                     model_id.c_str(), owner_id.c_str());
+            return 0;  // logical success; physical model unchanged
+        }
+        if (oit->second.size() > 1) {
             oit->second.erase(owner_id);
             LOG_INFO("Model %s: removed owner '%s' (remaining owners: %zu)",
                      model_id.c_str(), owner_id.c_str(), oit->second.size());
-
-            // If other owners remain, don't unload
-            if (!oit->second.empty()) {
-                return 0;
-            }
-            // Clean up empty owner set
-            owners_.erase(oit);
+            return 0;  // logical release; co-owners keep the physical model
         }
-    }
-
-    // Check ref_count before physical unload
-    if (it->second.ref_count > 0) {
+        if (it->second.ref_count > 0) {
+            LOG_ERROR("Cannot unregister %s for last owner '%s': ref_count=%d "
+                      "(still in use by active sessions)",
+                      model_id.c_str(), owner_id.c_str(), it->second.ref_count);
+            return -1;
+        }
+        oit->second.erase(owner_id);
+        owners_.erase(oit);
+    } else if (it->second.ref_count > 0) {
+        // Ownerless requests are the system-level force-unload path, but
+        // still respect live inference references.
         LOG_ERROR("Cannot unregister %s: ref_count=%d (still in use by active sessions)",
                   model_id.c_str(), it->second.ref_count);
         return -1;
@@ -622,18 +634,26 @@ int ModelManager::unregister_model(const std::string& model_id,
 // Force unregister all
 // ============================================================
 
-void ModelManager::force_unregister_all() {
+bool ModelManager::force_unregister_all() {
     std::unique_lock lock(mu_);
+    for (const auto& [id, entry] : models_) {
+        if (entry.ref_count > 0) {
+            LOG_ERROR("Cannot unload models for GenAI: model %s has %d live "
+                      "reference(s)", id.c_str(), entry.ref_count);
+            return false;
+        }
+    }
+
     for (auto& [id, entry] : models_) {
         release_post_locked(entry.post_session.session);
         release_infer_locked(entry.infer_session);
-        LOG_INFO("Force unloaded model %s (ref_count was %d)",
-                 id.c_str(), entry.ref_count);
+        LOG_INFO("Unloaded model %s for GenAI", id.c_str());
     }
     models_.clear();
     owners_.clear();
     infer_refs_.clear();
     post_refs_.clear();
+    return true;
 }
 
 // ============================================================
@@ -731,18 +751,20 @@ int ModelManager::tensor_from_frame(const HalFrameBuffer* frame, HalTensor* tens
 
 void ModelManager::free_tensor(HalTensor* tensor) {
     if (!infer_ops_ || !infer_ops_->free_tensor) return;
-    if (tensor && tensor->data) {
+    if (tensor && (tensor->data || tensor->priv)) {
         infer_ops_->free_tensor(tensor);
         tensor->data = nullptr;
+        tensor->priv = nullptr;
     }
 }
 
 void ModelManager::free_outputs(HalTensor* outputs, int num_outputs) {
     if (!infer_ops_ || !infer_ops_->free_tensor) return;
     for (int i = 0; i < num_outputs; i++) {
-        if (outputs[i].data != nullptr) {
+        if (outputs[i].data != nullptr || outputs[i].priv != nullptr) {
             infer_ops_->free_tensor(&outputs[i]);
             outputs[i].data = nullptr;
+            outputs[i].priv = nullptr;
         }
     }
 }
@@ -781,9 +803,10 @@ int ModelManager::query_session_stats(const std::string& model_id,
                                        HalInferenceSessionPerfStats* out) {
     if (!infer_ops_ || !infer_ops_->query_session_performance_stats || !out)
         return -1;
+    ModelGuard guard(this, model_id);
     auto snap = acquire_model_snapshot(model_id);
     if (!snap) return -1;
-    ModelGuard guard(this, model_id);
+    guard.arm();
     return infer_ops_->query_session_performance_stats(
         snap->infer_session, sampling_ms, out);
 }
