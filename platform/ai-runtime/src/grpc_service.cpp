@@ -630,8 +630,6 @@ bool validate_infer_inputs(const pb::InferRequest& request,
     return true;
 }
 
-
-
 // Repack an NV12 frame received as per-plane dma-buf fds into a tight
 // [h*3/2, w] UINT8 CPU buffer — byte-for-byte the layout the bytes path
 // sends, so downstream geometry validation is identical. One dma-buf per
@@ -707,16 +705,6 @@ bool repack_nv12_planes(const BufferLookupClient::LookupResult& r,
                         std::string& out, std::string& why) {
     return repack_nv12_planes(r.width, r.height, r.format, r.num_planes,
                               r.strides, r.sizes, r.fds, out, why);
-}
-
-// Frame pushed by camera-daemon's FD publisher (StreamInfer input).
-bool repack_nv12_planes(const ReceivedFrame& f,
-                        std::string& out, std::string& why) {
-    static const std::vector<int> kNoFds;
-    return repack_nv12_planes(f.width, f.height, f.format, f.num_planes,
-                              f.strides, f.sizes,
-                              f.fd_group ? f.fd_group->fds : kNoFds,
-                              out, why);
 }
 
 // ─── P1-2: buffer_id direct-bind ─────────────────────────────────────────────
