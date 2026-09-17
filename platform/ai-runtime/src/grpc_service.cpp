@@ -596,7 +596,7 @@ static void fill_proto_post_result(pb::PostResult* out, const HalPostprocessResu
 
 namespace {
 
-// ─── Input admission limits (upstream #66) ────────────────────────────────
+// ─── Input admission limits ───────────────────────────────────────────────
 constexpr int kMaxInferBatchRequests = 64;
 constexpr uint64_t kMaxInferBatchInputBytes = 32ULL * 1024ULL * 1024ULL;
 
@@ -2624,11 +2624,11 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                 num_inputs = 1;
                 input_owner = direct_lease;
             } else if (num_inputs == 0) {
-                // fork (2026-09-16 remediation #10): packed-RGB-input model —
-                // convert through the session-aware preprocess. build_nv12_tensors
-                // can never match an RGB model's byte_size and run() would reject
-                // every frame (the yolov5m chain-B journal flood). The conversion
-                // cost is reported in repack_us (it is the CPU stage of this path).
+                // Packed-RGB-input model: convert through the session-aware
+                // preprocess. build_nv12_tensors can never match an RGB model's
+                // byte_size and run() would reject every frame. The conversion
+                // cost is reported in repack_us (it is the CPU stage of this
+                // path).
                 const bool rgb_model = snap->model_info.num_inputs > 0 &&
                     !snap->model_info.inputs[0].is_nv12;
                 bool converted = false;
