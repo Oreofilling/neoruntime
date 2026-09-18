@@ -10,7 +10,8 @@ SERVICES=(
     ai-runtime
     device-control
     device-discovery
-    onvif-device
+    # onvif-device is deliberately omitted: ONVIF discovery stays off by
+    # default. Opt in per device with `systemctl enable --now onvif-device`.
     platform-api
     app-manager
     aipc-nginx-gateway
