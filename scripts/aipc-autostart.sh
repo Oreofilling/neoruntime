@@ -3,6 +3,8 @@
 
 set -uo pipefail
 
+# onvif-device is deliberately omitted: ONVIF discovery stays off by
+# default. Opt in per device with `systemctl enable --now onvif-device`.
 SERVICES=(
     aipc-healthmon
     event-bus
@@ -10,8 +12,6 @@ SERVICES=(
     ai-runtime
     device-control
     device-discovery
-    # onvif-device is deliberately omitted: ONVIF discovery stays off by
-    # default. Opt in per device with `systemctl enable --now onvif-device`.
     platform-api
     app-manager
     aipc-nginx-gateway

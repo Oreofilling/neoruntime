@@ -267,9 +267,9 @@ func init() {
 
 // ============ service management ============
 
-// aipcServices contains the SERVICES in scripts/aipc-autostart.sh in dependency
-// order plus optional units such as onvif-device that system disable must also
-// quiesce. stop reverses the list. system_test.go guards the boot-set mapping.
+// aipcServices mirrors SERVICES in scripts/aipc-autostart.sh (dependency
+// order; stop reverses it). system_test.go fails the build when the two
+// lists drift, so `system stop/disable` always covers the full boot set.
 var aipcServices = []string{
 	"aipc-healthmon",
 	"event-bus",
@@ -277,7 +277,6 @@ var aipcServices = []string{
 	"ai-runtime",
 	"device-control",
 	"device-discovery",
-	"onvif-device",
 	"platform-api",
 	"app-manager",
 	"aipc-nginx-gateway",
