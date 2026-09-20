@@ -275,24 +275,24 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
     if (rc == 0 && !req->model_type().empty() && model_mgr_->has_post_ops()) {
         int post_rc = model_mgr_->init_post_process(
             req->model_id(), req->model_type(), req->model_variant());
-        if (post_rc != 0 && req->transient()) {
-            // A transient model that declared a postprocess type but failed to
-            // initialize it would answer inference with raw tensors — silent
-            // degradation. Roll the registration back and fail loudly.
-            LOG_ERROR("RegisterModel: post-process init failed for transient "
-                      "model %s (type=%s, rc=%d), rolling back registration",
+        if (post_rc != 0) {
+            // A model that declared a postprocess type but failed to
+            // initialize it would answer inference with raw tensors — or,
+            // with a broken/unresolvable vendor plugin, zero decoded
+            // results — while still reporting success. That is the silent
+            // no-op trap. Roll the registration back and fail loudly,
+            // transient or not: every Go-side caller treats success=false as
+            // an error and rolls back its own state too.
+            LOG_ERROR("RegisterModel: post-process init failed for model "
+                      "%s (type=%s, rc=%d), rolling back registration",
                       req->model_id().c_str(), req->model_type().c_str(), post_rc);
             model_mgr_->unregister_model(req->model_id(), owner_id);
             resp->mutable_status()->set_success(false);
             resp->mutable_status()->set_message(
-                "post-process init failed for app-bundled model '" +
-                req->model_id() + "' (type=" + req->model_type() + ")");
+                "post-process init failed for model '" + req->model_id() +
+                "' (type=" + req->model_type() + ", rc=" +
+                std::to_string(post_rc) + ")");
             return grpc::Status::OK;
-        }
-        if (post_rc != 0) {
-            LOG_WARN("Post-process init failed for %s: %d (inference will return raw tensors)",
-                     req->model_id().c_str(), post_rc);
-            // Continue anyway - raw tensors will still be available
         }
     }
 
