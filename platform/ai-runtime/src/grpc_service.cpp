@@ -3,6 +3,7 @@
 #include "common.h"
 #include "dsp_client.h"
 #include "stream_infer_utils.h"
+#include "model_variant_validation.h"
 
 #include "hal_inference.h"
 #include "hal_postprocess.h"
@@ -213,6 +214,37 @@ grpc::Status AIRuntimeServiceImpl::RegisterModel(
         resp->mutable_status()->set_message(
             "model_type is required for app-bundled (transient) model '" +
             req->model_id() + "'");
+        return grpc::Status::OK;
+    }
+
+    // Boundary validation (P1a): the REST import path validates model_type
+    // and the postprocess variant (handlers/ai_postprocess.go), but this
+    // gRPC surface is reachable directly from the SDK — a typo'd type used to
+    // fall through to init_post_process's silent detection default, and a
+    // typo'd variant meant zero detections with success=true. Refuse both up
+    // front with the same closed schema the REST side enforces. Preload
+    // registration (main.cpp) bypasses this handler and stays trusted.
+    if (!req->model_type().empty() &&
+        !is_known_model_type(req->model_type())) {
+        const std::string msg =
+            "Unsupported model_type '" + req->model_type() +
+            "' for model '" + req->model_id() +
+            "' (known: detection, yolo, landmarks, keypoint, segmentation, "
+            "classification, clip, embedding, depth, monocular_depth, "
+            "scdepth, ocr_detection, ocr_recognition; empty = raw output "
+            "only)";
+        LOG_ERROR("RegisterModel: %s", msg.c_str());
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(msg);
+        return grpc::Status::OK;
+    }
+    const std::string variant_error =
+        validate_model_variant(req->model_type(), req->model_variant());
+    if (!variant_error.empty()) {
+        LOG_ERROR("RegisterModel: %s (model_id=%s)", variant_error.c_str(),
+                  req->model_id().c_str());
+        resp->mutable_status()->set_success(false);
+        resp->mutable_status()->set_message(variant_error);
         return grpc::Status::OK;
     }
 
