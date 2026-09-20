@@ -3289,7 +3289,33 @@ grpc::Status AIRuntimeServiceImpl::UpdatePostprocessConfig(
     int rc = model_mgr_->update_postprocess_config(req->model_id(), req->config_json());
     resp->mutable_status()->set_success(rc == 0);
     if (rc != 0) {
-        resp->mutable_status()->set_message("Failed to update config: " + std::to_string(rc));
+        // Readable rc mapping — a bare negative number sent SDK users
+        // guessing. -2 dominates real reports: it is all a model registered
+        // WITHOUT model_type can answer (no postprocess session exists to
+        // reconfigure), for every key.
+        std::string why;
+        switch (rc) {
+            case -1:
+                why = "model not found";
+                break;
+            case -2:
+                why = "model has no post-processing session — it was "
+                      "registered without model_type; re-register it with a "
+                      "model_type before updating its post-process config";
+                break;
+            case -3:
+                why = "platform does not support post-process config updates";
+                break;
+            default:
+                why = "config rejected (rc=" + std::to_string(rc) +
+                      ") — keys must match the variant schema of the model's "
+                      "family (detection: backend_function, iou_threshold, "
+                      "detection_threshold, output_activation, label_offset, "
+                      "max_boxes, labels); unknown keys are refused by the "
+                      "plugin (rc=-2801)";
+                break;
+        }
+        resp->mutable_status()->set_message("Failed to update config: " + why);
     }
 
     return grpc::Status::OK;

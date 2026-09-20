@@ -627,7 +627,12 @@ int ModelManager::update_postprocess_config(const std::string& model_id,
     std::unique_lock lock(mu_);
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
-    if (!it->second.post_session.session) return -2;
+    if (!it->second.post_session.session) {
+        LOG_WARN("%s: no postprocess session (registered without model_type) "
+                 "— runtime config updates need a re-registration with model_type",
+                 model_id.c_str());
+        return -2;
+    }
     if (!post_ops_ || !post_ops_->apply_config_json) return -3;
     int rc = post_ops_->apply_config_json(it->second.post_session.session, config_json.c_str());
     if (rc == 0) {
