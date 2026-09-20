@@ -1070,11 +1070,21 @@ void AutoInfer::pipeline_loop(
                             }
                         }
                     } catch (const std::exception& e) {
-                        LOG_ERROR("AutoInfer: postprocess failed for %s: %s",
-                                  model_id.c_str(), e.what());
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s: %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(), e.what(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
                     } catch (...) {
-                        LOG_ERROR("AutoInfer: postprocess failed for %s",
-                                  model_id.c_str());
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
                     }
                 };
 

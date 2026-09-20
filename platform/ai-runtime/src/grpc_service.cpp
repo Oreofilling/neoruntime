@@ -1224,12 +1224,20 @@ grpc::Status AIRuntimeServiceImpl::Infer(
                         }
                     }
                 } catch (const std::exception& e) {
-                    LOG_ERROR("Postprocess failed for model '%s': %s",
-                              model_id.c_str(), e.what());
                     pp_failed = true;
                     response_ptr->mutable_status()->set_success(false);
                     response_ptr->mutable_status()->set_message(
                         std::string("Postprocess failed: ") + e.what());
+                    // Same journal cadence as the rc!=0 branch above: a
+                    // throwing plugin also fires here per frame.
+                    uint64_t fail_n = 0;
+                    if (model_mgr_->note_post_failure(model_id, -1,
+                                                      &fail_n)) {
+                        LOG_ERROR("Postprocess failed for model '%s': %s "
+                                  "(failure #%llu)",
+                                  model_id.c_str(), e.what(),
+                                  static_cast<unsigned long long>(fail_n));
+                    }
                 }
             }
 
@@ -1509,12 +1517,17 @@ static void infer_batch_item_post(InferBatchItemCtx* ctx,
                 }
             }
         } catch (const std::exception& e) {
-            LOG_ERROR("Postprocess failed for model '%s': %s",
-                      ctx->model_id.c_str(), e.what());
             pp_failed = true;
             ctx->response.mutable_status()->set_success(false);
             ctx->response.mutable_status()->set_message(
                 std::string("Postprocess failed: ") + e.what());
+            uint64_t fail_n = 0;
+            if (mgr->note_post_failure(ctx->model_id, -1, &fail_n)) {
+                LOG_ERROR("Postprocess failed for model '%s': %s "
+                          "(failure #%llu)",
+                          ctx->model_id.c_str(), e.what(),
+                          static_cast<unsigned long long>(fail_n));
+            }
         }
         mgr->free_post_result(&post_result);
     }
@@ -1722,13 +1735,19 @@ static void complete_infer_batch_callback(
                                 }
                             }
                         } catch (const std::exception& e) {
-                            LOG_ERROR(
-                                "Postprocess failed for model '%s': %s",
-                                ctx->model_id.c_str(), e.what());
                             post_failed = true;
                             ctx->response.mutable_status()->set_success(false);
                             ctx->response.mutable_status()->set_message(
                                 std::string("Postprocess failed: ") + e.what());
+                            uint64_t fail_n = 0;
+                            if (mgr->note_post_failure(ctx->model_id, -1,
+                                                       &fail_n)) {
+                                LOG_ERROR("Postprocess failed for model "
+                                          "'%s': %s (failure #%llu)",
+                                          ctx->model_id.c_str(), e.what(),
+                                          static_cast<unsigned long long>(
+                                              fail_n));
+                            }
                         }
                     }
 
@@ -2935,12 +2954,21 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                             }
                         }
                     } catch (const std::exception& e) {
-                        LOG_ERROR("Postprocess failed for model '%s': %s",
-                                  model_id.c_str(), e.what());
                         pp_failed = true;
                         stream_resp->mutable_status()->set_success(false);
                         stream_resp->mutable_status()->set_message(
                             std::string("Postprocess failed: ") + e.what());
+                        // Same journal cadence as the rc!=0 branch above: a
+                        // throwing plugin also fires here per frame.
+                        uint64_t fail_n = 0;
+                        if (model_mgr_->note_post_failure(model_id, -1,
+                                                          &fail_n)) {
+                            LOG_ERROR("Postprocess failed for model '%s': %s "
+                                      "(failure #%llu)",
+                                      model_id.c_str(), e.what(),
+                                      static_cast<unsigned long long>(
+                                          fail_n));
+                        }
                     }
                     perf->set_post_us(now_us() - post_t0);
                 }
