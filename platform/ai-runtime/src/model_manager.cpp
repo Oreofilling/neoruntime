@@ -639,6 +639,26 @@ int ModelManager::update_postprocess_config(const std::string& model_id,
 }
 
 // ============================================================
+// note_post_failure
+// ============================================================
+
+// Journal rate limit for per-frame post-process failures: log the 1st and
+// then every 100th failure per model. The response status flip is NOT
+// throttled — every caller still reports failure to its client.
+static constexpr uint64_t kPostFailLogInterval = 100;
+
+bool ModelManager::note_post_failure(const std::string& model_id, int rc,
+                                     uint64_t* count_out) {
+    (void)rc;
+    std::unique_lock lock(mu_);
+    uint64_t& count = post_fail_counts_[model_id];
+    ++count;
+    if (count_out)
+        *count_out = count;
+    return count == 1 || count % kPostFailLogInterval == 0;
+}
+
+// ============================================================
 // unregister_model
 // ============================================================
 

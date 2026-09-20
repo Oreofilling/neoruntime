@@ -374,6 +374,80 @@ void test_model_manager() {
     PASS();
 }
 
+// ─── Mock postprocess ops whose create() always fails ────────────────────────
+// The observable contract of HAL's fail-loud change (Fix 1): a vendor plugin
+// that cannot be dlopened/dlsymed answers create() with nullptr instead of a
+// session whose every run() would silently fail.
+static HalPostprocessSession* mock_post_create_fail(const HalPostprocessConfig*) {
+    return nullptr;
+}
+static void mock_post_destroy(HalPostprocessSession*) {}
+static int mock_post_run_fail(HalPostprocessSession*, const HalTensor*, int,
+                              HalPostprocessResult*) {
+    return -1;
+}
+static void mock_post_free_result(HalPostprocessResult*) {}
+
+// ─── Test: postprocess create failure keeps the registration intact ──────────
+// ModelManager translates create()==nullptr into init_post_process failure
+// without touching the registration; rolling the registration back (Fix 2) is
+// the gRPC layer's decision, made with a readable status message.
+void test_postprocess_create_failure_keeps_model_registered() {
+    TEST(postprocess_create_failure_keeps_model_registered);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    HalPostprocessOps post_ops{};
+    post_ops.create      = mock_post_create_fail;
+    post_ops.destroy     = mock_post_destroy;
+    post_ops.run         = mock_post_run_fail;
+    post_ops.free_result = mock_post_free_result;
+
+    ModelManager mgr(&infer_ops, &post_ops, nullptr, nullptr);
+    ASSERT_EQ(mgr.register_model("broken_pp", "/fake/broken.hef", "app-a"), 0,
+              "register_model failed");
+
+    int rc = mgr.init_post_process("broken_pp", "detection", "");
+    ASSERT_EQ(rc, -1, "init_post_process must fail when create() returns null");
+
+    // The registration itself survives; no postprocess session may exist.
+    auto snap = mgr.acquire_model_snapshot("broken_pp");
+    ASSERT_TRUE(snap.has_value(),
+                "model must stay registered after postprocess init failure");
+    ASSERT_TRUE(snap->post_session == nullptr, "no postprocess session may exist");
+    mgr.release_model("broken_pp");
+
+    ASSERT_EQ(mgr.unregister_model("broken_pp", "app-a"), 0, "cleanup unregister");
+
+    PASS();
+}
+
+// ─── Test: note_post_failure journal cadence (Fix 3) ─────────────────────────
+// The status flip on failed post-processing is unconditional; only the LOG
+// line is rate-limited — the 1st failure and every 100th thereafter.
+void test_note_post_failure_cadence() {
+    TEST(note_post_failure_cadence);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    ModelManager mgr(&infer_ops, nullptr, nullptr, nullptr);
+
+    for (uint64_t n = 1; n <= 250; ++n) {
+        uint64_t count = 0;
+        const bool should_log = mgr.note_post_failure("cadence", -2801, &count);
+        ASSERT_EQ(count, n, "count must track the number of failures");
+        const bool expected = (n == 1 || n % 100 == 0);
+        ASSERT_EQ(should_log, expected,
+                  "log gate: 1st and every 100th failure only (n not reported; see cerr)");
+    }
+
+    // Per-model isolation: a different model starts its own cadence.
+    uint64_t count = 0;
+    ASSERT_TRUE(mgr.note_post_failure("other_model", -1, &count),
+                "first failure of another model logs");
+    ASSERT_EQ(count, 1u, "other model's count is independent");
+
+    PASS();
+}
+
 // ─── Test: gRPC registration variant validation (Fix 5) ──────────────────────
 // Mirrors the REST boundary: closed 7-key detection schema, backend_function
 // whitelist, keypoint bare-name refusal, fail-closed on malformed JSON.
@@ -2097,6 +2171,8 @@ int main() {
 
     test_hal_loader();
     test_model_manager();
+    test_postprocess_create_failure_keeps_model_registered();
+    test_note_post_failure_cadence();
     test_validate_model_variant_table();
     test_owner_scoped_unregister();
     test_force_unregister_all_is_atomic_when_busy();

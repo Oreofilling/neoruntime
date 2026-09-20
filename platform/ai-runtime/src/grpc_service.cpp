@@ -1191,8 +1191,9 @@ grpc::Status AIRuntimeServiceImpl::Infer(
                 } post_guard{model_mgr_, &post_result};
 
                 try {
-                    if (model_mgr_->post_process(post_session, outputs,
-                                                  num_outputs, &post_result) == 0) {
+                    const int post_rc = model_mgr_->post_process(
+                        post_session, outputs, num_outputs, &post_result);
+                    if (post_rc == 0) {
                         fill_proto_post_result(response_ptr->mutable_post_result(),
                                                post_result);
 
@@ -1202,6 +1203,24 @@ grpc::Status AIRuntimeServiceImpl::Infer(
                                 std::chrono::system_clock::now().time_since_epoch()).count();
                             publish_result("app-infer", model_id, 0, ts_ns,
                                            response_ptr->post_result());
+                        }
+                    } else {
+                        // rc!=0: no structured result was produced. Reporting
+                        // success with an empty post_result hid broken
+                        // plugins behind per-frame "success" — flip the
+                        // status; only the journal line is rate-limited.
+                        pp_failed = true;
+                        response_ptr->mutable_status()->set_success(false);
+                        response_ptr->mutable_status()->set_message(
+                            "Postprocess failed (rc=" +
+                            std::to_string(post_rc) + ")");
+                        uint64_t fail_n = 0;
+                        if (model_mgr_->note_post_failure(model_id, post_rc,
+                                                          &fail_n)) {
+                            LOG_ERROR("Postprocess failed for model '%s': "
+                                      "rc=%d (failure #%llu)",
+                                      model_id.c_str(), post_rc,
+                                      static_cast<unsigned long long>(fail_n));
                         }
                     }
                 } catch (const std::exception& e) {
@@ -1467,11 +1486,27 @@ static void infer_batch_item_post(InferBatchItemCtx* ctx,
     if (mgr->has_post_ops() && ctx->snap->post_session) {
         HalPostprocessResult post_result{};
         try {
-            if (mgr->post_process(ctx->snap->post_session,
-                                  ctx->outputs.data(), max_out,
-                                  &post_result) == 0) {
+            const int post_rc = mgr->post_process(
+                ctx->snap->post_session, ctx->outputs.data(), max_out,
+                &post_result);
+            if (post_rc == 0) {
                 fill_proto_post_result(ctx->response.mutable_post_result(),
                                        post_result);
+            } else {
+                // rc!=0 produced no structured result: fail the item instead
+                // of returning success with an empty post_result. Only the
+                // journal line is rate-limited, never the status flip.
+                pp_failed = true;
+                ctx->response.mutable_status()->set_success(false);
+                ctx->response.mutable_status()->set_message(
+                    "Postprocess failed (rc=" + std::to_string(post_rc) + ")");
+                uint64_t fail_n = 0;
+                if (mgr->note_post_failure(ctx->model_id, post_rc, &fail_n)) {
+                    LOG_ERROR("Postprocess failed for model '%s': rc=%d "
+                              "(failure #%llu)",
+                              ctx->model_id.c_str(), post_rc,
+                              static_cast<unsigned long long>(fail_n));
+                }
             }
         } catch (const std::exception& e) {
             LOG_ERROR("Postprocess failed for model '%s': %s",
@@ -1658,13 +1693,33 @@ static void complete_infer_batch_callback(
                         } post_guard{mgr, &post_result};
 
                         try {
-                            if (mgr->post_process(
-                                    ctx->snap->post_session,
-                                    ctx->outputs.data(), result_outputs,
-                                    &post_result) == 0) {
+                            const int post_rc = mgr->post_process(
+                                ctx->snap->post_session,
+                                ctx->outputs.data(), result_outputs,
+                                &post_result);
+                            if (post_rc == 0) {
                                 fill_proto_post_result(
                                     ctx->response.mutable_post_result(),
                                     post_result);
+                            } else {
+                                // rc!=0 produced no structured result: fail
+                                // the batch instead of returning success with
+                                // an empty post_result. Only the journal line
+                                // is rate-limited, never the status flip.
+                                post_failed = true;
+                                ctx->response.mutable_status()->set_success(false);
+                                ctx->response.mutable_status()->set_message(
+                                    "Postprocess failed (rc=" +
+                                    std::to_string(post_rc) + ")");
+                                uint64_t fail_n = 0;
+                                if (mgr->note_post_failure(ctx->model_id,
+                                                           post_rc, &fail_n)) {
+                                    LOG_ERROR("Postprocess failed for model "
+                                              "'%s': rc=%d (failure #%llu)",
+                                              ctx->model_id.c_str(), post_rc,
+                                              static_cast<unsigned long long>(
+                                                  fail_n));
+                                }
                             }
                         } catch (const std::exception& e) {
                             LOG_ERROR(
@@ -2853,10 +2908,31 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                     } post_guard{model_mgr_, &post_result};
                     const uint64_t post_t0 = now_us();
                     try {
-                        if (model_mgr_->post_process(pp_session, outputs,
-                                    num_outputs, &post_result) == 0) {
+                        const int post_rc = model_mgr_->post_process(
+                            pp_session, outputs, num_outputs, &post_result);
+                        if (post_rc == 0) {
                             fill_proto_post_result(stream_resp->mutable_post_result(),
                                                   post_result);
+                        } else {
+                            // rc!=0 produced no structured result: fail the
+                            // frame instead of returning success with an
+                            // empty post_result. Only the journal line is
+                            // rate-limited, never the status flip.
+                            pp_failed = true;
+                            stream_resp->mutable_status()->set_success(false);
+                            stream_resp->mutable_status()->set_message(
+                                "Postprocess failed (rc=" +
+                                std::to_string(post_rc) + ")");
+                            uint64_t fail_n = 0;
+                            if (model_mgr_->note_post_failure(model_id,
+                                                              post_rc,
+                                                              &fail_n)) {
+                                LOG_ERROR("Postprocess failed for model "
+                                          "'%s': rc=%d (failure #%llu)",
+                                          model_id.c_str(), post_rc,
+                                          static_cast<unsigned long long>(
+                                              fail_n));
+                            }
                         }
                     } catch (const std::exception& e) {
                         LOG_ERROR("Postprocess failed for model '%s': %s",
