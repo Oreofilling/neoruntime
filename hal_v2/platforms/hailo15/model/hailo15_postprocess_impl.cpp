@@ -147,6 +147,159 @@ static std::string json_extract_string_best_effort(const std::string &json, cons
     return json.substr(p, q - p);
 }
 
+// Root-member-only string extraction for LOADER CONTROL KEYS
+// (backend_lib_path / backend_function / backend_config_path).
+// json_extract_string_best_effort substring-searches the raw text, so the
+// key spelling anywhere — including nested inside an ordinary object or
+// array value of a user-supplied variant blob — matches, and what it names
+// gets dlopen'd (review 2026-09-21 P0). Loader keys only ever ride at the
+// TOP LEVEL of platform-composed configs, so this walker honors exactly
+// that surface: iterate the root object's members, compare keys verbatim
+// (escaped spellings never match), and skip non-matching values
+// structurally. A key spelled inside a STRING value stays escaped in the
+// raw text and cannot collide. Returns "" when the key is absent at the
+// root (callers already treat "" as absent).
+static std::string json_extract_root_string(const std::string &json, const char *key)
+{
+    if (!key || json.empty())
+        return {};
+    const size_t n = json.size();
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < n && std::isspace((unsigned char)json[i]))
+            i++;
+    };
+    skip_ws();
+    if (i >= n || json[i] != '{')
+        return {};
+    ++i;
+    skip_ws();
+    if (i < n && json[i] == '}')
+        return {};
+    for (;;)
+    {
+        skip_ws();
+        if (i >= n || json[i] != '"')
+            return {};
+        ++i;
+        std::string mkey;
+        bool escaped_key = false;
+        while (i < n && json[i] != '"')
+        {
+            char c = json[i];
+            if (c == '\\' && i + 1 < n)
+            {
+                ++i;
+                escaped_key = true;
+                c = json[i];
+            }
+            mkey.push_back(c);
+            ++i;
+        }
+        if (i >= n)
+            return {};
+        ++i; // key's closing quote
+        skip_ws();
+        if (i >= n || json[i] != ':')
+            return {};
+        ++i;
+        skip_ws();
+        if (i >= n)
+            return {};
+        const bool key_match = !escaped_key && mkey == key;
+        if (json[i] == '"')
+        {
+            ++i;
+            std::string val;
+            while (i < n && json[i] != '"')
+            {
+                char c = json[i];
+                if (c == '\\' && i + 1 < n)
+                {
+                    ++i;
+                    c = json[i];
+                    switch (c)
+                    {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'r': c = '\r'; break;
+                    default: break; // \" \\ \/ \b \f pass through literally
+                    }
+                }
+                val.push_back(c);
+                ++i;
+            }
+            if (i >= n)
+                return {};
+            ++i;
+            if (key_match)
+                return val;
+        }
+        else if (json[i] == '{' || json[i] == '[')
+        {
+            // Skip a container counting only same-type brackets; JSON's
+            // grammar keeps them balanced, and string contents are opaque.
+            const char open = json[i];
+            const char close = (open == '{') ? '}' : ']';
+            int depth = 0;
+            bool in_str = false;
+            for (; i < n; ++i)
+            {
+                const char c = json[i];
+                if (in_str)
+                {
+                    if (c == '\\')
+                        ++i;
+                    else if (c == '"')
+                        in_str = false;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    in_str = true;
+                    continue;
+                }
+                if (c == open)
+                    ++depth;
+                else if (c == close)
+                {
+                    --depth;
+                    if (depth == 0)
+                    {
+                        ++i;
+                        break;
+                    }
+                }
+            }
+            if (depth != 0)
+                return {};
+        }
+        else
+        {
+            // number / true / false / null token
+            while (i < n && json[i] != ',' && json[i] != '}' &&
+                   !std::isspace((unsigned char)json[i]))
+                ++i;
+        }
+        skip_ws();
+        if (i < n && json[i] == ',')
+        {
+            ++i;
+            continue;
+        }
+        return {}; // '}' (end) or malformed
+    }
+}
+
+// Root-member variant of json_extract_string_value_best_effort for loader
+// control keys — same signature/semantics, root-only scanning.
+static inline std::string json_extract_root_string_value(const std::string &json, const char *key,
+                                                          const std::string &default_value)
+{
+    const std::string v = json_extract_root_string(json, key);
+    return v.empty() ? default_value : v;
+}
+
 static bool str_has_json_object_prefix(const char *s)
 {
     if (!s)
@@ -443,12 +596,16 @@ static void merge_vendor_patch_json_best_effort(Hailo15PostPriv *p, const char *
         }
     }
 
-    // Common string keys used by vendor plugins.
-    for (const char *key : {"backend_lib_path", "backend_function", "backend_config_path", "output_activation",
-                            "scdepth_output_name", "output_tensor_name"})
+    // Loader control keys merge ROOT-MEMBER-ONLY: json_extract_string_best_effort
+    // matches the key spelling at any nesting depth, and what these keys name
+    // gets dlopen'd — a "backend_lib_path" nested inside an ordinary value of
+    // a user-supplied variant blob must never select a library (review
+    // 2026-09-21 P0). merged_vendor_json is HAL-composed (top-level keys
+    // only), so root-only reads lose nothing there.
+    for (const char *key : {"backend_lib_path", "backend_function", "backend_config_path"})
     {
-        const std::string before = json_extract_string_best_effort(p->merged_vendor_json, key);
-        const std::string v = json_extract_string_best_effort(patch, key);
+        const std::string before = json_extract_root_string(p->merged_vendor_json, key);
+        const std::string v = json_extract_root_string(patch, key);
         if (!v.empty() && replace_or_insert_json_string(p->merged_vendor_json, key, v))
         {
             changed = true;
@@ -463,6 +620,19 @@ static void merge_vendor_patch_json_best_effort(Hailo15PostPriv *p, const char *
             else if (std::strcmp(key, "backend_config_path") == 0)
                 p->plugin_config_path = v;
 #endif
+        }
+    }
+
+    // Common string content keys used by vendor plugins.
+    for (const char *key : {"output_activation", "scdepth_output_name", "output_tensor_name"})
+    {
+        const std::string before = json_extract_string_best_effort(p->merged_vendor_json, key);
+        const std::string v = json_extract_string_best_effort(patch, key);
+        if (!v.empty() && replace_or_insert_json_string(p->merged_vendor_json, key, v))
+        {
+            changed = true;
+            if (before != v)
+                HAL_LOG_INFO("hailo15_postprocess: merged %s override \"%s\" -> \"%s\"", key, before.c_str(), v.c_str());
         }
     }
 
@@ -1167,8 +1337,8 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
     if (config->type == HAL_POST_TYPE_OCR_DETECTION || config->type == HAL_POST_TYPE_OCR_RECOGNITION)
     {
         p->ocr_builtin = true;
-        const std::string bl = json_extract_string_best_effort(p->merged_vendor_json, "backend_lib_path");
-        const std::string bf = json_extract_string_best_effort(p->merged_vendor_json, "backend_function");
+        const std::string bl = json_extract_root_string(p->merged_vendor_json, "backend_lib_path");
+        const std::string bf = json_extract_root_string(p->merged_vendor_json, "backend_function");
         if (!bl.empty() && !bf.empty())
             p->ocr_builtin = false;
         if (config->type == HAL_POST_TYPE_OCR_RECOGNITION && p->ocr_builtin)
@@ -1260,9 +1430,12 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
 
     if (!json_cfg.empty())
     {
-        p->plugin_lib_path = json_extract_string_value_best_effort(json_cfg, "backend_lib_path", "");
-        p->plugin_function = json_extract_string_value_best_effort(json_cfg, "backend_function", "");
-        p->plugin_config_path = json_extract_string_value_best_effort(json_cfg, "backend_config_path", "");
+        // Root-member-only: a loader key nested inside a user-supplied
+        // variant blob's ordinary values must not reach dlopen (review
+        // 2026-09-21 P0).
+        p->plugin_lib_path = json_extract_root_string_value(json_cfg, "backend_lib_path", "");
+        p->plugin_function = json_extract_root_string_value(json_cfg, "backend_function", "");
+        p->plugin_config_path = json_extract_root_string_value(json_cfg, "backend_config_path", "");
     }
     if ((p->plugin_lib_path.empty() || p->plugin_function.empty()) && !p->yolov8_pose_builtin &&
         p->cfg.type != HAL_POST_TYPE_DEPTH)
@@ -1271,9 +1444,9 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
     // Ensure merged JSON patch wins over defaults (especially when only backend_function is provided).
     if (!json_cfg.empty())
     {
-        const std::string bl = json_extract_string_value_best_effort(json_cfg, "backend_lib_path", "");
-        const std::string bf = json_extract_string_value_best_effort(json_cfg, "backend_function", "");
-        const std::string bc = json_extract_string_value_best_effort(json_cfg, "backend_config_path", "");
+        const std::string bl = json_extract_root_string_value(json_cfg, "backend_lib_path", "");
+        const std::string bf = json_extract_root_string_value(json_cfg, "backend_function", "");
+        const std::string bc = json_extract_root_string_value(json_cfg, "backend_config_path", "");
         if (!bl.empty())
             p->plugin_lib_path = bl;
         if (!bf.empty())
