@@ -89,6 +89,7 @@
 | [benchmarks/ai-runtime-performance-params.md](benchmarks/ai-runtime-performance-params.md) | AI runtime performance parameters |
 | [benchmarks/npu-parallelism-benchmark.md](benchmarks/npu-parallelism-benchmark.md) | NPU parallelism benchmark |
 | [benchmarks/video-decode-capability-assessment.md](benchmarks/video-decode-capability-assessment.md) | Video decode capability assessment |
+| [testing/performance-test-plan.md](testing/performance-test-plan.md) | 性能测试方案（引用本节各基准报告作基线/对照，含 M 系列多模型横向对比） |
 
 ## Testing & API
 
@@ -97,6 +98,8 @@
 | [testing/hal_lens_af0832_usage.md](testing/hal_lens_af0832_usage.md) | HAL lens (AF0832) usage |
 | [api/swagger.yaml](api/swagger.yaml) | OpenAPI spec for the Platform API |
 | [testing/lens_api_test.sh](testing/lens_api_test.sh) | Lens API test harness |
+| [testing/performance-test-plan.md](testing/performance-test-plan.md) | 性能测试方案（L1 SDK 基线 / L2 流媒体与管线 E2E / L3 服务端资源面，含多模型横向对比） |
+| [testing/performance-acceptance-template.md](testing/performance-acceptance-template.md) | 性能验收文档模板（阈值 + 判定方法 + 空白结果表） |
 
 ## Planning
 
