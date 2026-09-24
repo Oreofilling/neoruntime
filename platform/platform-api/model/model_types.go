@@ -58,10 +58,10 @@ type ModelFieldDef struct {
 // yolov5m_vehicles this threshold does nothing" without a second
 // hand-maintained effect table.
 type ModelTypeDef struct {
-	ID                  string                                    `json:"id"`
-	Label               string                                    `json:"label"`
-	Fields              []ModelFieldDef                           `json:"fields"`
-	Aliases             []string                                  `json:"aliases,omitempty"`
+	ID                  string                                   `json:"id"`
+	Label               string                                   `json:"label"`
+	Fields              []ModelFieldDef                          `json:"fields"`
+	Aliases             []string                                 `json:"aliases,omitempty"`
 	ProfileParamEffects map[string]map[string]postprocess.Effect `json:"profile_param_effects,omitempty"`
 }
 
