@@ -540,6 +540,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     wdcfg.scan_interval = std::chrono::milliseconds(config_.watchdog_scan_ms);
     wdcfg.frame_timeout = std::chrono::milliseconds(config_.watchdog_timeout_ms);
     wdcfg.warn_threshold = std::chrono::milliseconds(config_.watchdog_warn_ms);
+    wdcfg.in_use_timeout = std::chrono::milliseconds(config_.watchdog_in_use_timeout_ms);
 
     watchdog_ = std::make_unique<FrameWatchdog>(wdcfg);
     frame_router_ = std::make_unique<FrameRouter>(video_source_.get(),

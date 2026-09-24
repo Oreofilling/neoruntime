@@ -168,6 +168,8 @@ struct DaemonConfig {
     uint32_t    watchdog_scan_ms;
     uint32_t    watchdog_timeout_ms;
     uint32_t    watchdog_warn_ms;
+    // Hard cap for hw-in-use frames (FRAME_IN_USE); 0 disables the exemption
+    uint32_t    watchdog_in_use_timeout_ms;
 
     // DSP offload service (P2: `dsp:` YAML section; defaults in dsp_service.h)
     DspServiceConfig dsp;
