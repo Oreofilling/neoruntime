@@ -460,9 +460,27 @@ std::string validate_model_variant(const std::string& model_type,
                "silently be kept";
     }
 
-    // Other families: pass through. Their variants are config blobs whose
-    // content HAL and the plugin validate; restricting them here would break
-    // forward compatibility for no silent-no-op gain.
+    // Other families have no dialect of their own here, but the same
+    // any-depth loader-key refusal applies (review 2026-09-24 P0: the
+    // pass-through let backend_lib_path / backend_config_path through for
+    // types whose variants had no schema at this boundary, while REST
+    // already refused them). Bare names still pass — these types have no
+    // decoder-selection semantics and init_post_process drops their
+    // variants; the guard exists so a future routing change cannot reopen
+    // the dlopen vector silently. Malformed `{`-prefixed blobs fail closed,
+    // matching REST's validateLoaderKeysOnly.
+    if (v.front() == '{') {
+        std::unordered_set<std::string> keys;
+        MemberShapes shapes;
+        std::string forbidden;
+        if (!parse_flat_object(v, &keys, &shapes, &forbidden))
+            return "model_variant is not a valid flat JSON object — a "
+                   "`{`-prefixed variant for this model_type must be valid "
+                   "JSON, and loader control keys are refused at any depth";
+        if (!forbidden.empty())
+            return "model_variant JSON key '" + forbidden +
+                   "' is never accepted (loader control key)";
+    }
     return "";
 }
 

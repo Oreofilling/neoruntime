@@ -305,7 +305,9 @@ func TestValidateKeypointVariant(t *testing.T) {
 
 func TestValidateVariantJSONDispatch(t *testing.T) {
 	// detection keeps its closed set; keypoint its open dialect with the
-	// loader blacklist; everything else has no REST-side variant semantics.
+	// loader blacklist; every other type runs the same loader-key refusal
+	// (review 2026-09-24 P0 — the pass-through let loader keys through for
+	// types with no schema at this boundary).
 	if err := validateVariantJSON("detection", `{"backend_function":"hailo_yolov8n"}`); err == nil {
 		t.Error("detection partial blob must be rejected by the closed-set check")
 	}
@@ -322,8 +324,83 @@ func TestValidateVariantJSONDispatch(t *testing.T) {
 	if err := validateVariantJSON("yolo", `{"backend_lib_path":"/tmp/evil.so"}`); err == nil {
 		t.Error("yolo alias must reach the detection closed set")
 	}
-	if err := validateVariantJSON("classification", `{"backend_lib_path":"/tmp/evil.so"}`); err != nil {
-		t.Errorf("classification variant must pass unchecked: %v", err)
+	if err := validateVariantJSON("classification", `{"backend_lib_path":"/tmp/evil.so"}`); err == nil {
+		t.Error("classification loader key must be rejected by the default-branch walk")
+	}
+}
+
+// The default branch of validateVariantJSON covers every model type that has
+// no dialect of its own: the only refusal is the any-depth loader-key walk,
+// applied per type (review 2026-09-24 P0 — these types used to pass
+// unchecked all the way to the HAL plugin loader's config surface).
+func TestValidateVariantJSONDefaultBranchLoaderKeys(t *testing.T) {
+	otherTypes := []string{
+		"segmentation", "classification", "clip", "embedding", "depth",
+		"monocular_depth", "scdepth", "ocr_detection", "ocr_recognition",
+	}
+	tests := []struct {
+		name    string
+		variant string
+		wantErr string // empty means must pass
+	}{
+		{"empty variant passes", "", ""},
+		{"bare name passes (no dialect to select)", "some_decoder", ""},
+		{"ordinary blob passes", `{"threshold":0.3,"prompts":["a cat"]}`, ""},
+		{
+			// Not a smuggling channel: quotes are escaped inside a JSON
+			// string value, so HAL's raw search cannot match it.
+			"loader-like text inside a string value passes",
+			`{"note":"set backend_lib_path to your plugin"}`,
+			"",
+		},
+		{
+			"root backend_lib_path rejected",
+			`{"threshold":0.3,"backend_lib_path":"/tmp/evil.so"}`,
+			`variant key "backend_lib_path" is never accepted`,
+		},
+		{
+			"root backend_config_path rejected",
+			`{"backend_config_path":"/tmp/evil.json"}`,
+			`variant key "backend_config_path" is never accepted`,
+		},
+		{
+			"nested object loader key rejected",
+			`{"extra":{"backend_lib_path":"/tmp/evil.so"}}`,
+			`variant key "extra.backend_lib_path" is never accepted`,
+		},
+		{
+			"loader key inside array element rejected",
+			`{"presets":[{"backend_config_path":"/tmp/evil.json"}]}`,
+			`variant key "presets[0].backend_config_path" is never accepted`,
+		},
+		{
+			"deeply nested loader key rejected",
+			`{"a":{"b":{"c":{"backend_lib_path":"/tmp/evil.so"}}}}`,
+			`variant key "a.b.c.backend_lib_path" is never accepted`,
+		},
+		{
+			// Fail-closed, mirroring the keypoint surface: a malformed
+			// object is refused instead of silently stored.
+			"invalid json rejected",
+			`{"threshold":`,
+			"not valid JSON",
+		},
+	}
+	for _, modelType := range otherTypes {
+		for _, tt := range tests {
+			t.Run(modelType+"/"+tt.name, func(t *testing.T) {
+				err := validateVariantJSON(modelType, tt.variant)
+				if tt.wantErr == "" {
+					if err != nil {
+						t.Fatalf("validateVariantJSON(%s, %q) = %v, want nil", modelType, tt.variant, err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("validateVariantJSON(%s, %q) = %v, want error containing %q", modelType, tt.variant, err, tt.wantErr)
+				}
+			})
+		}
 	}
 }
 

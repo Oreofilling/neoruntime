@@ -527,6 +527,45 @@ void test_validate_model_variant_table() {
         // text and cannot collide with HAL's search — not a vector, must pass.
         {"keypoint",
          R"({"note":"set backend_lib_path yourself"})", true, ""},
+        // ── other families: the same any-depth loader-key refusal (review
+        // 2026-09-24 P0 — the pass-through let loader keys through for types
+        // with no schema at this boundary; REST already refused them). ──
+        {"segmentation",
+         R"({"backend_lib_path":"/evil.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        {"classification",
+         R"({"extra":{"backend_lib_path":"/evil.so"}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"clip",
+         R"({"presets":[{"backend_config_path":"/evil.json"}]})", false,
+         "'backend_config_path' is never accepted"},
+        {"embedding",
+         R"({"deep":{"a":{"backend_lib_path":"/e.so"}}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"depth",
+         R"({"backend_config_path":"/evil.json"})", false,
+         "'backend_config_path' is never accepted"},
+        {"monocular_depth",
+         R"({"a":{"b":{"c":{"backend_lib_path":"/e.so"}}}})", false,
+         "'backend_lib_path' is never accepted"},
+        {"scdepth",
+         R"({"backend_lib_path":"/e.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        {"ocr_detection",
+         R"({"nested":{"backend_config_path":"/e.json"}})", false,
+         "'backend_config_path' is never accepted"},
+        {"ocr_recognition",
+         R"({"backend_lib_path":"/e.so"})", false,
+         "'backend_lib_path' is never accepted"},
+        // Ordinary blobs, string-value mentions, and bare names still pass —
+        // these types have no dialect here beyond the loader-key refusal.
+        {"clip", R"({"threshold":0.3,"prompts":["a cat"]})", true, ""},
+        {"ocr_detection", "some_decoder", true, ""},
+        {"scdepth", R"({"note":"set backend_lib_path yourself"})", true, ""},
+        // Fail-closed on malformed `{`-prefixed blobs, matching REST's
+        // validateLoaderKeysOnly.
+        {"clip", R"({"threshold":)", false,
+         "not a valid flat JSON object"},
         // Detection value shapes: the closed key set alone does not close the
         // same vector — labels is a legal KEY whose object/array-of-non-
         // strings value smuggles structure the raw search can hit.
