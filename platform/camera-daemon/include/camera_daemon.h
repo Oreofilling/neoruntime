@@ -480,6 +480,20 @@ public:
     // Reapply the cached web OSD after MediaLibrary recreates encoder/blender
     // objects. Also clears vendor profile defaults on active encoders first.
     bool reapply_osd_config_after_pipeline_rebuild(const char* reason);
+    // Reapply the persisted web-tuned ISP state after a pipeline rebuild that
+    // reloaded the active profile's IQ defaults (profile switch, MediaLibrary
+    // reinit, stream layout change, pipeline reconfigure; in-place changes
+    // like transform rotation re-push harmlessly). cached_isp_state_ and the
+    // isp_config.json mirror still hold the web values and get_isp_config()
+    // serves that cache, so without a re-push the web UI shows values the
+    // hardware no longer has, and the next daemon start replays them onto
+    // whatever profile is active. No-op when the mirror is absent (the user
+    // never tuned ISP; the fresh profile defaults must be kept). Skips with
+    // a WARNING when video_source_'s video context no longer belongs to the
+    // rebuilt pipeline (some paths recreate MediaLibrary without rebinding
+    // the source; update_isp_settings would write through the dangling ctx).
+    // Best-effort: a failure logs and never fails the rebuild caller.
+    bool reapply_isp_config_after_pipeline_rebuild(const char* reason);
 
     // Privacy-mask/DPM config persistence — best-effort disk mirror of the last
     // config applied via set_privacy_mask_config so web-configured static regions
