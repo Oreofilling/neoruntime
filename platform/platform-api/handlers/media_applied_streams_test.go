@@ -10,13 +10,13 @@ import (
 // streamCfg is a compact helper for building applied-stream entries.
 func streamCfg(id string, w, h, bitrate, fps, gop uint32, codec string) *camerapb.PipelineStreamConfig {
 	return &camerapb.PipelineStreamConfig{
-		StreamId:       id,
-		EncoderWidth:   w,
-		EncoderHeight:  h,
-		EncoderBitrate: bitrate,
+		StreamId:         id,
+		EncoderWidth:     w,
+		EncoderHeight:    h,
+		EncoderBitrate:   bitrate,
 		EncoderFramerate: fps,
-		EncoderGop:     gop,
-		Codec:          codec,
+		EncoderGop:       gop,
+		Codec:            codec,
 	}
 }
 
