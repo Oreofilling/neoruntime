@@ -804,6 +804,22 @@ void CameraDaemon::run() {
         }
     }
 
+#ifdef HAS_GRPC
+    // Re-replay the persisted ISP config AFTER the pipeline start (and any boot
+    // profile switch above). The init()-time replay seeds the HAL + cache before
+    // the pipeline runs, but media start and switch_profile each rebuild the ISP
+    // firmware state from the profile's iq_settings — re-enabling the firmware
+    // auto algorithms (ACproc/AE/AWdrv) and resetting the manual picture controls —
+    // so the early replay is silently wiped (observed on-device: boot applies
+    // manual B/C/S, seconds later the kernel shows the ACproc auto fingerprint
+    // again and isp_cproc_enable back at its firmware default). Same ordering rule
+    // as the profile replay above: state that must survive a reboot is pushed
+    // after the last pipeline rebuild of the boot. Goes through the guarded
+    // reapply helper (ctx-liveness check vs a concurrent switch_profile rebuild);
+    // idempotent — the snapshot is re-persisted unchanged.
+    reapply_isp_config_after_pipeline_rebuild("boot: after pipeline start");
+#endif
+
     HAL_LOG_INFO("CameraDaemon: Running, streams active");
 
     // Main loop: just wait for stop signal
