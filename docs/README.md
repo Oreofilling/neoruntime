@@ -10,6 +10,7 @@
 | [services/platform-api.md](services/platform-api.md) | Platform API service |
 | [references/config-reference.md](references/config-reference.md) | Configuration reference |
 | [deployment/DEPLOYMENT.md](deployment/DEPLOYMENT.md) | Deployment guide |
+| [constraints.md](constraints.md) | 平台约束清单：红线速览、构建/部署/硬件/AI/容器约束、已知风险与文档漂移 |
 
 ## Getting Started
 
@@ -26,6 +27,7 @@
 | -------- | ----------- |
 | [architecture/README.md](architecture/README.md) | System architecture overview |
 | [architecture/hal_v2_overview.md](architecture/hal_v2_overview.md) | HAL v2 design and extension points |
+| [architecture/hal_v2_code_walkthrough_zh.md](architecture/hal_v2_code_walkthrough_zh.md) | HAL v2 中文代码深度解读：生命周期、数据流、并发、各后端与调试 |
 | [architecture/hal_v2_hailo15_gap_adaptation_plan.md](architecture/hal_v2_hailo15_gap_adaptation_plan.md) | Hailo-15 capability gap adaptation plan (batched API additions) |
 | [architecture/security-architecture.md](architecture/security-architecture.md) | Security model (auth, sandbox, seccomp) |
 | [os-image-aipc-restore-design.md](deployment/os-image-aipc-restore-design.md) | OS image restore / `aipc-restore` design |
@@ -71,6 +73,8 @@
 
 | Document | Description |
 | -------- | ----------- |
+| [release/pre-release-checklist.md](release/pre-release-checklist.md) | 产品发布前检查清单（基线 / 质量门 / MCU 固件配对 / 打包 / 性能自测 / 升级回滚） |
+| [release/release-test-email-template.md](release/release-test-email-template.md) | 提测邮件模板（含常驻注意事项与内部追溯表） |
 | [OPEN_SOURCE_SPLIT.md](OPEN_SOURCE_SPLIT.md) | Open-source split & pre-publish checklist (secrets, vendor assets, final gate) |
 
 ## Protocols
@@ -100,6 +104,9 @@
 | [testing/lens_api_test.sh](testing/lens_api_test.sh) | Lens API test harness |
 | [testing/performance-test-plan.md](testing/performance-test-plan.md) | 性能测试方案（L1 SDK 基线 / L2 流媒体与管线 E2E / L3 服务端资源面，含多模型横向对比） |
 | [testing/performance-acceptance-template.md](testing/performance-acceptance-template.md) | 性能验收文档模板（阈值 + 判定方法 + 空白结果表） |
+| [testing/dev-self-test-scope.md](testing/dev-self-test-scope.md) | 研发自测范围与分层（L0–L4 + 按改动类型必测矩阵 + 框架缺口基线） |
+| [testing/app-install-guide.zh-CN.md](testing/app-install-guide.zh-CN.md) | 应用包安装向导（测试用：升级/首装、验证、回滚与 FAQ） |
+| [testing/app-install-wizard-guide.zh-CN.html](testing/app-install-wizard-guide.zh-CN.html) | Web 控制台「应用安装向导」测试操作手册（三屏流程、字段校验、错误对照、测试场景，HTML 单文件） |
 
 ## Planning
 
