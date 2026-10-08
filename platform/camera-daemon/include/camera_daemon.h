@@ -593,7 +593,13 @@ public:
     // Switch the active medialib profile. On failure the daemon rolls back to the
     // previous profile and (when non-null) writes a human-readable cause into *message
     // (e.g. thermal restriction / unknown profile). Returns true only on a clean switch.
-    bool switch_profile(const std::string& profile_name, std::string* message = nullptr);
+    // verify_budget_ms bounds the post-switch (and rollback) first-frame wait. The
+    // 5s default fits warm interactive switches; callers replaying a persisted
+    // profile at boot must pass a larger budget — an AI-ISP profile's cold first
+    // start (model load + DSP init) can exceed 5s and would otherwise be rolled
+    // back to the default profile on every boot.
+    bool switch_profile(const std::string& profile_name, std::string* message = nullptr,
+                        uint64_t verify_budget_ms = 5000);
 
     // Active-profile persistence — best-effort disk mirror of the last
     // successfully-switched profile name so a web profile change survives
@@ -870,7 +876,7 @@ private:
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,
-                                 std::string* message);
+                                 std::string* message, uint64_t verify_budget_ms = 5000);
     bool set_led_duty_raw(uint32_t led_id, uint32_t duty_percent);
     double current_zoom_ratio() const;
 
