@@ -1,6 +1,7 @@
 # 统一后处理配置提案（Unified Postprocess Config）
 
-> Status: **draft v2 — 提案，未批准实施**（v2 2026-09-20：按评审 7 条意见全量修订；§3.1 重构为经官方源码核实的解码器能力矩阵）
+> Status: **目标已按 v11 核心方案落地并随 release/v1.1.0 交付**（实施细节见 [unified-postprocess-config-design.md](./unified-postprocess-config-design.md)）；本文保留为设计依据与解码器能力矩阵基线
+> （v2 2026-09-20：按评审 7 条意见全量修订；§3.1 重构为经官方源码核实的解码器能力矩阵）
 > Origin: 2026-09-20 模型导入后处理审计与整改（fail-loud 系列 7 笔提交）的后继设计讨论 + 同日提案评审
 > Scope: **平台层**配置模型统一。不改动厂商插件方言（.so 已编译冻结）、不改动 HAL `HalPostprocessConfig` ABI。
 > 证据基线: 官方 postprocess 库 [hailo-media-library **1.12.1**](https://github.com/hailo-ai/hailo-media-library/tree/1.12.1/hailo-postprocess)——vendor 库升级是 §3.1 能力矩阵的重核触发器。

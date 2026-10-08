@@ -29,6 +29,9 @@
 | [architecture/hal_v2_overview.md](architecture/hal_v2_overview.md) | HAL v2 design and extension points |
 | [architecture/hal_v2_code_walkthrough_zh.md](architecture/hal_v2_code_walkthrough_zh.md) | HAL v2 中文代码深度解读：生命周期、数据流、并发、各后端与调试 |
 | [architecture/hal_v2_hailo15_gap_adaptation_plan.md](architecture/hal_v2_hailo15_gap_adaptation_plan.md) | Hailo-15 capability gap adaptation plan (batched API additions) |
+| [architecture/unified-postprocess-config-proposal.md](architecture/unified-postprocess-config-proposal.md) | 统一后处理配置提案（解码器能力矩阵基线，v11 已实施） |
+| [architecture/unified-postprocess-config-design.md](architecture/unified-postprocess-config-design.md) | 统一后处理配置设计 v11（核心方案已随 v1.1.0 交付） |
+| [architecture/unified-postprocess-config-strong-consistency.md](architecture/unified-postprocess-config-strong-consistency.md) | 统一后处理配置强一致扩展（v10 冻结存档，触发条件见文内） |
 | [architecture/security-architecture.md](architecture/security-architecture.md) | Security model (auth, sandbox, seccomp) |
 | [os-image-aipc-restore-design.md](deployment/os-image-aipc-restore-design.md) | OS image restore / `aipc-restore` design |
 
@@ -93,7 +96,6 @@
 | [benchmarks/ai-runtime-performance-params.md](benchmarks/ai-runtime-performance-params.md) | AI runtime performance parameters |
 | [benchmarks/npu-parallelism-benchmark.md](benchmarks/npu-parallelism-benchmark.md) | NPU parallelism benchmark |
 | [benchmarks/video-decode-capability-assessment.md](benchmarks/video-decode-capability-assessment.md) | Video decode capability assessment |
-| [testing/performance-test-plan.md](testing/performance-test-plan.md) | 性能测试方案（引用本节各基准报告作基线/对照，含 M 系列多模型横向对比） |
 
 ## Testing & API
 

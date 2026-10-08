@@ -1,6 +1,8 @@
 # 统一后处理配置设计方案（Unified Postprocess Config — Design）
 
-> Status: **design draft v11 — 范围收口"砍到核心"（2026-09-20），未批准实施**
+> Status: **v11 核心方案已实施——随 release/v1.1.0 交付（keypoint decoder 档案 facial_landmarks / yolov8_pose、`ProfileParamEffects` 字段效果标注、变体校验），P1+P2 于 2026-09-20 设备验收**
+> 实施后增量（超出本文范围，平台行为已与其对齐）：2026-09-24 P0 全类型 loader-key 三层封堵（REST / gRPC / HAL 任一深度拒绝 `backend_lib_path` / `backend_config_path`）；2026-09-26 `GuessModelType` clip 类型提升。
+> 原稿：design draft v11 — 范围收口"砍到核心"（2026-09-20）
 > **原始目标**：导入模型时能正常使用设备内置后处理与自定义后处理。
 > v10→v11：九轮评审演化的强一致机制**整体降为冻结附录**（全文存档于 [unified-postprocess-config-strong-consistency.md](./unified-postprocess-config-strong-consistency.md)，触发条件见 §11）。正文只保留服务原始目标的核心；**放松的保证（诚实清单）**：
 > - 并发写：`WHERE active==base` 单句 CAS——后到者收到 BASE_CONFLICT 后**显式**重读重提（无自动 rebase）；
