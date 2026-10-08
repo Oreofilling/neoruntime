@@ -22,7 +22,10 @@
       "save": "Save",
       "saving": "Saving...",
       "ssh_settings": "SSH Settings",
-      "view_all": "View All"
+      "view_all": "View All",
+      "enabled": "Enabled",
+      "saved": "Saved",
+      "save_failed_retry": "Save failed, device configuration restored"
     },
     "login": {
       "login_title": "Login CamThink",
@@ -58,7 +61,8 @@
       "latency": "Latency",
       "bandwidth": "Bandwidth",
       "preview_disconnected": "Preview Disconnected",
-      "volume": "Volume"
+      "volume": "Volume",
+      "disconnected": "Disconnected"
     },
     "gyro": {
       "title": "Gyroscope Calibration",
@@ -327,14 +331,16 @@
       "write_inactive_copy": "Write Inactive Copy",
       "reboot_now": "Reboot Now",
       "remove_package": "Remove Package",
-      "reupload_package": "Re-upload"
+      "reupload_package": "Re-upload",
+      "ota_complete_login_prompt": "Firmware update complete. Please log in again."
     },
     "password_settings": {
       "title": "Password Disable",
       "status": "Password Status",
       "disable": "Disable Password",
       "enable": "Enable Password",
-      "warning": "Disabling the password poses a security risk as anyone can access the device."
+      "warning": "Disabling the password poses a security risk as anyone can access the device.",
+      "enable_warning": "Enable the device password? A password will be required to access the device."
     },
     "firmware_settings": {
       "title": "Firmware Upgrade",
@@ -377,6 +383,7 @@
       "eject_warning": "Make sure no read/write operations are in progress before ejecting.",
       "eject_confirm": "Are you sure you want to unmount?",
       "formatting": "Formatting...",
+      "formatting_hint": "Do not leave or refresh this page while formatting is in progress; it unlocks automatically when done (large SD cards may take several minutes).",
       "ejecting": "Ejecting...",
       "format_success": "Formatted successfully",
       "format_failed": "Format failed",
@@ -661,7 +668,17 @@
       "privacy_mask_draw_hint_progress": "Click to place vertices (need 3 min). Double-click to close the polygon.",
       "privacy_mask_draw_hint_close": "Double-click to close the polygon.",
       "privacy_mask_draw_hint_idle": "Click \"Add Region\" then click on the live video to place vertices. Drag a vertex to fine-tune.",
-      "privacy_mask_no_regions": "No mask regions yet"
+      "privacy_mask_no_regions": "No mask regions yet",
+      "daynight_mode": "Day / Night Mode",
+      "daynight_auto_hint": "Auto: switches day/night with the light sensor",
+      "infrared_on_hint": "Infrared profile and IR illumination are active",
+      "infrared_off_hint": "Use the daylight profile with IR illumination off",
+      "daynight_auto": "Auto",
+      "daynight_day": "Day",
+      "daynight_night": "Night",
+      "light_thresholds": "Light thresholds (auto)",
+      "night_enter": "Enter night ≤",
+      "day_enter": "Enter day ≥"
     },
     "media_player": {
       "bitrate": "Bitrate",
@@ -1103,34 +1120,6 @@
       "reconnecting": "Reconnecting...",
       "max_retries_reached": "Max retries reached. Click to reconnect."
     },
-    "ssh": {
-      "permit_root_login": "Root Login",
-      "port_invalid": "Port must be between 1 and 65535",
-      "permit_root": {
-        "yes": "Allow",
-        "prohibit_password": "Key Only",
-        "no": "Deny"
-      },
-      "password_authentication": "Password Authentication",
-      "pubkey_authentication": "Public Key Authentication",
-      "auth": {
-        "enabled": "Enabled",
-        "disabled": "Disabled"
-      },
-      "max_auth_tries": "Max Authentication Tries",
-      "max_auth_tries_invalid": "Max authentication tries must be between 1 and 10",
-      "restart_service": "Restart SSH service after saving",
-      "logs": "SSH Logs",
-      "no_logs": "No logs available",
-      "status": {
-        "active": "Running",
-        "inactive": "Stopped",
-        "unknown": "Unknown"
-      },
-      "update_success": "SSH configuration updated successfully",
-      "update_error": "Failed to update SSH configuration: ",
-      "logs_refreshed": "Logs refreshed"
-    },
     "file_management": {
       "title": "File Management",
       "search_placeholder": "Search files...",
@@ -1207,12 +1196,25 @@
       "confirm_save_description": "Are you sure you want to save changes? This will overwrite the original file.",
       "forward": "Forward",
       "select_all": "Select All",
-      "up": "Up"
+      "up": "Up",
+      "preparing_zip": "Packaging {{count}} files...",
+      "download_complete": "Successfully downloaded {{count}} files",
+      "batch_download_failed": "Batch download failed",
+      "deleting": "Deleting...",
+      "confirm_delete": "Confirm Delete",
+      "batch_delete_confirm": "Batch Delete Confirmation",
+      "batch_delete_warning": "Are you sure you want to delete {{count}} selected files/folders? This cannot be undone."
     },
     "file_upload": {
       "uploading": "Uploading...",
       "add_more_files": "Click or drag to add more files",
-      "placeholder": "Drag files here, or click to select"
+      "placeholder": "Drag files here, or click to select",
+      "file_too_large": "File too large; maximum allowed {{limit}}",
+      "no_limit": "Unlimited",
+      "file_type_unsupported": "Unsupported file type",
+      "select_file": "Select File",
+      "upload_image_hint": "Click or drag to upload an image",
+      "image_formats_hint": "Supports PNG, JPG, GIF, WebP"
     },
     "apps": {
       "title": "Applications",
@@ -1291,7 +1293,10 @@
         "resource_load": "Resource Load",
         "since_last_hour": "since last hour",
         "stability_index": "Overall stability index",
-        "optimal_allocation": "Optimal allocation active"
+        "optimal_allocation": "Optimal allocation active",
+        "cpu": "CPU",
+        "memory": "Memory",
+        "uptime": "Uptime"
       },
       "permissions": {
         "events": "Events"
@@ -1303,7 +1308,9 @@
         "device": "Device Control",
         "network": "Network",
         "light": "Light",
-        "lens": "Lens"
+        "lens": "Lens",
+        "video": "Video Streams",
+        "models": "AI Models"
       },
       "import": {
         "wizard_title": "Application Setup Wizard",
@@ -1361,8 +1368,6 @@
         "yaml_copied": "Copied to clipboard",
         "yaml_copy_failed": "Copy failed",
         "yaml_preview_hint": "Read-only preview · generated from the form — copy and use as app.yaml",
-        "yaml_edited_review": "app.yaml: modified in the YAML editor (installed as edited)",
-        "yaml_review_unchanged": "app.yaml: unmodified",
         "yaml_loading": "Loading editor…",
         "image_address": "Image Address",
         "app_id": "Application ID *",
@@ -1522,7 +1527,31 @@
         "model_required_row": "Required (install fails if missing)",
         "model_custom_hint": "Declare a model bundled in the image and not registered with the system: when the id is not in the system list, the in-image AMPK model package (.bin) path is required to pass install validation.",
         "model_unavailable_required": "A required model dependency is unregistered and declares no path — install would be blocked. Provide the model path or pick a system model.",
-        "image_uploading": "Image upload is still in progress, please wait"
+        "image_uploading": "Image upload is still in progress, please wait",
+        "app_version_required": "App version is required",
+        "cpu_limit_invalid": "CPU limit must be greater than zero and use cores or a percentage (for example 0.5 or 50%)",
+        "cpu_limit_high": "CPU limit exceeds one core (100%); confirm the device has enough capacity",
+        "memory_limit_invalid": "Memory limit must be a positive integer with a supported unit (for example 256Mi or 1Gi)",
+        "memory_limit_high": "Memory limit exceeds 4Gi; confirm the device has enough capacity",
+        "reserved_model_alias": "The model alias conflicts with a platform-injected environment variable",
+        "model_path_conflict": "The same model ID cannot declare different package paths",
+        "inference_quota_invalid": "Inference QPS and concurrency must be zero or greater; zero keeps the default or unlimited behavior",
+        "event_topic_invalid": "Event topics must not be empty",
+        "event_topic_duplicate": "Publish and subscribe topic lists must not contain duplicates",
+        "video_stream_unavailable": "The manifest references a video stream that is not available on this device",
+        "network_mode_invalid": "Network mode must be isolated or host",
+        "network_inbound_invalid": "Inbound ports must be integers from 1 through 65535",
+        "network_inbound_duplicate": "Inbound ports must not be duplicated",
+        "network_inbound_requires_host": "Inbound ports require host network mode",
+        "host_network_warning": "Host network mode shares the device network namespace; confirm that the app requires it",
+        "dynamic_model_registration_warning": "The app may dynamically register models; continue only if you trust it",
+        "env_name_invalid": "Environment variable names must start with a letter or underscore and contain only letters, digits, and underscores",
+        "env_name_duplicate": "Environment variable names must not be duplicated",
+        "volume_path_invalid": "Volume host and container paths must be absolute and contain no ., .., or repeated separators",
+        "volume_destination_duplicate": "Multiple volumes cannot use the same container destination",
+        "restart_policy_invalid": "Restart policy must be no, on-failure, or always (legacy never and on_failure are also accepted)",
+        "writable_rootfs_warning": "The app requests a writable root filesystem, which reduces isolation",
+        "warning_confirm": "The following risks were detected. Continue with installation?"
       },
       "logs": {
         "title": "Logs",
@@ -1553,7 +1582,15 @@
         "website": "Official Website",
         "docs": "Documentation",
         "version_history": "Version History",
-        "release_date": "Release Date"
+        "release_date": "Release Date",
+        "permissions": "Permissions & Resources",
+        "info": "App Info",
+        "id": "ID",
+        "version": "Version",
+        "installed_at": "Installed At",
+        "started_at": "Started At",
+        "fetch_failed": "Failed to load app details",
+        "missing_manifest": "App is missing manifest_path information"
       },
       "terminal": {
         "title": "Container Terminal"
@@ -1922,7 +1959,14 @@
         "ir_led_on": "ON",
         "ir_led_off": "OFF",
         "set_success": "Setting updated",
-        "set_failed": "Failed to update setting"
+        "set_failed": "Failed to update setting",
+        "preset_name_prompt": "Preset name",
+        "preset_saved": "Preset saved",
+        "preset_loaded": "Preset loaded",
+        "presets": "Presets",
+        "save_preset": "Save current",
+        "no_presets": "No presets saved",
+        "load": "Load"
       },
       "lens": {
         "title": "Lens Control",
