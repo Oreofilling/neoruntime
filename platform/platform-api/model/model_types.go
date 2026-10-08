@@ -491,7 +491,10 @@ func GuessModelType(networkName string) string {
 	// or the wizard suggests detection for a pose HEF. "face" is NOT part of
 	// the hoisted set: face_detection/face_detector are detection networks,
 	// and a bare face token outranking det sends them at the facial-landmarks
-	// decoder (review 2026-09-21).
+	// decoder (review 2026-09-21). "clip" joins the hoisted set for the same
+	// reason against a generic token: CLIP encoders ship as clip_vit_b_32_*,
+	// and the "vit" token in the classification case below would otherwise
+	// swallow every ViT-named CLIP network (found on-device 2026-09-26).
 	case strings.Contains(n, "ocr_det"):
 		return "ocr_detection"
 	case strings.Contains(n, "ocr_rec") || strings.Contains(n, "recognition"):
@@ -500,6 +503,8 @@ func GuessModelType(networkName string) string {
 		return "ocr_recognition"
 	case strings.Contains(n, "pose") || strings.Contains(n, "keypoint") || strings.Contains(n, "landmark"):
 		return "keypoint"
+	case strings.Contains(n, "clip"):
+		return "clip"
 	// Generic patterns
 	case strings.Contains(n, "yolo") || strings.Contains(n, "det"):
 		return "detection"
@@ -513,8 +518,6 @@ func GuessModelType(networkName string) string {
 	// face_detection already matched detection above.
 	case strings.Contains(n, "face"):
 		return "keypoint"
-	case strings.Contains(n, "clip"):
-		return "clip"
 	case strings.Contains(n, "embed"):
 		return "embedding"
 	case strings.Contains(n, "depth") || strings.Contains(n, "scdepth"):

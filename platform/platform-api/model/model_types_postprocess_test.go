@@ -260,6 +260,27 @@ func TestGuessModelTypeKeypointPrecedence(t *testing.T) {
 	}
 }
 
+// CLIP identity must win over the generic classification tokens: the vision
+// encoders ship as clip_vit_b_32_*, and the "vit" token in the classification
+// case would otherwise suggest classification for every ViT-named CLIP
+// network (found on-device 2026-09-26: clip_vit_b_32_image_encoder parsed as
+// classification). Pure ViT classifiers keep the classification suggestion.
+func TestGuessModelTypeClipPrecedence(t *testing.T) {
+	cases := map[string]string{
+		"clip_vit_b_32_image_encoder": "clip",
+		"clip_vit_l_14":               "clip",
+		"clip_text_encoder":           "clip",
+		// Controls: without the clip token the generic vit/cls tokens win.
+		"vit_b_32":         "classification",
+		"mobilenet_v2_cls": "classification",
+	}
+	for name, want := range cases {
+		if got := GuessModelType(name); got != want {
+			t.Errorf("GuessModelType(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
 // RuntimeTypes is the registry's own list of gRPC-known type strings; the Go
 // wizard table must cover it (via ids or aliases) and, minus genai (no
 // runtime postprocess path), must not miss entries either.
