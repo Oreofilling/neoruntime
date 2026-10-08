@@ -482,6 +482,20 @@ public:
     // Reapply the cached web OSD after MediaLibrary recreates encoder/blender
     // objects. Also clears vendor profile defaults on active encoders first.
     bool reapply_osd_config_after_pipeline_rebuild(const char* reason);
+    // Reapply the persisted web-tuned ISP state after a pipeline rebuild that
+    // reloaded the active profile's IQ defaults (profile switch, MediaLibrary
+    // reinit, stream layout change, pipeline reconfigure; in-place changes
+    // like transform rotation re-push harmlessly). cached_isp_state_ and the
+    // isp_config.json mirror still hold the web values and get_isp_config()
+    // serves that cache, so without a re-push the web UI shows values the
+    // hardware no longer has, and the next daemon start replays them onto
+    // whatever profile is active. No-op when the mirror is absent (the user
+    // never tuned ISP; the fresh profile defaults must be kept). Skips with
+    // a WARNING when video_source_'s video context no longer belongs to the
+    // rebuilt pipeline (some paths recreate MediaLibrary without rebinding
+    // the source; update_isp_settings would write through the dangling ctx).
+    // Best-effort: a failure logs and never fails the rebuild caller.
+    bool reapply_isp_config_after_pipeline_rebuild(const char* reason);
 
     // Privacy-mask/DPM config persistence — best-effort disk mirror of the last
     // config applied via set_privacy_mask_config so web-configured static regions
@@ -700,6 +714,22 @@ private:
     // Remains held while op_mu_ is temporarily released around blocking HAL calls.
     // This prevents two ReconfigurePipeline RPCs from entering MediaLibrary concurrently.
     std::mutex pipeline_reconfig_mu_;
+    // Serializes the full body of add_stream()/remove_stream()/
+    // reconfigure_pipeline()/reconfigure_encoder()/update_encoder_config().
+    // op_mu_ is intentionally released around blocking HAL calls in these
+    // paths, so without this guard a concurrent remove_stream +
+    // reconfigure_pipeline can interleave: reconfigure rebuilds
+    // config_.encoders from a codec list that still contains the stream being
+    // removed, resurrecting it as enabled=true right before remove finishes
+    // tearing down its HAL encoder -- every later AddStream for that stream
+    // is then rejected by the "already exists" guard until daemon restart.
+    // Held for the whole function; RAII covers every return path. Lock order:
+    // stream_op_mu_ -> pipeline_reconfig_mu_ -> op_mu_. NOT covered (known
+    // follow-ups): switch_profile() (has its own profile_switch_mu_ + throttle),
+    // set_transform_config()'s rotation_full_reinit path, and the AF worker's
+    // refresh_autofocus_video_context() (takes pipeline_reconfig_mu_ + op_mu_
+    // only, so it can still interleave with a stream add/remove HAL rebuild).
+    std::mutex stream_op_mu_;
     // Serializes the full body of switch_profile() (HAL switch + post-switch frame
     // verify + rollback). op_mu_ is intentionally released through the HAL-call and
     // verify/rollback windows, so without this guard a second concurrent profile

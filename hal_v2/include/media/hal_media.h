@@ -70,6 +70,9 @@ typedef enum {
 #define HAL_PM_MAX_LABELS 8     /* max masked labels per dynamic config */
 #define HAL_PM_LABEL_LEN  64    /* max label string length (incl. NUL) */
 
+/* Max codec context name length (incl. NUL); matches HalCodecContext::codec_name. */
+#define HAL_CODEC_NAME_MAX 64
+
 /** A single privacy mask region defined by up to 8 polygon vertices. */
 typedef struct {
     const char *id;             /* unique identifier for this mask region */
@@ -863,6 +866,29 @@ typedef struct {
      * @return 0 on success, negative HalErrorCode on failure.
      */
     int (*unsubscribe_motion)(void *media_ctx);
+
+    /**
+     * @brief Snapshot the codec context names, race-free against rebuilds.
+     *
+     * get_codec_list() hands out internal pointers whose lifetime ends at the
+     * next layout rebuild (profile switch / rotation / add-remove reinit);
+     * dereferencing them from a context that cannot hold the caller's
+     * serialization locks races the rebuild's free. This op copies the current
+     * codec_name of every FROM_MEDIA codec context into caller storage under
+     * the implementation's context-list lock, so the snapshot is always
+     * self-consistent. Trailing ops entry: older HAL implementations leave it
+     * NULL — callers must NULL-check and fall back to get_codec_list().
+     *
+     * @param media_ctx  Media context.
+     * @param names_out  Caller-allocated array of name buffers, each
+     *                   HAL_CODEC_NAME_MAX bytes.
+     * @param max_names  Capacity of @p names_out (entries beyond it are not
+     *                   copied; the call still succeeds with a capped count).
+     * @param count_out  Receives the number of names written.
+     * @return 0 on success, negative HalErrorCode on failure.
+     */
+    int (*get_codec_names)(void *media_ctx, char (*names_out)[HAL_CODEC_NAME_MAX],
+                           uint32_t max_names, uint32_t *count_out);
 } HalMediaOps;
 
 /** Platform-specific media operations (resolved at link time). */

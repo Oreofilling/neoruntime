@@ -45,6 +45,13 @@ struct Hailo15MediaPriv
     std::string current_config_field_value;
 
     std::vector<std::string> profile_names;
+    /** Authored iq_settings.grayscale.enabled per profile, snapshotted once at first
+     *  init from the pristine (pre-override) SDK state. The live value is unsafe
+     *  afterwards: set_override_parameters() replaces the stored profile_by_name
+     *  entries with toggled values (see profile_authored_grayscale in
+     *  hailo15_media_impl.cpp). Survives media_lib reinits; deliberately NOT
+     *  rebuilt from patched json. */
+    std::map<std::string, bool> authored_profile_grayscale;
     std::vector<std::string> frontend_stream_ids;
     std::vector<std::string> encoder_stream_ids;
     /** Snapshot after last successful build; used to detect profile-only updates vs stream layout changes. */
@@ -65,6 +72,19 @@ struct Hailo15MediaPriv
 
     uint64_t frame_seq{0};
     uint64_t packet_seq{0};
+
+    /**
+     * Leaf lock guarding hm->video_ctx_list / hm->codec_ctx_list (+counts and
+     * the by_stream maps) against get_codec_names() snapshots. destroy_contexts()
+     * and build_contexts() mutate the lists under it; it is NEVER held across
+     * MediaLibrary calls (build_contexts takes it only after its
+     * get_current_profile() returns) and never nests with mutex, so no
+     * lock-order interaction exists. Exists because daemon-side codec-name
+     * probes (zombie heal / profile-switch reconcile) cannot hold the daemon
+     * serialization locks without an AB-BA against switch_profile_internal —
+     * the snapshot op lets them read names race-free instead.
+     */
+    std::mutex ctx_list_mu;
 
     std::map<std::string, HalVideoContext *> video_by_stream;
     std::map<std::string, HalCodecContext *> codec_by_stream;

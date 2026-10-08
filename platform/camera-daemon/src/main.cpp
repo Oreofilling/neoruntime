@@ -11,6 +11,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -1042,6 +1043,29 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_focus_curve_path = val;
             }
         }
+    }
+
+    // Canonicalize encoder order: main, sub, third first (stable for the rest).
+    // Boot discovery pairs pipeline sinks with config entries positionally, and
+    // HAL assigns sinks in canonical order (main→sink0, sub→sink1, third→sink2
+    // via the override map built in init_media). YAML entry order is NOT
+    // canonical: platform-api's reconfigure rebuild appends a re-added stream
+    // at the end, so "remove sub + re-add" legitimately yields [main, third,
+    // sub] — a cold boot on that order bound 'third' to sink1 and 'sub' to
+    // sink2, making sub.sock serve 640x384 while third.sock served 1280x720
+    // (wire cross observed on the reboot acceptance case). Sorting in memory
+    // makes every positional walk sink-ordered; the YAML file is untouched.
+    {
+        auto rank = [](const std::string& n) -> int {
+            if (n == "main") return 0;
+            if (n == "sub") return 1;
+            if (n == "third") return 2;
+            return 3;
+        };
+        std::stable_sort(cfg.encoders.begin(), cfg.encoders.end(),
+                         [&rank](const EncoderCfg& a, const EncoderCfg& b) {
+                             return rank(a.stream_name) < rank(b.stream_name);
+                         });
     }
 
     // Derive raw stream configs from encoder configs.
