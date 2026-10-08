@@ -225,8 +225,12 @@ func joinVariantPath(path, key string) string {
 
 // validateVariantJSON dispatches variant validation by model type: detection
 // keeps its closed seven-key schema, keypoint gets the open dialect with the
-// loader-key blacklist, and every other type has no variant semantics at the
-// REST boundary (the runtime treats their variant as opaque).
+// loader-key blacklist, and every other type runs the same any-depth
+// loader-key refusal on `{`-prefixed blobs (review 2026-09-24 P0: the
+// previous pass-through let backend_lib_path / backend_config_path through
+// for types whose variants had no schema at this boundary). Bare names and
+// empty variants still pass — other types have no decoder-selection
+// semantics here.
 func validateVariantJSON(modelType, variant string) error {
 	switch model.ResolveModelType(modelType) {
 	case "detection":
@@ -234,8 +238,29 @@ func validateVariantJSON(modelType, variant string) error {
 	case "keypoint":
 		return validateKeypointVariant(variant)
 	default:
+		return validateLoaderKeysOnly(variant)
+	}
+}
+
+// validateLoaderKeysOnly applies the any-depth loader-key refusal to a
+// variant blob without imposing any other schema: empty and bare
+// non-object names pass (no dialect to enforce), while a `{`-prefixed blob
+// must parse as JSON (fail-closed, mirroring the keypoint surface — a
+// malformed object is refused, not silently stored) and must not carry a
+// loader control key at any depth.
+func validateLoaderKeysOnly(variant string) error {
+	trimmed := strings.TrimSpace(variant)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
 		return nil
 	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &cfg); err != nil {
+		return fmt.Errorf("variant is not valid JSON: %w", err)
+	}
+	if key := findForbiddenVariantKey("", cfg); key != "" {
+		return fmt.Errorf("variant key %q is never accepted (loader control key)", key)
+	}
+	return nil
 }
 
 // validatePostprocessProfile guards the postprocess_profile config key at the
