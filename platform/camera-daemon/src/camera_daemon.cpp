@@ -541,6 +541,7 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     wdcfg.scan_interval = std::chrono::milliseconds(config_.watchdog_scan_ms);
     wdcfg.frame_timeout = std::chrono::milliseconds(config_.watchdog_timeout_ms);
     wdcfg.warn_threshold = std::chrono::milliseconds(config_.watchdog_warn_ms);
+    wdcfg.in_use_timeout = std::chrono::milliseconds(config_.watchdog_in_use_timeout_ms);
 
     watchdog_ = std::make_unique<FrameWatchdog>(wdcfg);
     frame_router_ = std::make_unique<FrameRouter>(video_source_.get(),
@@ -6257,7 +6258,9 @@ bool CameraDaemon::get_device_hardware_status(aipc::camera::DeviceHardwareStatus
         auto* led_ops = hal_loader_->led();
         uint8_t duty = 0;
         if (led_ops->led_get_duty) {
-            if (led_ops->led_get_duty(ctx, 0, &duty) == HAL_OK) {
+            // white2 (dedicated white channel) — the same MCU LED the
+            // SetWhiteLight write path drives; 0 is the near-IR fill light.
+            if (led_ops->led_get_duty(ctx, 2, &duty) == HAL_OK) {
                 status.set_white_light_duty(duty);
             }
             if (led_ops->led_get_duty(ctx, 1, &duty) == HAL_OK) {
