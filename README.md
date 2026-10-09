@@ -93,6 +93,23 @@ The package is written to
 `build/release/neoruntime-hailo15-1.0.0.tar.gz`. MCU OTA firmware is rebuilt by
 default; pass `BUILD_MCU_FW=0` only when packaging existing MCU artifacts.
 
+To use the same container as an interactive build environment — shell
+access to the Hailo/Poky SDK for running individual make targets:
+
+```bash
+docker pull camthink/ne503-dev:v1.0
+docker run --rm -it --entrypoint /bin/bash --user root \
+  -v "$PWD:/ne503" -w /ne503 -e SDK_PATH=/opt/hailo-sdk \
+  camthink/ne503-dev:v1.0
+```
+
+Inside the container:
+
+```bash
+git config --global --add safe.directory /ne503
+make pack-release VERSION=0.1.0
+```
+
 For local cross-compilation with a vendor SDK, see the
 [build guide](docs/getting-started/BUILD.md).
 
