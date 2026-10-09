@@ -6179,7 +6179,9 @@ bool CameraDaemon::get_device_hardware_status(aipc::camera::DeviceHardwareStatus
         auto* led_ops = hal_loader_->led();
         uint8_t duty = 0;
         if (led_ops->led_get_duty) {
-            if (led_ops->led_get_duty(ctx, 0, &duty) == HAL_OK) {
+            // white2 (dedicated white channel) — the same MCU LED the
+            // SetWhiteLight write path drives; 0 is the near-IR fill light.
+            if (led_ops->led_get_duty(ctx, 2, &duty) == HAL_OK) {
                 status.set_white_light_duty(duty);
             }
             if (led_ops->led_get_duty(ctx, 1, &duty) == HAL_OK) {
