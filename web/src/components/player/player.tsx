@@ -1,4 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+} from 'react';
 import { VideoStreamPlayer } from '@/lib/videoStream';
 import { AudioPlayer } from '@/lib/audioStream/audioPlayer';
 import Loading from '@/components/loading';
@@ -32,6 +38,8 @@ type PlayerProps = {
   defaultStreamStatsVisible?: boolean;
   /** Show an encoder configuration progress state over the player */
   configuring?: boolean;
+  /** Preserve the last rendered frame while a full stream restart is running */
+  streamRestarting?: boolean;
   /** Actual decoded frame size, used by overlay layers to match the video. */
   onFrameSizeChange?: (size: { width: number; height: number }) => void;
   /**
@@ -44,6 +52,7 @@ type PlayerProps = {
 
 const STREAM_STATS_KEY = 'deviceToolStreamStatsVisible';
 const TRANSFORM_STREAM_RESUME_TIMEOUT = 15000;
+const FROZEN_FRAME_RELEASE_DELAY_MS = 500;
 
 export default function Player({
   videoUrl,
@@ -56,6 +65,7 @@ export default function Player({
   enableAudio = true,
   defaultStreamStatsVisible,
   configuring = false,
+  streamRestarting = false,
   onFrameSizeChange,
   audioOverlay = false,
 }: PlayerProps) {
@@ -66,6 +76,7 @@ export default function Player({
   const [isShowPanel, setIsShowPanel] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const frozenFrameRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const idleTimerRef = useRef<number | null>(null);
   const audioPlayerRef = useRef<AudioPlayer | null>(null);
@@ -127,6 +138,11 @@ export default function Player({
     'connecting' | 'connected' | 'disconnected'
   >('connecting');
   const [videoVisible, setVideoVisible] = useState(false);
+  const [frozenFrameVisible, setFrozenFrameVisible] = useState(false);
+  const frozenFrameVisibleRef = useRef(false);
+  const streamRestartingRef = useRef(streamRestarting);
+  const pendingVideoFrameCallbackRef = useRef<number | null>(null);
+  const frozenFrameReleaseTimerRef = useRef<number | null>(null);
   const [videoDimensions, setVideoDimensions] = useState({
     width: streamWidth ?? 0,
     height: streamHeight ?? 0,
@@ -140,6 +156,52 @@ export default function Player({
   // recreated on every store update.
   const audioSettingsRef = useRef({ audioShouldPlay, volume, videoUrl });
   audioSettingsRef.current = { audioShouldPlay, volume, videoUrl };
+  streamRestartingRef.current = streamRestarting;
+
+  const setFrozenFrame = useCallback((visible: boolean) => {
+    frozenFrameVisibleRef.current = visible;
+    setFrozenFrameVisible(visible);
+  }, []);
+
+  // Capture synchronously before the videoUrl effect tears down the old player.
+  // The canvas then covers the empty/reset video element until the replacement
+  // decoder presents a real frame, turning a codec-switch black flash into a
+  // short freeze of the last valid frame.
+  useLayoutEffect(() => {
+    if (!streamRestarting) return;
+
+    const video = videoRef.current;
+    const canvas = frozenFrameRef.current;
+    if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      return;
+    }
+
+    try {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      setFrozenFrame(true);
+    } catch {
+      // A failed snapshot should never block the normal reconnect path.
+      setFrozenFrame(false);
+    }
+  }, [setFrozenFrame, streamRestarting]);
+
+  useEffect(() => () => {
+    const video = videoRef.current;
+    if (
+      video
+      && pendingVideoFrameCallbackRef.current !== null
+      && typeof video.cancelVideoFrameCallback === 'function'
+    ) {
+      video.cancelVideoFrameCallback(pendingVideoFrameCallbackRef.current);
+    }
+    if (frozenFrameReleaseTimerRef.current !== null) {
+      window.clearTimeout(frozenFrameReleaseTimerRef.current);
+    }
+  }, []);
 
   const startAudioPlayer = useCallback(() => {
     const settings = audioSettingsRef.current;
@@ -516,6 +578,33 @@ export default function Player({
         setIsControlPanel(true);
         setConnectionState('connected');
         setVideoVisible(true);
+        if (
+          frozenFrameVisibleRef.current
+          && !streamRestartingRef.current
+          && pendingVideoFrameCallbackRef.current === null
+        ) {
+          const video = videoRef.current;
+          if (video && typeof video.requestVideoFrameCallback === 'function') {
+            pendingVideoFrameCallbackRef.current = video.requestVideoFrameCallback(
+              () => {
+                pendingVideoFrameCallbackRef.current = null;
+                frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+                  frozenFrameReleaseTimerRef.current = null;
+                  setFrozenFrame(false);
+                }, FROZEN_FRAME_RELEASE_DELAY_MS);
+              }
+            );
+          } else {
+            // requestVideoFrameCallback is available in the supported Chromium
+            // browsers; this fallback still waits one paint before revealing.
+            window.requestAnimationFrame(() => {
+              frozenFrameReleaseTimerRef.current = window.setTimeout(() => {
+                frozenFrameReleaseTimerRef.current = null;
+                setFrozenFrame(false);
+              }, FROZEN_FRAME_RELEASE_DELAY_MS);
+            });
+          }
+        }
       } else {
         setIsControlPanel(false);
       }
@@ -532,7 +621,7 @@ export default function Player({
       window.removeEventListener('wv_close', handlWvClose);
       window.removeEventListener('wv_error', handleWvError);
     };
-  }, [t]);
+  }, [setFrozenFrame, t]);
 
   const handleSnapshot = () => {
     videoRendererInstance.current?.doSnapshot();
@@ -644,6 +733,11 @@ export default function Player({
             onLoadedMetadata={syncVideoDimensions}
             onResize={syncVideoDimensions}
             disableRemotePlayback
+          />
+          <canvas
+            ref={frozenFrameRef}
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-0 h-full w-full ${resolvedObjectFit === 'cover' ? 'object-cover' : 'object-contain'} ${frozenFrameVisible ? 'opacity-100' : 'opacity-0'}`}
           />
           {isShowStreamStats && (
             <div className="absolute md:top-4 top-2 md:right-4 right-2 bg-gray-800/50 px-2 py-1 rounded text-xs font-mono space-y-0.5">

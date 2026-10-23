@@ -34,8 +34,18 @@ vi.mock('@/hooks/useStreamFallback', () => ({
 }));
 
 vi.mock('@/components/player/player', () => ({
-  default: ({ videoUrl }: { videoUrl: string }) => (
-    <div data-testid="player" data-video-url={videoUrl} />
+  default: ({
+    videoUrl,
+    streamRestarting,
+  }: {
+    videoUrl: string;
+    streamRestarting: boolean;
+  }) => (
+    <div
+      data-testid="player"
+      data-video-url={videoUrl}
+      data-stream-restarting={String(streamRestarting)}
+    />
   ),
 }));
 
@@ -71,10 +81,12 @@ describe('Monitoring encoder reconfiguration', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'start reconfigure' }));
     expect(player.getAttribute('data-video-url')).toBe('');
+    expect(player.getAttribute('data-stream-restarting')).toBe('true');
 
     fireEvent.click(screen.getByRole('button', { name: 'finish reconfigure' }));
     expect(player.getAttribute('data-video-url')).toContain(
       '/api/v1/h264/main?token=test-token'
     );
+    expect(player.getAttribute('data-stream-restarting')).toBe('false');
   });
 });
