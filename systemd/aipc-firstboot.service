@@ -5,7 +5,7 @@ Wants=aipc-restore.service
 After=aipc-restore.service network.target local-fs.target
 Before=containerd.service
 # Note: no Before= on business services here. Each AIPC service unit declares
-# Requires=aipc-firstboot.service + After=aipc-firstboot.service itself, so the
+# Wants=aipc-firstboot.service + After=aipc-firstboot.service itself, so the
 # ordering is already guaranteed and this file stays free of service names.
 # containerd is ordered after firstboot because firstboot owns its persistent
 # root configuration.
@@ -17,6 +17,13 @@ RemainAfterExit=yes
 StandardOutput=journal+console
 StandardError=journal+console
 SyslogIdentifier=aipc-firstboot
+# Hard stop against a wedged boot: if this script ever blocks (e.g. on an
+# unresponsive manager — the 2026-10-21 field incident hung here for 5h16m
+# with no IP/SSH/journal), systemd kills it after 180s and the boot
+# proceeds. Every step is idempotent, so killed work retries next boot.
+# Dependents use Wants= (not Requires=) so a timed-out firstboot does not
+# gate the business services from starting.
+TimeoutStartSec=180
 
 # This service only prepares infrastructure (kernel modules, directories,
 # device permissions, HAL libs). It does NOT start/stop AIPC services.

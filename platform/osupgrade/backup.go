@@ -63,6 +63,7 @@ func (r *Runner) createUpgradeBackup(job *Job) error {
 	deviceConfigPaths := []string{
 		"/etc/timezone",
 		"/etc/localtime",
+		"/etc/machine-id",
 		"/etc/systemd/timesyncd.conf",
 		"/etc/systemd/ntp-units.d/10-aipc-timesyncd.list",
 		"/usr/local/share/ca-certificates",

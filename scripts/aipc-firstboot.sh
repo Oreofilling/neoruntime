@@ -40,6 +40,26 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ---------- systemctl/timedatectl timeout guard ----------
+# 2026-10-21 field incident (.216 bench unit): PID1's reload transaction
+# wedged inside a generator for 5h16m; every systemctl call — including
+# this script's `enable --now serial-getty` — blocked on the unresponsive
+# manager and took the whole boot down with it (no IP, no SSH, silent
+# journal). Shadow both binaries with a bounded wrapper so no single call
+# can wedge the boot: an abandoned call exits 124, the caller's `|| warn`
+# handles it, and every firstboot step is idempotent so the work simply
+# retries on the next boot. Boot progress must never depend on the
+# manager being healthy.
+if command -v timeout >/dev/null 2>&1; then
+    # Resolve binary paths once: `timeout` execs its argument, so the shell
+    # builtin `command` cannot appear there (verified on-device: it exits
+    # 125/127 instantly and would silently break every call).
+    _SYSTEMCTL_BIN="$(command -v systemctl)"
+    _TIMEDATECTL_BIN="$(command -v timedatectl)"
+    systemctl()   { timeout 60 "${_SYSTEMCTL_BIN:?systemctl binary not found}" "$@"; }
+    timedatectl() { timeout 60 "${_TIMEDATECTL_BIN:?timedatectl binary not found}" "$@"; }
+fi
+
 # ---------- Parse args ----------
 ACTION="boot"
 while [[ $# -gt 0 ]]; do
@@ -259,6 +279,38 @@ provision_network() {
 }
 provision_network
 
+# Re-apply packaged journald limits from the persistent install root. The
+# drop-ins (SystemMaxUse / rate limits, packaged under configs/systemd/
+# journald.conf.d) are installed into /etc by deploy.sh — but a rootfs
+# reflash wipes /etc, and the very first boot after the reflash is exactly
+# when the clock-restore jump triggers a journald retention/vacuum storm
+# (2026-10-21: the storm congested I/O and contributed to a 5h16m boot
+# hang). /data/aipc survives the reflash, so promoting the caps here —
+# before Step 2 touches the clock — means the storm window is already
+# bounded. Only a factory-fresh flash (empty /data) stays unprotected;
+# that case needs the drop-ins baked into the OS image itself.
+journald_caps_applied=0
+if [[ -d "${AIPC_PREFIX}/etc/systemd/journald.conf.d" ]]; then
+    shopt -s nullglob
+    for jconf in "${AIPC_PREFIX}"/etc/systemd/journald.conf.d/*.conf; do
+        jbase="$(basename "$jconf")"
+        if ! cmp -s "$jconf" "/etc/systemd/journald.conf.d/${jbase}" 2>/dev/null; then
+            if install -D -m 0644 "$jconf" "/etc/systemd/journald.conf.d/${jbase}" 2>/dev/null; then
+                log "journald drop-in promoted: ${jbase}"
+                journald_caps_applied=1
+            else
+                warn "Failed to promote journald drop-in: ${jbase}"
+            fi
+        fi
+    done
+    shopt -u nullglob
+    if [[ ${journald_caps_applied} -eq 1 ]]; then
+        # Apply now so the caps are live before the clock jump below; a
+        # later restart in Step 6 re-reads them harmlessly.
+        systemctl restart systemd-journald 2>/dev/null || true
+    fi
+fi
+
 # ============================================================================
 # Step 1: Kernel modules (Hailo NPU + RTC)
 # ============================================================================
@@ -344,6 +396,35 @@ if [[ -e /dev/rtc0 ]]; then
             warn "hwclock --hctosys failed"
     else
         warn "RTC time is implausible (ts=${rtc_ts}), skipping hctosys"
+    fi
+fi
+
+# Pull time from the baseboard MCU RTC when the SoC clock is stale and the
+# SoC itself has no RTC. On NE503 the only battery-backed RTC lives on the
+# STM32 baseboard MCU behind the exclusive UART /dev/ttyS0 (verified
+# 2026-10-23: keeps time across full mains power loss). firstboot runs
+# before camera-daemon/device-control claim the UART, so it is safe to use
+# it here. Plausibility-checked: an MCU whose battery also died returns
+# garbage and we fall through to last-known-time below. A 4.5-year wall
+# clock jump later in boot is what ignited the journald retention storm of
+# 2026-10-21 — restoring time this early minimises how many journal
+# entries are ever written with a bogus clock.
+BOOT_PREP="${AIPC_PREFIX}/bin/ne503_boot_prep"
+if [[ "$(date +%s)" -lt "${MIN_PLAUSIBLE_TS}" ]] && \
+   [[ ! -e /dev/rtc0 ]] && \
+   [[ -x "${BOOT_PREP}" ]] && [[ -e /dev/ttyS0 ]]; then
+    info "SoC clock stale and no /dev/rtc0 — pulling time from MCU RTC"
+    mkdir -p /run/aipc/mcu-prep/.hailo 2>/dev/null || true
+    if HOME=/run/aipc/mcu-prep timeout 15 "${BOOT_PREP}" \
+            --serial /dev/ttyS0 --baud 921600 \
+            --version-check off --rtc sync-from-mcu >/dev/null 2>&1; then
+        if [[ "$(date +%s)" -ge "${MIN_PLAUSIBLE_TS}" ]]; then
+            log "System time restored from MCU RTC: $(date '+%Y-%m-%d %H:%M:%S')"
+        else
+            warn "MCU RTC time is implausible ($(date '+%Y-%m-%d %H:%M:%S')), falling back"
+        fi
+    else
+        warn "sync-from-mcu failed (MCU not answering or UART busy)"
     fi
 fi
 
@@ -485,13 +566,30 @@ fi
 # Ensure serial-getty is running on the kernel console device
 # (console=ttySX on kernel cmdline). systemd-getty-generator usually handles
 # this, but some BSPs ship with it masked or targeting the wrong device.
+#
+# Enable via a plain wants-symlink: creating the link is a pure filesystem
+# operation and never talks to the manager, so a wedged PID1 cannot hang the
+# boot here. (Root cause of the 2026-10-21 5h16m boot hang: `systemctl
+# enable --now` blocked behind a manager reload stuck in a generator.) The
+# best-effort start is bounded by the systemctl timeout guard above; if it
+# is abandoned, the getty comes up on the next boot via the symlink.
 if ! systemctl is-active --quiet serial-getty@* 2>/dev/null; then
     console_dev=$(grep -o 'console=tty[^ ,]*' /proc/cmdline 2>/dev/null | head -1 | sed 's/console=//' | cut -d, -f1)
     if [[ -n "${console_dev}" ]] && [[ -e "/dev/${console_dev}" ]]; then
         info "Enabling serial-getty on /dev/${console_dev}"
-        systemctl enable --now "serial-getty@${console_dev}.service" 2>/dev/null && \
-            log "serial-getty@${console_dev} enabled" || \
-            warn "Failed to enable serial-getty@${console_dev}"
+        getty_unit="serial-getty@${console_dev}.service"
+        getty_src="/lib/systemd/system/serial-getty@.service"
+        [[ -f "$getty_src" ]] || getty_src="/usr/lib/systemd/system/serial-getty@.service"
+        if [[ -f "$getty_src" ]] && \
+           mkdir -p /etc/systemd/system/getty.target.wants 2>/dev/null && \
+           ln -sfn "$getty_src" "/etc/systemd/system/getty.target.wants/${getty_unit}"; then
+            log "${getty_unit} enabled (wants-symlink)"
+        else
+            warn "Failed to enable ${getty_unit} via wants-symlink"
+        fi
+        systemctl start "${getty_unit}" 2>/dev/null && \
+            log "${getty_unit} started" || \
+            warn "Failed to start ${getty_unit} this boot (enabled for next boot)"
     fi
 else
     info "Serial getty already running"
@@ -557,7 +655,7 @@ containerd_set_config_version() {
 }
 
 migrate_containerd_root() {
-    local source="$1" destination="$2" link_target
+    local source="$1" destination="$2" link_target destination_has_data=0
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
@@ -565,17 +663,33 @@ migrate_containerd_root() {
         return 0
     }
 
+    # The destination lives on persistent /data and is authoritative once it
+    # contains any containerd state. After an OS reflash, /var/lib/containerd
+    # can contain a freshly initialized (empty) meta.db; copying it over the
+    # persistent root destroys the image/tag index while leaving blobs and
+    # snapshots behind. Only seed an empty destination. Existing persistent
+    # state must never be overlaid by the replaceable rootfs copy.
+    if find "$destination" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+        destination_has_data=1
+    fi
+
     if [[ -L "$source" ]]; then
         link_target="$(readlink -f "$source" 2>/dev/null || true)"
         if [[ "$link_target" == "$destination" ]]; then
             return 0
         fi
-        if [[ -n "$link_target" && -d "$link_target" ]]; then
+        if [[ $destination_has_data -eq 0 && -n "$link_target" && -d "$link_target" ]]; then
             cp -a "$link_target"/. "$destination"/ 2>/dev/null || true
+        elif [[ $destination_has_data -eq 1 ]]; then
+            log "Preserving existing containerd state in $destination; ignoring $source -> $link_target"
         fi
         rm -f "$source" 2>/dev/null || true
     elif [[ -d "$source" ]]; then
-        cp -a "$source"/. "$destination"/ 2>/dev/null || true
+        if [[ $destination_has_data -eq 0 ]]; then
+            cp -a "$source"/. "$destination"/ 2>/dev/null || true
+        else
+            log "Preserving existing containerd state in $destination; ignoring rootfs state in $source"
+        fi
         rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
@@ -794,6 +908,36 @@ if findmnt --mountpoint "$JOURNAL_DST" >/dev/null 2>&1; then
 else
     warn "Journal bind not active — persistent journal unavailable this boot"
 fi
+
+# 6c.3 Persist login records (wtmp/lastlog) across reboots and rootfs
+#     reflashes. /var/log is tmpfs on this BSP: every reboot wipes the login
+#     audit trail, and every OS reflash loses it entirely — the 2026-10-21
+#     incident forensics hit exactly this (wtmp began at the reflash, all
+#     earlier logins unrecoverable). Mirrors the journal bind pattern: keep
+#     the files on /data and bind-mount them onto /var/log.
+for ut_file in wtmp lastlog; do
+    ut_src="/data/aipc-data/log/${ut_file}"
+    ut_dst="/var/log/${ut_file}"
+    mkdir -p /data/aipc-data/log 2>/dev/null || true
+    # Seed the persistent copy from the current boot's file if it exists.
+    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
+        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
+    fi
+    if [[ ! -f "$ut_src" ]]; then
+        : >"$ut_src" 2>/dev/null || true
+        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
+        chmod 664 "$ut_src" 2>/dev/null || true
+    fi
+    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
+        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
+            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
+    fi
+    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
+        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
+            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
+    fi
+done
+log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
 
 # Runtime service lifecycle (including aipc-healthmon) belongs exclusively to
 # aipc-autostart and aipc-cli. Enabling a unit here would silently undo

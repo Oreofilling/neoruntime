@@ -187,7 +187,12 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 			return // Return to reconnect
 		}
 
-		logger.Info("Received event: topic=%s, id=%s, timestamp_ns=%d", event.Topic, event.EventId, event.TimestampNs)
+		// Debug, not Info: event-bus forwards thousands of these per minute
+		// when inference apps publish per-frame results. At Info they flood
+		// the journal (~12-20MB per 15min observed), force rotation/vacuum
+		// storms and crowd out the logs that matter during incident
+		// forensics (2026-10-21).
+		logger.Debug("Received event: topic=%s, id=%s, timestamp_ns=%d", event.Topic, event.EventId, event.TimestampNs)
 
 		eventJSON := map[string]interface{}{
 			"topic":        event.Topic,

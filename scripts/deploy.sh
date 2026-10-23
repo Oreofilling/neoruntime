@@ -14,6 +14,18 @@
 #
 set -euo pipefail
 
+# Bounded systemctl: a wedged manager (PID1 stuck in a reload/generator —
+# the 2026-10-21 field incident) makes every systemctl call block forever.
+# Deploy must never hang the operator's shell: an abandoned call exits 124
+# and the surrounding ||/warn handles it. stop_services already uses
+# --no-block; this covers daemon-reload/enable/start/restart and probes.
+if command -v timeout >/dev/null 2>&1; then
+    _SYSTEMCTL_BIN="$(command -v systemctl)"
+    _TIMEDATECTL_BIN="$(command -v timedatectl)"
+    systemctl()   { timeout 60 "${_SYSTEMCTL_BIN:?systemctl binary not found}" "$@"; }
+    timedatectl() { timeout 60 "${_TIMEDATECTL_BIN:?timedatectl binary not found}" "$@"; }
+fi
+
 FAILURE_DETAIL=""
 SERVICES_STOPPED=0
 SWAP_ACTIVE=0
@@ -1016,6 +1028,12 @@ start_services() {
         systemctl enable --now aipc-logrotate.timer 2>/dev/null \
             && log "  Enabled aipc-logrotate.timer (rotates Go logs every 10 min)" \
             || warn "  Failed to enable aipc-logrotate.timer"
+    fi
+
+    if unit_exists aipc-time-save.service; then
+        systemctl enable aipc-time-save.service 2>/dev/null \
+            && log "  Enabled aipc-time-save.service (persists last-known-time at shutdown)" \
+            || warn "  Failed to enable aipc-time-save.service"
     fi
 }
 
