@@ -88,7 +88,7 @@ export default function Monitoring() {
         )}
         <div className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black my-2 md:max-w-none md:rounded-2xl">
           <Player
-            key={`${effectiveStreamId}:${playerKey}`}
+            key={playerKey}
             videoUrl={currentStreamUrl}
             videoRendererInstance={playerRef}
             streamWidth={activeStreamInfo?.width}
@@ -96,6 +96,7 @@ export default function Monitoring() {
             objectFit="adaptive"
             audioOverlay
             configuring={isEncoderConfiguring}
+            streamRestarting={isEncoderRestarting}
           />
         </div>
       </div>
