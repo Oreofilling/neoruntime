@@ -2,7 +2,8 @@
 Description=AIPC Nginx App Gateway
 Documentation=https://github.com/yourorg/ne503
 Wants=aipc-restore.service platform-api.service app-manager.service
-Requires=aipc-firstboot.service
+# Wants (not Requires): a timed-out or failed firstboot must not gate startup
+Wants=aipc-firstboot.service
 After=aipc-restore.service aipc-firstboot.service network.target platform-api.service app-manager.service
 RequiresMountsFor=/data
 ConditionPathExists=/data/nginx/bin/nginx

@@ -1,0 +1,18 @@
+[Unit]
+Description=Persist last-known-time snapshot before reboot
+Documentation=file:///data/aipc/docs/baseboard-mcu-rtc-ota.md
+# platform-api saves last-known-time.json periodically while running; this
+# oneshot closes the gap for short-lived sessions (fresh flash, factory
+# bring-up, commissioning) that power off before the periodic saver ever
+# fires. Enabled by deploy.sh alongside aipc-logrotate.timer.
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+ConditionPathExists=/data/aipc/scripts/aipc-time-save.sh
+
+[Service]
+Type=oneshot
+ExecStart=/data/aipc/scripts/aipc-time-save.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=halt.target reboot.target shutdown.target

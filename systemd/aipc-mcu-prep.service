@@ -1,14 +1,15 @@
 [Unit]
 Description=AIPC baseboard MCU boot prep (RTC sync + firmware OTA)
 Documentation=file:///data/aipc/docs/baseboard-mcu-rtc-ota.md
-# Runs AFTER aipc-firstboot (so the host clock is already sane, set from the
-# battery-backed RTC / NTP) and BEFORE aipc-autostart. aipc-autostart is the
-# single chokepoint that enable+starts every runtime daemon, so ordering ahead
-# of it guarantees /dev/ttyS0 — exclusive-use, owned at runtime by the camera
-# and device daemons — is still free when MCU prep runs. The matching
-# ordering vs those two daemons is declared on their own units
-# (After=aipc-mcu-prep.service), keeping this file free of business service
-# names so AIPC and the OS image stay independently maintainable.
+# Runs AFTER aipc-firstboot (so the host clock is already sane — restored
+# by firstboot Step 2 from the baseboard MCU RTC, last-known-time, or NTP;
+# the SoC itself has NO /dev/rtc0) and BEFORE aipc-autostart. aipc-autostart
+# is the single chokepoint that enable+starts every runtime daemon, so
+# ordering ahead of it guarantees /dev/ttyS0 — exclusive-use, owned at
+# runtime by the camera and device daemons — is still free when MCU prep
+# runs. The matching ordering vs those two daemons is declared on their own
+# units (After=aipc-mcu-prep.service), keeping this file free of business
+# service names so AIPC and the OS image stay independently maintainable.
 # Within boot_prep the RTC step runs first, then version check + OTA.
 After=aipc-firstboot.service
 Before=aipc-autostart.service
