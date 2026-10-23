@@ -1350,6 +1350,15 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 	}
 	// Create and start container via containerd
 	if s.runtime != nil {
+		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
+		if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, appManifest.ImageReferences()); err != nil {
+			return &proto.Status{
+				Success: false,
+				Message: fmt.Sprintf("Failed to restore required application images: %v", err),
+				Code:    500,
+			}, nil
+		}
+
 		// Preload required models before creating the container. A logical
 		// registration refusal (including an id/path/config collision) must
 		// stop the start — otherwise the app launches against no model or
@@ -1362,34 +1371,7 @@ func (s *AppManagerServer) startSingleContainerApp(ctx context.Context, appID st
 			}, nil
 		}
 
-		// Ensure namespace is set in context for containerd operations
-		ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
-
-		// Auto-pull: if the image isn't in containerd yet, try to pull it.
-		// This handles cases where the app was installed before PullImage was
-		// implemented, or the image was pruned.
 		imageName := appManifest.GetNormalizedImage()
-		if _, err := s.client.GetImage(ctxWithNamespace, imageName); err != nil {
-			logger.Warn("Image %s (manifest.image=%q) not found locally, attempting to pull", imageName, appManifest.Spec.Image)
-			if pullErr := s.client.PullImage(ctxWithNamespace, imageName); pullErr != nil {
-				// Readable failure: name the image, explain the two likely root
-				// causes (tag mismatch on the imported tar, or an offline device
-				// that cannot reach a registry), point to the remediation, and
-				// keep the original pull error for diagnostics.
-				return &proto.Status{
-					Success: false,
-					Message: fmt.Sprintf(
-						"Image %s is not present locally and could not be pulled. "+
-							"This usually means the imported image tar's tag does not match manifest.image (%q), "+
-							"or the device is offline and cannot reach a registry. "+
-							"Re-import the app together with its image tar, or ensure the image tag matches manifest.image. "+
-							"Pull error: %v",
-						imageName, appManifest.Spec.Image, pullErr),
-					Code: 500,
-				}, nil
-			}
-			logger.Info("Image pulled successfully on start: %s", imageName)
-		}
 
 		// Check if container already exists (from previous run)
 		// If exists, remove it first to avoid snapshot conflicts
@@ -1527,6 +1509,13 @@ func (s *AppManagerServer) startMultiContainerApp(ctx context.Context, appID str
 	}
 
 	ctxWithNamespace := namespaces.WithNamespace(ctx, s.config.Containerd.Namespace)
+	if err := s.ensureAppImagesAvailable(ctxWithNamespace, appID, imageReferencesForApp(appInfo, appManifest)); err != nil {
+		return &proto.Status{
+			Success: false,
+			Message: fmt.Sprintf("Failed to restore required application images: %v", err),
+			Code:    500,
+		}, nil
+	}
 
 	// Preload required models before touching the existing multi-container
 	// instance. A failed restore leaves the currently running instance alone
@@ -1879,7 +1868,7 @@ func (s *AppManagerServer) UninstallApp(ctx context.Context, req *proto.Uninstal
 	}
 
 	// Remove saved tar file (self-healing backup)
-	tarPath := filepath.Join("/data/apps/images", req.AppId+".tar")
+	tarPath := containerd.SavedImageTarPath(req.AppId)
 	if _, err := os.Stat(tarPath); err == nil {
 		if err := os.Remove(tarPath); err != nil {
 			logger.Warn("Failed to remove tar file %s: %v", tarPath, err)
@@ -2614,6 +2603,7 @@ func (s *AppManagerServer) syncAppStates() {
 func (s *AppManagerServer) recoverAppsOnStartup() {
 	s.syncAppStates()
 	s.repairSnapshotsIfNeeded()
+	s.restorePersistedAppImages()
 
 	apps := s.registry.List()
 	for _, app := range apps {

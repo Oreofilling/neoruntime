@@ -42,6 +42,15 @@ type Client struct {
 	rootDir   string // containerd root directory (e.g., /data/aipc-data/containerd)
 }
 
+// SavedImagesDir is the persistent archive directory used to rebuild
+// containerd image metadata after an OS upgrade or storage repair.
+const SavedImagesDir = "/data/apps/images"
+
+// SavedImageTarPath returns the recovery archive path for an installed app.
+func SavedImageTarPath(appID string) string {
+	return filepath.Join(SavedImagesDir, appID+".tar")
+}
+
 // ContainerInfo holds information about a running container
 type ContainerInfo struct {
 	ID        string
@@ -179,24 +188,29 @@ func (c *Client) ImportImage(ctx context.Context, imagePath, imageName string) (
 		return "", fmt.Errorf("no images found in tar file")
 	}
 
-	// Get the imported image
+	// docker save archives can contain several images. Import registers every
+	// image, but none is guaranteed to be unpacked, so prepare all of them. A
+	// later reference reconciliation step maps the archived tags to the app
+	// manifest's normalized names.
+	for _, imported := range imgs {
+		logger.Info("Image imported: %s", imported.Name)
+		image, getErr := c.client.GetImage(ctx, imported.Name)
+		if getErr != nil {
+			return "", fmt.Errorf("failed to get imported image %s: %w", imported.Name, getErr)
+		}
+		if unpackErr := image.Unpack(ctx, "overlayfs"); unpackErr != nil {
+			// Preserve the existing import contract: an already-unpacked image
+			// can report an error here, and the definitive availability check is
+			// performed by EnsureImageUnpacked below.
+			logger.Warn("Failed to unpack image %s (may already be unpacked): %v", imported.Name, unpackErr)
+		} else {
+			logger.Info("Image unpacked successfully: %s", imported.Name)
+		}
+	}
+
+	// The first imported image remains the primary return value for backwards
+	// compatibility with the install API.
 	img := imgs[0]
-	logger.Info("Image imported: %s", img.Name)
-
-	// IMPORTANT: Unpack the image to create snapshots
-	// Without this, CreateContainer will fail with "parent snapshot does not exist"
-	image, err := c.client.GetImage(ctx, img.Name)
-	if err != nil {
-		return "", fmt.Errorf("failed to get imported image: %w", err)
-	}
-
-	// Unpack using the default snapshotter (overlayfs)
-	if err := image.Unpack(ctx, "overlayfs"); err != nil {
-		// Log warning but don't fail - some images might already be unpacked
-		logger.Warn("Failed to unpack image (may already be unpacked): %v", err)
-	} else {
-		logger.Info("Image unpacked successfully: %s", img.Name)
-	}
 
 	// If the caller requested a specific image name, re-tag the imported image
 	// so that spec.image in the manifest remains the authoritative reference.
@@ -249,12 +263,9 @@ func (c *Client) TagImage(ctx context.Context, sourceRef, targetRef string) erro
 	return nil
 }
 
-// EnsureImageUnpacked unpacks an already-imported image into overlayfs
-// snapshots when it has none. ImportImage only unpacks the first image of a
-// multi-image archive, so references satisfied from later entries still need
-// their snapshots before CreateContainer can use them. Like ImportImage, an
-// unpack error is not fatal here — the image may already be unpacked, and a
-// genuinely broken unpack resurfaces at container creation.
+// EnsureImageUnpacked prepares an already-imported image for container
+// creation. An unpack error is returned so callers never treat an unusable
+// image record as a successful recovery.
 func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
 	ctx = namespaces.WithNamespace(ctx, c.namespace)
 
@@ -270,7 +281,7 @@ func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
 		return nil
 	}
 	if err := image.Unpack(ctx, "overlayfs"); err != nil {
-		logger.Warn("Failed to unpack image %s (may already be unpacked): %v", ref, err)
+		return fmt.Errorf("failed to unpack image %s: %w", ref, err)
 	}
 	return nil
 }
@@ -278,12 +289,11 @@ func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
 // SaveImageTar copies the image tar file to the persistent images directory
 // for self-healing recovery after power loss.
 func SaveImageTar(appID, srcPath string) error {
-	imagesDir := "/data/apps/images"
-	if err := os.MkdirAll(imagesDir, 0755); err != nil {
+	if err := os.MkdirAll(SavedImagesDir, 0755); err != nil {
 		return fmt.Errorf("failed to create images dir: %w", err)
 	}
 
-	dstPath := filepath.Join(imagesDir, appID+".tar")
+	dstPath := SavedImageTarPath(appID)
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to open source: %w", err)
@@ -463,8 +473,7 @@ func (c *Client) nukeMetadataDB() {
 
 // reimportAllImages re-imports images from saved tar files in /data/apps/images/
 func (c *Client) reimportAllImages(ctx context.Context) ([]RepairResult, error) {
-	imagesDir := "/data/apps/images"
-	entries, err := os.ReadDir(imagesDir)
+	entries, err := os.ReadDir(SavedImagesDir)
 	if err != nil {
 		return nil, fmt.Errorf("no saved image tar files found: %w", err)
 	}
@@ -474,7 +483,7 @@ func (c *Client) reimportAllImages(ctx context.Context) ([]RepairResult, error) 
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar") {
 			continue
 		}
-		tarPath := filepath.Join(imagesDir, e.Name())
+		tarPath := filepath.Join(SavedImagesDir, e.Name())
 		appID := strings.TrimSuffix(e.Name(), ".tar")
 
 		logger.Info("[SELF-HEAL] Re-importing image from %s", tarPath)
