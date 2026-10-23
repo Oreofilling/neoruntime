@@ -381,8 +381,8 @@ export default function Player({
   const handleReloadRef = useRef(handleReload);
   handleReloadRef.current = handleReload;
 
-  // External callers (e.g. encoder reconfigure) request a full player reconnect
-  // by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
+  // External callers (for example a hot bitrate update) request a full player
+  // reconnect by dispatching 'player-reload'. This tears down WS + MSE and reconnects,
   // fetching fresh SPS/PPS and waiting for a clean IDR — avoiding 花屏/黑屏
   // after a resolution/codec/fps change.
   useEffect(() => {

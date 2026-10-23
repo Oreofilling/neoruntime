@@ -15,6 +15,7 @@ export default function Monitoring() {
     'main'
   );
   const [isEncoderConfiguring, setIsEncoderConfiguring] = useState(false);
+  const [isEncoderRestarting, setIsEncoderRestarting] = useState(false);
 
   const { data: mediaStatus } = useMediaStatus();
 
@@ -52,7 +53,10 @@ export default function Monitoring() {
   // Incrementing the generation guarantees a different URL and a full Player
   // remount after every successful enable/disable operation.
   const [playerKey, setPlayerKey] = useState(0);
-  const currentStreamUrl = effectiveEnabled
+  // Full codec/resolution changes rebuild the backend pipeline. Disconnect the
+  // old player immediately and reconnect only after the mutation's status poll
+  // completes, using the final effective stream (including H.265 fallback).
+  const currentStreamUrl = effectiveEnabled && !isEncoderRestarting
     ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
     : '';
 
@@ -112,6 +116,7 @@ export default function Monitoring() {
             onStreamChange={handleStreamChange}
             onStreamToggleSuccess={handleStreamToggleSuccess}
             onEncoderConfiguringChange={setIsEncoderConfiguring}
+            onEncoderRestartingChange={setIsEncoderRestarting}
           />
         </div>
       </div>

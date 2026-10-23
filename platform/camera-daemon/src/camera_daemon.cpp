@@ -2636,17 +2636,24 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                     }
                 }
             }
-            // MediaLibrary may reallocate codec contexts after restart.
-            // Rebind encoder manager contexts to avoid stale handles.
+            // A codec/layout change may fully recreate MediaLibrary. Both the
+            // video and codec contexts are borrowed from that instance, so
+            // refresh VideoSource before replaying ISP state or handing its
+            // primary context back to autofocus.
+            const bool video_source_rebound =
+                resync_video_source_from_media_pipeline("encoder reconfigure restart");
             resync_encoders_from_media_pipeline();
             reapply_osd_config_after_pipeline_rebuild("encoder reconfigure restart");
             reapply_isp_config_after_pipeline_rebuild("encoder reconfigure restart");
 
             // Refresh AF video context — the stop/start cycle may have
             // reallocated internal video contexts.
-            if (autofocus_controller_) {
+            if (autofocus_controller_ && video_source_rebound) {
                 autofocus_controller_->update_video_context(video_source_->video_ctx());
                 autofocus_controller_->start();
+            } else if (autofocus_controller_) {
+                HAL_LOG_WARNING("CameraDaemon: autofocus remains stopped after encoder "
+                                "reconfigure because VideoSource rebind failed");
             }
         }
 
@@ -5150,6 +5157,46 @@ bool CameraDaemon::init_encoders() {
         }
     }
 
+    return true;
+}
+
+bool CameraDaemon::resync_video_source_from_media_pipeline(const char* reason) {
+    auto* media_ops = hal_loader_ ? hal_loader_->media() : nullptr;
+    const char* why = reason ? reason : "pipeline rebuild";
+    if (!media_ops || !media_ctx_ || !media_ops->get_video_list || !video_source_) {
+        HAL_LOG_WARNING("CameraDaemon: VideoSource rebind after %s unavailable", why);
+        return false;
+    }
+
+    void* video_list = nullptr;
+    uint32_t video_count = 0;
+    const int ret = media_ops->get_video_list(media_ctx_, &video_list, &video_count);
+    if (ret < 0 || !video_list || video_count == 0) {
+        HAL_LOG_WARNING("CameraDaemon: VideoSource rebind after %s: get_video_list "
+                        "failed (ret=%d list=%p count=%u)",
+                        why, ret, video_list, video_count);
+        return false;
+    }
+
+    if (!video_source_->init_from_context(static_cast<void**>(video_list), video_count)) {
+        HAL_LOG_WARNING("CameraDaemon: VideoSource rebind after %s: "
+                        "init_from_context failed", why);
+        return false;
+    }
+
+    // init_from_context clears callbacks and running flags. Restore the same
+    // pre-encode routing used at startup before subscribing to the new contexts.
+    bind_video_source_callbacks();
+    for (auto& slot : video_source_->streams()) {
+        if (!video_source_->start_stream(slot.name)) {
+            HAL_LOG_WARNING("CameraDaemon: VideoSource rebind after %s: failed to "
+                            "start stream '%s'", why, slot.name.c_str());
+            return false;
+        }
+    }
+
+    HAL_LOG_INFO("CameraDaemon: VideoSource rebound after %s: primary=%p streams=%u",
+                 why, video_source_->video_ctx(), video_count);
     return true;
 }
 
