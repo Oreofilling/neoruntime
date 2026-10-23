@@ -1653,6 +1653,7 @@
         "model_id": "模型 ID",
         "estimated_tops": "预估算力",
         "estimated_memory": "预估内存",
+        "estimate_unavailable": "暂不支持",
         "inputs": "输入",
         "outputs": "输出",
         "tensor_inputs": "输入张量",

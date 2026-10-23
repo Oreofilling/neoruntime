@@ -7170,8 +7170,14 @@ components:
             $ref: '#/components/schemas/TensorSpec'
         estimated_tops:
           type: number
+          format: float
+          minimum: 0
+          description: Optional precomputed compiler/package estimate in TOPS; 0 means unavailable.
         estimated_memory:
           type: integer
+          format: uint32
+          minimum: 0
+          description: Optional compiler/package memory estimate in MiB; 0 means unavailable.
         load_timestamp:
           type: integer
           format: int64

@@ -78,6 +78,10 @@ export interface ModelParseResult {
   format: string;
   /** Server classification of the compiled output: 'nms' | 'feature_map'. */
   output_format?: string;
+  /** Optional precomputed compiler/package estimate in TOPS. */
+  estimated_tops?: number;
+  /** Optional compiler/package estimate in MiB. */
+  estimated_memory?: number;
   /** Present only for AMPK .bin imports — pre-fills the form. */
   package?: ModelPackagePrefill;
   input_width?: number;
@@ -877,6 +881,8 @@ export type ReplacementFileFacts = {
   vstream_info?: string;
   input_width?: number;
   input_height?: number;
+  estimated_tops?: number;
+  estimated_memory?: number;
 };
 
 /** Fold the replacement file's identity facts into a register preview.
@@ -895,6 +901,8 @@ export function withReplacementFileFacts(
     'vstream_info',
     'input_width',
     'input_height',
+    'estimated_tops',
+    'estimated_memory',
   ];
   for (const key of keys) {
     const value = facts[key];
