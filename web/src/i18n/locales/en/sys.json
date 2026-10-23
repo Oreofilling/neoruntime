@@ -1733,6 +1733,7 @@
         "links": "Related Links",
         "estimated_tops": "Estimated TOPS",
         "estimated_memory": "Estimated Memory",
+        "estimate_unavailable": "Not available",
         "inputs": "Inputs",
         "outputs": "Outputs",
         "tensor_inputs": "Input Tensors",
