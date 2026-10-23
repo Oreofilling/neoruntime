@@ -210,7 +210,11 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 		}
 
 		es.broadcast(jsonData)
-		logger.Info("Broadcasted event to %d clients", len(es.clients))
+		// Debug, same reasoning as the "Received event" line above: one log
+		// line per forwarded event kept the flood alive after that one was
+		// demoted. Connection-level events (connect/disconnect) stay Info —
+		// they are low-frequency and diagnostically useful.
+		logger.Debug("Broadcasted event to %d clients", len(es.clients))
 	}
 }
 

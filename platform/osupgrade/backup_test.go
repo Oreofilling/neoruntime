@@ -29,6 +29,7 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	writeBackupFixture(t, sourceRoot, "/etc/ssh/sshd_config", "PermitRootLogin prohibit-password\n")
 	// device-config group
 	writeBackupFixture(t, sourceRoot, "/etc/timezone", "Asia/Shanghai\n")
+	writeBackupFixture(t, sourceRoot, "/etc/machine-id", "0123456789abcdef0123456789abcdef\n")
 	writeBackupFixture(t, sourceRoot, "/etc/systemd/timesyncd.conf", "[Time]\nNTP=ntp.example\n")
 	writeBackupFixture(t, sourceRoot, "/usr/local/share/ca-certificates/site.crt", "test certificate\n")
 	writeBackupFixture(t, sourceRoot, "/home/root/apps/resources/final_calibration.json", "{}\n")
@@ -85,6 +86,7 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	deviceConfigNames := readTarNames(t, filepath.Join(runner.BackupRoot, job.ID, "device-config.tar.gz"))
 	for _, want := range []string{
 		"etc/timezone",
+		"etc/machine-id",
 		"etc/systemd/timesyncd.conf",
 		"etc/resolv.conf",
 		"usr/local/share/ca-certificates/site.crt",
