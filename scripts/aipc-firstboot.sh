@@ -96,8 +96,14 @@ if [[ "$ACTION" == "boot" ]]; then
 fi
 
 # ---------- Constants ----------
-# Minimum plausible epoch — reject timestamps before 2024-01-01 (bad RTC / empty battery)
+# Plausible epoch window — reject timestamps outside [2024-01-01, 2040-01-01].
+# The lower bound catches dead RTCs / epoch-1970 boots; the UPPER bound
+# catches corrupt RTCs reading the far future (the MCU RTC year field is
+# 2-digit, so 2099 is representable): accepting it would skip the
+# last-known-time fallback and jump the wall clock by decades — another
+# journald retention storm (2026-10-21).
 MIN_PLAUSIBLE_TS=1704067200
+MAX_PLAUSIBLE_TS=2208988800
 
 # Detect install prefix for status display. /data/aipc is the sole canonical
 # root; legacy /data (flat) and /opt/aipc (rootfs) are kept as transition
@@ -391,11 +397,11 @@ log "=== [2/5] Time synchronization ==="
 # Sync hardware RTC → system clock if RTC is present and plausible
 if [[ -e /dev/rtc0 ]]; then
     rtc_ts=$(hwclock -u --show 2>/dev/null | xargs -I{} date -d "{}" +%s 2>/dev/null || echo "0")
-    if [[ "${rtc_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]]; then
+    if [[ "${rtc_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]] && [[ "${rtc_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
         hwclock --hctosys 2>/dev/null && log "System clock synced from hardware RTC" || \
             warn "hwclock --hctosys failed"
     else
-        warn "RTC time is implausible (ts=${rtc_ts}), skipping hctosys"
+        warn "RTC time is outside the plausible window (ts=${rtc_ts}), skipping hctosys"
     fi
 fi
 
@@ -418,10 +424,14 @@ if [[ "$(date +%s)" -lt "${MIN_PLAUSIBLE_TS}" ]] && \
     if HOME=/run/aipc/mcu-prep timeout 15 "${BOOT_PREP}" \
             --serial /dev/ttyS0 --baud 921600 \
             --version-check off --rtc sync-from-mcu >/dev/null 2>&1; then
-        if [[ "$(date +%s)" -ge "${MIN_PLAUSIBLE_TS}" ]]; then
+        # The tool sets the clock itself, so re-check AFTER it ran and
+        # two-sided: a corrupt MCU RTC reading e.g. 2099 must be rejected
+        # here so the last-known-time fallback below still applies.
+        _mcu_ts="$(date +%s)"
+        if [[ "${_mcu_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]] && [[ "${_mcu_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
             log "System time restored from MCU RTC: $(date '+%Y-%m-%d %H:%M:%S')"
         else
-            warn "MCU RTC time is implausible ($(date '+%Y-%m-%d %H:%M:%S')), falling back"
+            warn "MCU RTC time is outside the plausible window ($(date '+%Y-%m-%d %H:%M:%S')), falling back"
         fi
     else
         warn "sync-from-mcu failed (MCU not answering or UART busy)"
@@ -435,7 +445,7 @@ LAST_KNOWN_TIME="${AIPC_ETC}/last-known-time.json"
 
 if [[ "${current_ts}" -lt "${MIN_PLAUSIBLE_TS}" ]] && [[ -f "${LAST_KNOWN_TIME}" ]]; then
     saved_ts=$(grep -o '"unix_timestamp": *[0-9]*' "${LAST_KNOWN_TIME}" 2>/dev/null | grep -o '[0-9]*' || true)
-    if [[ -n "${saved_ts}" ]] && [[ "${saved_ts}" -gt "${MIN_PLAUSIBLE_TS}" ]]; then
+    if [[ -n "${saved_ts}" ]] && [[ "${saved_ts}" -gt "${MIN_PLAUSIBLE_TS}" ]] && [[ "${saved_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
         saved_date=$(date -d "@${saved_ts}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
         if [[ -n "${saved_date}" ]]; then
             systemctl stop systemd-timesyncd.service ntpd.service chronyd.service 2>/dev/null || true
@@ -656,6 +666,7 @@ containerd_set_config_version() {
 
 migrate_containerd_root() {
     local source="$1" destination="$2" link_target destination_has_data=0
+    local stage_parent stage_dir copy_src=""
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
@@ -678,22 +689,48 @@ migrate_containerd_root() {
         if [[ "$link_target" == "$destination" ]]; then
             return 0
         fi
-        if [[ $destination_has_data -eq 0 && -n "$link_target" && -d "$link_target" ]]; then
-            cp -a "$link_target"/. "$destination"/ 2>/dev/null || true
-        elif [[ $destination_has_data -eq 1 ]]; then
-            log "Preserving existing containerd state in $destination; ignoring $source -> $link_target"
+        if [[ -n "$link_target" && -d "$link_target" ]]; then
+            copy_src="$link_target"
         fi
-        rm -f "$source" 2>/dev/null || true
     elif [[ -d "$source" ]]; then
-        if [[ $destination_has_data -eq 0 ]]; then
-            cp -a "$source"/. "$destination"/ 2>/dev/null || true
-        else
-            log "Preserving existing containerd state in $destination; ignoring rootfs state in $source"
-        fi
-        rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
+        copy_src="$source"
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
         return 0
+    fi
+
+    if [[ $destination_has_data -eq 1 ]]; then
+        log "Preserving existing containerd state in $destination; ignoring $source"
+    elif [[ -n "$copy_src" ]]; then
+        # Crash-safe seeding. firstboot runs under TimeoutStartSec, so a
+        # large image store can legitimately be killed mid-copy; a partial
+        # destination would then be treated as authoritative state on the
+        # next boot while the complete source gets deleted. Copy into a
+        # staging sibling and publish with a single rename instead. Staging
+        # left behind by an interrupted attempt is partial by definition —
+        # always discard it.
+        stage_parent="$(dirname "$destination")"
+        rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true
+        stage_dir="${stage_parent}/.containerd-migrate.$$"
+        if mkdir -p "$stage_dir" 2>/dev/null && \
+           cp -a "$copy_src"/. "$stage_dir"/ 2>/dev/null && \
+           rmdir "$destination" 2>/dev/null && \
+           mv "$stage_dir" "$destination" 2>/dev/null; then
+            log "Seeded containerd root $destination from $copy_src (staged + atomic rename)"
+        else
+            rm -rf "$stage_dir" 2>/dev/null || true
+            mkdir -p "$destination" 2>/dev/null || true
+            warn "containerd seed copy did not complete; keeping source $copy_src intact"
+            return 0
+        fi
+    fi
+
+    # Only now — the destination either already held authoritative state or
+    # was fully seeded — is it safe to drop the replaceable source.
+    if [[ -L "$source" ]]; then
+        rm -f "$source" 2>/dev/null || true
+    else
+        rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
     fi
 
     mkdir -p "$(dirname "$source")" 2>/dev/null || true

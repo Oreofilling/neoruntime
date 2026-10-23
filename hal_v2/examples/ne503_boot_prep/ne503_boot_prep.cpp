@@ -240,6 +240,22 @@ static int rtc_sync_linux_from_mcu(void *mcu)
     if (r != HAL_OK) {
         return r;
     }
+    // Sanity-bound the date BEFORE touching the system clock. The MCU RTC
+    // year field is 2-digit (2000+yy), so a corrupt or misbehaving RTC can
+    // report 1999/2099 or impossible month/day/time values. The caller
+    // (aipc-firstboot) only re-checks AFTER this tool returns, and a
+    // clock_settime with a far-future value would skip its
+    // last-known-time fallback and jump the wall clock by decades — the
+    // journald retention-storm trigger of 2026-10-21. Refuse instead of set.
+    const int full_year = 2000 + (int)ht.year;
+    if (full_year < 2024 || full_year > 2040 ||
+        ht.month < 1 || ht.month > 12 || ht.day < 1 || ht.day > 31 ||
+        ht.hour > 23 || ht.minute > 59 || ht.second > 60) {
+        HAL_LOG_ERROR("MCU RTC time outside plausible range "
+                      "(%04d-%02u-%02u %02u:%02u:%02u); refusing clock_settime",
+                      full_year, ht.month, ht.day, ht.hour, ht.minute, ht.second);
+        return HAL_ERROR;
+    }
     struct tm tm {};
     std::memset(&tm, 0, sizeof(tm));
     tm.tm_year = ht.year + 100;

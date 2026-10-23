@@ -253,6 +253,14 @@ restore_device_config() {
         restored_time=1
     fi
     restore_regular_file "$tmp" "etc/systemd/ntp-units.d/10-aipc-timesyncd.list" 0644 >/dev/null 2>&1 || true
+    # Restore the commissioned machine-id so journals stay unified across
+    # rootfs upgrades: a regenerated id forks a new /var/log/journal/<id>
+    # tree and re-fragments history (plus the retention-vacuum storms that
+    # come with it). PID1 of the CURRENT boot already committed the freshly
+    # generated id, so the restored value takes effect from the next boot.
+    if restore_regular_file "$tmp" "etc/machine-id" 0444 >/dev/null 2>&1; then
+        log "Restored commissioned /etc/machine-id (effective next boot)"
+    fi
     if [[ $restored_time -eq 1 ]]; then
         log "Restored time and NTP projection"
     fi
