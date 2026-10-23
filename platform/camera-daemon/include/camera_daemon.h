@@ -989,6 +989,8 @@ private:
     bool init_rtsp();
     bool init_encoded_publisher();
     bool init_ai_overlay();
+    /** Rebind VideoSource after MediaLibrary replaces its borrowed video contexts. */
+    bool resync_video_source_from_media_pipeline(const char* reason);
     /** Re-register EncoderManager from get_codec_list after MediaLibrary reallocates codec contexts. */
     void resync_encoders_from_media_pipeline();
 

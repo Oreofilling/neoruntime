@@ -31,6 +31,7 @@ interface MediaSettingsProps {
   onStreamChange?: (streamId: string) => void;
   onStreamToggleSuccess?: (streamId: string, enabled: boolean) => void;
   onEncoderConfiguringChange?: (isConfiguring: boolean) => void;
+  onEncoderRestartingChange?: (isRestarting: boolean) => void;
 }
 
 export default function MediaSettings({
@@ -38,6 +39,7 @@ export default function MediaSettings({
   onStreamChange: controlledOnStreamChange,
   onStreamToggleSuccess,
   onEncoderConfiguringChange,
+  onEncoderRestartingChange,
 }: MediaSettingsProps) {
   const { t } = useTranslation();
   const { data: statusData, isLoading, error } = useMediaStatus();
@@ -196,6 +198,14 @@ export default function MediaSettings({
     isReconfiguringEncoder,
     onEncoderConfiguringChange,
   ]);
+
+  // A codec/resolution reconfigure tears down the complete media pipeline.
+  // Tell the media page to disconnect the old decoder until the status poll in
+  // useReconfigureEncoder has observed the final stream. This prevents the old
+  // socket from briefly rendering the rebuilt stream before a second reconnect.
+  useEffect(() => {
+    onEncoderRestartingChange?.(isReconfiguringEncoder);
+  }, [isReconfiguringEncoder, onEncoderRestartingChange]);
 
   // Any encoder reconfiguration in flight (codec/resolution full reconfig, or
   // bitrate/fps/gop hot reload). While true the codec & resolution dropdowns
