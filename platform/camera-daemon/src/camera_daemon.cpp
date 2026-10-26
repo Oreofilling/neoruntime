@@ -6962,9 +6962,60 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             return;
         }
 
+        // Adding one stream rebuilds the complete MediaLibrary pipeline, so
+        // every encoder receives a new frontend generation. Hold all encoder
+        // input while the rebuilt video contexts are rebound and the persisted
+        // ISP/OSD state is replayed. Otherwise the first IDR can itself contain
+        // an unprimed/default-IQ frame; waiting for an IDR at the socket layer
+        // cannot hide that corrupt frame.
+        const bool can_gate_layout_feed =
+            encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed;
+        bool layout_feed_gated = false;
+        auto set_layout_auto_feed = [&](bool enable, const char* phase) {
+            if (!can_gate_layout_feed) return;
+            const int ar = media_ops->set_encoder_auto_feed(media_ctx_, enable);
+            if (ar < 0) {
+                HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed(%s) %s failed: %d",
+                                enable ? "true" : "false", phase, ar);
+                return;
+            }
+            layout_feed_gated = !enable;
+            HAL_LOG_INFO("CameraDaemon: encoder auto-feed %s %s",
+                         enable ? "resumed" : "gated", phase);
+        };
+        auto recover_stream_add = [&]() {
+            const bool rebound =
+                resync_video_source_from_media_pipeline("stream-add failure recovery");
+            resync_encoders_from_media_pipeline();
+            restore_image_config_if_cached();
+            reapply_isp_config_after_pipeline_rebuild("stream-add failure recovery");
+            reapply_osd_config_after_pipeline_rebuild("stream-add failure recovery");
+            if (encoder_mgr_) {
+                std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+                for (const auto& [media_id, config_name] : encoder_name_map_) {
+                    (void)config_name;
+                    encoder_mgr_->force_keyframe(media_id);
+                }
+            }
+            if (layout_feed_gated) {
+                set_layout_auto_feed(true, "after stream-add failure recovery");
+            }
+            if (autofocus_controller_ && rebound) {
+                autofocus_controller_->update_video_context(video_source_->video_ctx());
+                autofocus_controller_->start();
+            }
+        };
+
+        if (autofocus_controller_) {
+            autofocus_controller_->stop();
+            autofocus_controller_->invalidate_anchor("stream layout changing");
+        }
+
         // Release op_mu_ before destroy_all / HAL calls to avoid AB-BA deadlock
         // (same pattern as remove_stream — see deadlock analysis there).
         lock.unlock();
+
+        set_layout_auto_feed(false, "before stream addition");
 
         // Destroy all local encoder entries before pipeline reconfig —
         // their HalCodecContext pointers will be invalidated.
@@ -7006,6 +7057,7 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
             if (ret < 0) {
                 HAL_LOG_ERROR("CameraDaemon: add_codec_stream for '%s' failed: %d",
                               stream_id.c_str(), ret);
+                recover_stream_add();
                 response.set_success(false);
                 response.set_message("add_codec_stream failed: " + std::to_string(ret));
                 return;
@@ -7022,16 +7074,23 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                         rmc.stream_id = stream_id.c_str();
                         media_ops->remove_codec_stream(media_ctx_, &rmc);
                     }
+                    recover_stream_add();
                     response.set_success(false);
                     response.set_message("add_video_stream failed: " + std::to_string(vret));
                     return;
                 }
             }
         } else if (ret < 0) {
+            recover_stream_add();
             response.set_success(false);
             response.set_message("No stream addition API available");
             return;
         }
+
+        // A full MediaLibrary reinit may restore the HAL's default feed state.
+        // Close that window again before any new EncoderManager subscriptions
+        // are installed and before replaying the tuned image state.
+        set_layout_auto_feed(false, "before stream-add state replay");
 
         // Derive the actual media-pipeline name from the HAL codec list.
         // The new stream is the one whose codec_name is NOT yet in encoder_name_map_.
@@ -7058,7 +7117,7 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
 
         // Enable automatic frontend->encoder forwarding for the new stream.
         // Use the media-pipeline name (sink-style) for the auto-feed call.
-        if (encoder_auto_feed_enabled_.load()) {
+        if (encoder_auto_feed_enabled_.load() && !layout_feed_gated) {
             if (!media_ops->set_encoder_auto_feed_for_stream) {
                 HAL_LOG_WARNING("CameraDaemon: auto-feed enabled but HAL lacks per-stream setter; fallback to global behavior");
             } else if (media_ops->set_encoder_auto_feed_for_stream(media_ctx_, media_name.c_str(), true) < 0) {
@@ -7098,23 +7157,46 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
         // callbacks that try to acquire op_mu_ (read) via output_fn_.
         lock.unlock();
 
-        // Update video_source_ contexts — add_streams_batch may have rebuilt
-        // the pipeline and freed old video contexts, leaving stale pointers.
-        if (media_ops->get_video_list && video_source_) {
-            void* video_list = nullptr;
-            uint32_t video_count = 0;
-            if (media_ops->get_video_list(media_ctx_, &video_list, &video_count) >= 0
-                && video_list && video_count > 0) {
-                video_source_->init_from_context(static_cast<void**>(video_list), video_count);
+        // Both video and codec contexts are owned by the rebuilt MediaLibrary.
+        // Rebind them before replaying controls that dereference video_ctx().
+        const bool video_source_rebound =
+            resync_video_source_from_media_pipeline("stream addition");
+        resync_encoders_from_media_pipeline();
 
-                bind_video_source_callbacks();
-                for (auto& slot : video_source_->streams()) {
-                    video_source_->start_stream(slot.name);
-                }
+        restore_image_config_if_cached();
+        reapply_isp_config_after_pipeline_rebuild("stream addition");
+        reapply_osd_config_after_pipeline_rebuild("stream addition");
+
+        // Arm every rebuilt encoder for a clean first frame while feeding is
+        // still gated. The first frontend buffer released below is therefore
+        // encoded as an IDR from the replayed, stable pipeline state.
+        std::vector<std::string> rebuilt_encoder_ids;
+        {
+            std::shared_lock<std::shared_mutex> map_lock(op_mu_);
+            rebuilt_encoder_ids.reserve(encoder_name_map_.size());
+            for (const auto& [media_id, config_name] : encoder_name_map_) {
+                (void)config_name;
+                rebuilt_encoder_ids.push_back(media_id);
             }
         }
+        for (const auto& media_id : rebuilt_encoder_ids) {
+            const int kf = encoder_mgr_->force_keyframe(media_id);
+            if (kf < 0) {
+                HAL_LOG_WARNING("CameraDaemon: force keyframe for %s after stream addition failed: %d",
+                                media_id.c_str(), kf);
+            }
+        }
+        set_layout_auto_feed(true, "after stream-add state replay");
 
-        resync_encoders_from_media_pipeline();
+        if (autofocus_controller_ && video_source_rebound) {
+            autofocus_controller_->update_video_context(video_source_->video_ctx());
+            autofocus_controller_->invalidate_anchor("stream layout changed");
+            autofocus_controller_->start();
+        } else if (autofocus_controller_) {
+            HAL_LOG_WARNING("CameraDaemon: autofocus remains stopped after stream addition "
+                            "because VideoSource rebind failed");
+        }
+
         lock.lock();
         HAL_LOG_INFO("CameraDaemon: Stream '%s' added via HAL incremental (no interruption) (%ux%u %s %ubps) media_name=%s",
                      stream_id.c_str(), request.width(), request.height(),
