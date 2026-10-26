@@ -60,13 +60,12 @@ export default function Monitoring() {
     ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
     : '';
 
-  const handleStreamToggleSuccess = useCallback(
-    (streamId: string) => {
-      if (streamId !== effectiveStreamId) return;
-      setPlayerKey(key => key + 1);
-    },
-    [effectiveStreamId]
-  );
+  const handleStreamToggleSuccess = useCallback((_streamId: string) => {
+    // A stream layout change recreates every encoder, even when the toggled
+    // stream is not the one currently displayed. Always give the active
+    // decoder a fresh URL/generation after the rebuild.
+    setPlayerKey(key => key + 1);
+  }, []);
 
   const noticeText = codecNotice
     ? t(
@@ -88,7 +87,6 @@ export default function Monitoring() {
         )}
         <div className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black my-2 md:max-w-none md:rounded-2xl">
           <Player
-            key={playerKey}
             videoUrl={currentStreamUrl}
             videoRendererInstance={playerRef}
             streamWidth={activeStreamInfo?.width}

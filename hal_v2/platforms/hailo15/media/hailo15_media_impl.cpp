@@ -5625,11 +5625,43 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
     config_profile_t p = prof_exp.value();
     // Save original profile for restart detection (framerate changes need buffer pool reallocation).
     const config_profile_t prev_p = p;
+    // Resolve file-backed encoder configs before mutating p. Resolving prev_p
+    // later can observe the same backing entry after mutation and make the old
+    // and new maps look identical.
+    const auto original_encoder_map = p.to_encoder_config_map();
+    bool explicit_codec_change = false;
+    bool explicit_hevc_gop_change = false;
 
     for (uint32_t i = 0; i < batch->stream_count; i++)
     {
         const HalStreamOverride &ov = batch->streams[i];
         const std::string sid(ov.stream_id);
+
+        const auto original_it = original_encoder_map.find(sid);
+        if (original_it != original_encoder_map.end())
+        {
+            const auto *original =
+                std::get_if<hailo_encoder_config_t>(&original_it->second);
+            if (original)
+            {
+                if (ov.encoder_codec[0] != '\0')
+                {
+                    const std::string requested_codec(ov.encoder_codec);
+                    const auto requested_type =
+                        (requested_codec == "h265" || requested_codec == "HEVC")
+                            ? CODEC_TYPE_HEVC
+                            : CODEC_TYPE_H264;
+                    explicit_codec_change = explicit_codec_change ||
+                        original->output_stream.codec != requested_type;
+                }
+                if (ov.encoder_gop > 0 &&
+                    original->output_stream.codec == CODEC_TYPE_HEVC &&
+                    original->rate_control.intra_pic_rate != ov.encoder_gop)
+                {
+                    explicit_hevc_gop_change = true;
+                }
+            }
+        }
 
         // --- Override frontend input stream ---
         if (ov.input_width > 0 || ov.input_height > 0 || ov.input_framerate > 0)
@@ -5707,10 +5739,14 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
     // accumulators stale, causing buffer pool exhaustion.  Do a full ML destroy+recreate instead.
     const bool full_reinit_required =
         ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p) ||
-        encoder_inplace_ineffective_change(prev_p, p);
+        encoder_inplace_ineffective_change(prev_p, p) || explicit_codec_change ||
+        explicit_hevc_gop_change;
     HAL_LOG_INFO("hailo15_media: override_stream_params: full_reinit_required=%d, "
+                 "explicit_codec_change=%d, explicit_hevc_gop_change=%d, "
                  "prev_framerate=%u, new_framerate=%u",
                  full_reinit_required,
+                 explicit_codec_change,
+                 explicit_hevc_gop_change,
                  prev_p.application_settings.application_input_streams.resolutions.empty() ? 0 :
                      prev_p.application_settings.application_input_streams.resolutions[0].framerate,
                  p.application_settings.application_input_streams.resolutions.empty() ? 0 :
