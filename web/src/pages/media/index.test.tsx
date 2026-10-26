@@ -52,8 +52,10 @@ vi.mock('@/components/player/player', () => ({
 vi.mock('./components/MediaSettings', () => ({
   default: ({
     onEncoderRestartingChange,
+    onStreamToggleSuccess,
   }: {
     onEncoderRestartingChange: (active: boolean) => void;
+    onStreamToggleSuccess: (streamId: string, enabled: boolean) => void;
   }) => (
     <>
       <button type="button" onClick={() => onEncoderRestartingChange(true)}>
@@ -61,6 +63,9 @@ vi.mock('./components/MediaSettings', () => ({
       </button>
       <button type="button" onClick={() => onEncoderRestartingChange(false)}>
         finish reconfigure
+      </button>
+      <button type="button" onClick={() => onStreamToggleSuccess('sub', true)}>
+        finish unrelated stream toggle
       </button>
     </>
   ),
@@ -88,5 +93,19 @@ describe('Monitoring encoder reconfiguration', () => {
       '/api/v1/h264/main?token=test-token'
     );
     expect(player.getAttribute('data-stream-restarting')).toBe('false');
+  });
+
+  it('refreshes the active player after another stream rebuilds the pipeline', () => {
+    render(<Monitoring />);
+
+    const player = screen.getByTestId('player');
+    const previousUrl = player.getAttribute('data-video-url');
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'finish unrelated stream toggle' })
+    );
+
+    expect(player.getAttribute('data-video-url')).not.toBe(previousUrl);
+    expect(player.getAttribute('data-video-url')).toContain('reconnect=1');
   });
 });

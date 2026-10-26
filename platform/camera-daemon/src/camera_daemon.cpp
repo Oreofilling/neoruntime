@@ -2461,6 +2461,28 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
 
         lock.unlock();
 
+        const bool can_gate_auto_feed =
+            encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed;
+        auto set_auto_feed_after_reconfigure = [&](bool enable, const char* phase) {
+            if (!can_gate_auto_feed) return;
+            int ar = media_ops->set_encoder_auto_feed(media_ctx_, enable);
+            if (ar < 0) {
+                HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed(%s) %s failed: %d",
+                                enable ? "true" : "false", phase, ar);
+                return;
+            }
+            if (enable && media_ops->set_encoder_auto_feed_for_stream) {
+                for (const auto& sid : feed_stream_ids) {
+                    int sr2 = media_ops->set_encoder_auto_feed_for_stream(
+                        media_ctx_, sid.c_str(), true);
+                    if (sr2 < 0) {
+                        HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed_for_stream(%s,true) %s failed: %d",
+                                        sid.c_str(), phase, sr2);
+                    }
+                }
+            }
+        };
+
         if (need_pipeline_restart && media_ops->stop) {
             HAL_LOG_INFO("CameraDaemon: Stopping pipeline for encoder reconfigure (dimension/fps/codec change)");
             int stop_ret = media_ops->stop(media_ctx_);
@@ -2470,6 +2492,9 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 response.set_message("Pipeline stop failed: " + std::to_string(stop_ret));
                 return false;
             }
+            // Keep the rebuilt encoders from consuming default-IQ frames. ISP
+            // controls can only be replayed after the new video contexts exist.
+            set_auto_feed_after_reconfigure(false, "before encoder reconfigure");
         }
 
         HalStreamOverrideBatch batch = {};
@@ -2489,6 +2514,8 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 int sr = media_ops->start(media_ctx_);
                 if (sr < 0) {
                     HAL_LOG_ERROR("CameraDaemon: Pipeline restart after override failure also failed: %d", sr);
+                } else {
+                    set_auto_feed_after_reconfigure(true, "after override failure recovery");
                 }
             }
             // Attempt to recover AF after failed override
@@ -2517,6 +2544,10 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                 response.set_interrupt_ms(interrupt_ms);
                 return false;
             }
+            // A full MediaLibrary reinit resets auto-feed to true and may have
+            // started the pipeline inside override_stream_params(). Close that
+            // window again before replaying the tuned ISP state.
+            set_auto_feed_after_reconfigure(false, "before ISP replay");
             // Pipeline restart = every stream's frame generation restarted.
             // Bump the overlay epoch per encoder stream so app commands
             // tagged to the old generation are rejected (and its layers
@@ -2529,25 +2560,6 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
                     }
                 }
             }
-            // Some HAL/MediaLibrary paths reset feed mode after stop/start.
-            // Restore auto-feed so encoded sockets continue producing packets.
-            if (encoder_auto_feed_enabled_.load() && media_ops->set_encoder_auto_feed) {
-                int ar = media_ops->set_encoder_auto_feed(media_ctx_, true);
-                if (ar < 0) {
-                    HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed(true) after reconfigure failed: %d", ar);
-                } else {
-                    HAL_LOG_INFO("CameraDaemon: Restored encoder auto-feed after reconfigure");
-                    if (media_ops->set_encoder_auto_feed_for_stream) {
-                        for (const auto& sid : feed_stream_ids) {
-                            int sr2 = media_ops->set_encoder_auto_feed_for_stream(media_ctx_, sid.c_str(), true);
-                            if (sr2 < 0) {
-                                HAL_LOG_WARNING("CameraDaemon: set_encoder_auto_feed_for_stream(%s,true) failed after reconfigure: %d",
-                                                sid.c_str(), sr2);
-                            }
-                        }
-                    }
-                }
-            }
             // A codec/layout change may fully recreate MediaLibrary. Both the
             // video and codec contexts are borrowed from that instance, so
             // refresh VideoSource before replaying ISP state or handing its
@@ -2555,8 +2567,22 @@ bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigReques
             const bool video_source_rebound =
                 resync_video_source_from_media_pipeline("encoder reconfigure restart");
             resync_encoders_from_media_pipeline();
-            reapply_osd_config_after_pipeline_rebuild("encoder reconfigure restart");
             reapply_isp_config_after_pipeline_rebuild("encoder reconfigure restart");
+            reapply_osd_config_after_pipeline_rebuild("encoder reconfigure restart");
+
+            // Only publish frames after the tuned ISP state is live. Force the
+            // first released frame to be an IDR so no decoder can inherit a
+            // reference chain from the pre-reconfigure generation.
+            if (encoder_mgr_) {
+                for (const auto& sid : feed_stream_ids) {
+                    int kf = encoder_mgr_->force_keyframe(sid);
+                    if (kf < 0) {
+                        HAL_LOG_WARNING("CameraDaemon: force keyframe for %s after reconfigure failed: %d",
+                                        sid.c_str(), kf);
+                    }
+                }
+            }
+            set_auto_feed_after_reconfigure(true, "after ISP replay");
 
             // Refresh AF video context — the stop/start cycle may have
             // reallocated internal video contexts.

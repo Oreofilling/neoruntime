@@ -5,8 +5,6 @@
 
 #include "../include/encoder_manager.h"
 
-#include <atomic>
-
 extern "C" {
     #include "hal_log.h"
 }
@@ -163,16 +161,15 @@ int EncoderManager::set_gop(const std::string& stream_name, uint32_t gop) {
 }
 
 int EncoderManager::force_keyframe(const std::string& stream_name) {
-    // v2 FROM_MEDIA encoders don't expose a direct force_keyframe API.
-    // The encoder generates IDR frames based on its GOP/interval settings.
-    // Log only once to avoid flooding at 30fps when platform-api keeps requesting.
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-        HAL_LOG_WARNING("EncoderManager: force_keyframe not directly available in v2 for %s "
-                        "(encoder generates IDR frames based on GOP config)",
-                        stream_name.c_str());
+    void* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = encoders_.find(stream_name);
+        if (it == encoders_.end()) return -1;
+        ctx = it->second.codec_ctx;
     }
-    return 0;
+    if (!ops_ || !ops_->force_idr) return -1;
+    return ops_->force_idr(ctx);
 }
 
 int EncoderManager::reconfigure(const std::string& stream_name,
