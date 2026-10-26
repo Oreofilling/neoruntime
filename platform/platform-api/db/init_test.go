@@ -34,6 +34,41 @@ func TestInit_PinsSingleConnection(t *testing.T) {
 	}
 }
 
+// TestInit_DurablePragmas pins the DSN's durability contract: WAL journaling
+// plus synchronous=NORMAL. NORMAL is the documented WAL pairing — no
+// per-commit fsync, consistent across abrupt power loss, and only the last
+// few seconds of commits are at risk. A DSN edit that silently reverts to
+// FULL (per-commit fsync stalls every read queued on the single connection)
+// or to OFF (corruption on power loss) must fail this test.
+func TestInit_DurablePragmas(t *testing.T) {
+	gdb, err := Init(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := gdb.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	var syncMode int
+	if err := gdb.Raw("PRAGMA synchronous").Scan(&syncMode).Error; err != nil {
+		t.Fatalf("PRAGMA synchronous: %v", err)
+	}
+	// 0=OFF, 1=NORMAL, 2=FULL
+	if syncMode != 1 {
+		t.Fatalf("synchronous = %d, want 1 (NORMAL)", syncMode)
+	}
+
+	var journalMode string
+	if err := gdb.Raw("PRAGMA journal_mode").Scan(&journalMode).Error; err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want %q", journalMode, "wal")
+	}
+}
+
 // TestInit_ConcurrentWritesNoLockFailures hammers the production DB setup
 // with concurrent writers across the setting and config tables. Every write
 // must succeed (no "database is locked"/SQLITE_BUSY errors), and the
