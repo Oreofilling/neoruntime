@@ -1,0 +1,101 @@
+#include "encoded_publisher.h"
+
+#include <cassert>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <poll.h>
+#include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
+
+namespace {
+
+bool read_exact(int fd, void* data, size_t size) {
+    auto* out = static_cast<uint8_t*>(data);
+    size_t total = 0;
+    while (total < size) {
+        const ssize_t n = ::recv(fd, out + total, size - total, 0);
+        if (n <= 0) return false;
+        total += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+void publish(EncodedPublisher& publisher, const uint8_t* data, size_t size) {
+    HalPacketBuffer packet{};
+    packet.data = const_cast<uint8_t*>(data);
+    packet.size = static_cast<uint32_t>(size);
+    packet.timestamp_ns = 1;
+    publisher.on_packet("main", &packet);
+}
+
+}  // namespace
+
+int main() {
+    char dir_template[] = "/tmp/encoded-publisher-keyframe-gate.XXXXXX";
+    char* dir = ::mkdtemp(dir_template);
+    assert(dir != nullptr);
+
+    EncodedPublisher publisher;
+    EncodedPublisher::StreamConfig config;
+    config.name = "main";
+    config.codec = "h264";
+    config.width = 1920;
+    config.height = 1080;
+    publisher.add_stream(config, dir);
+
+    int keyframe_requests = 0;
+    publisher.set_keyframe_request_cb(
+        [&](const std::string& stream_name) {
+            assert(stream_name == "main");
+            ++keyframe_requests;
+        });
+    assert(publisher.start());
+
+    const std::string socket_path = std::string(dir) + "/main.sock";
+    const int client = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(client >= 0);
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::strncpy(address.sun_path, socket_path.c_str(), sizeof(address.sun_path) - 1);
+    assert(::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+
+    // Give the accept loop time to install the new client before publishing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    const uint8_t p_frame[] = {0x00, 0x00, 0x00, 0x01, 0x41, 0x01};
+    publish(publisher, p_frame, sizeof(p_frame));
+
+    pollfd wait_for_p{client, POLLIN, 0};
+    assert(::poll(&wait_for_p, 1, 200) == 0);
+    assert(keyframe_requests > 0);
+
+    const uint8_t idr_frame[] = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+    publish(publisher, idr_frame, sizeof(idr_frame));
+
+    pollfd wait_for_idr{client, POLLIN, 0};
+    assert(::poll(&wait_for_idr, 1, 1000) == 1);
+
+    uint8_t header[EncodedPublisher::HEADER_SIZE]{};
+    assert(read_exact(client, header, sizeof(header)));
+    assert((header[5] & EncodedPublisher::FLAG_KEYFRAME) != 0);
+
+    uint32_t total_size = 0;
+    std::memcpy(&total_size, header, sizeof(total_size));
+    assert(total_size == EncodedPublisher::HEADER_SIZE + sizeof(idr_frame));
+
+    uint8_t payload[sizeof(idr_frame)]{};
+    assert(read_exact(client, payload, sizeof(payload)));
+    assert(std::memcmp(payload, idr_frame, sizeof(idr_frame)) == 0);
+
+    ::close(client);
+    publisher.stop();
+    ::unlink(socket_path.c_str());
+    ::rmdir(dir);
+    return 0;
+}

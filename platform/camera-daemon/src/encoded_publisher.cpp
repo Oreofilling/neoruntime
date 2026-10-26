@@ -330,6 +330,15 @@ void EncodedPublisher::accept_loop() {
 
                     auto client = std::make_unique<ClientInfo>();
                     client->fd = cfd;
+                    // A newly connected video decoder has no reference chain.
+                    // Even though platform-api immediately asks the encoder for
+                    // an IDR, one or more already-queued P frames can otherwise
+                    // win that race and briefly render as corruption before the
+                    // IDR arrives. Gate initial delivery exactly like recovery
+                    // after a socket-buffer drop. Audio has no inter-frame
+                    // dependency and must continue immediately.
+                    client->needs_keyframe =
+                        ss->config.codec == "h264" || ss->config.codec == "h265";
 
                     probe_clients(name, *ss);
                     std::lock_guard<std::mutex> lock(ss->clients_mu);
