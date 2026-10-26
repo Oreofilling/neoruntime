@@ -30,6 +30,22 @@ func Init(dbPath string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// SQLite allows a single writer at a time. Pinning the pool to one
+	// connection serializes all in-process DB access, which eliminates
+	// writer-writer contention — including the WAL BUSY_SNAPSHOT failure on
+	// deferred-transaction lock upgrades (read-then-write transactions),
+	// which busy_timeout does NOT cover. busy_timeout stays in the DSN only
+	// to cover cross-process lock waits. All queries here are short, so
+	// queueing behind the single connection is negligible.
+	// INVARIANT: with one pooled connection, any Transaction callback that
+	// queries the outer *gorm.DB (instead of tx) deadlocks permanently.
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to access database handle: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+
 	// Auto-migrate all models
 	if err := db.AutoMigrate(
 		&model.AIModel{},
