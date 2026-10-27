@@ -55,17 +55,13 @@ var deviceStatusCmd = &cobra.Command{
 		printer.Printf("\nLighting:\n")
 		printer.Printf("  White Light:  %d%%\n", status.WhiteLightLevel)
 		printer.Printf("  IR LED:       %d%%\n", status.IrLedLevel)
-		printer.Printf("  IR-Cut:       %s\n", formatIrCutMode(status.IrcutMode))
-		printer.Printf("\nPTZ Position:\n")
-		printer.Printf("  Pan:          %d\n", status.PtzPanPos)
-		printer.Printf("  Tilt:         %d\n", status.PtzTiltPos)
-		printer.Printf("\nLens:\n")
-		printer.Printf("  Zoom:         %d\n", status.ZoomPos)
-		printer.Printf("  Focus:        %d\n", status.FocusPos)
-		printer.Printf("  Autofocus:    %s\n", formatBool(status.AutofocusEnabled))
-		printer.Printf("\nMCU:\n")
-		printer.Printf("  Version:      %s\n", status.McuVersion)
-		printer.Printf("  Uptime:       %s\n", output.FormatDuration(int64(status.McuUptimeMs/1000)))
+	printer.Printf("  IR-Cut:       %s\n", formatIrCutMode(status.IrcutMode))
+	printer.Printf("\nLens:\n")
+	printer.Printf("  Zoom:         %d\n", status.ZoomPos)
+	printer.Printf("  Focus:        %d\n", status.FocusPos)
+	printer.Printf("  Autofocus:    %s\n", formatBool(status.AutofocusEnabled))
+	printer.Printf("\nMCU:\n")
+	printer.Printf("  Version:      %s\n", status.McuVersion)
 		return nil
 	},
 }
@@ -204,8 +200,12 @@ var (
 
 var devicePtzCmd = &cobra.Command{
 	Use:   "ptz <action>",
-	Short: "PTZ control",
+	Short: "PTZ control (unsupported on NE503)",
 	Long: `PTZ control commands.
+
+NOTE: NE503 has no PTZ hardware and the MCU host-link protocol has no PTZ
+command; the server rejects every action listed below. The subcommand
+exists for platforms that do ship a PTZ head.
 
 Actions:
   left [speed]    - Pan left (0-100)
@@ -454,8 +454,12 @@ Examples:
 
 var deviceGpioCmd = &cobra.Command{
 	Use:   "gpio <read|write> <pin> [value]",
-	Short: "GPIO control",
+	Short: "GPIO control (unsupported on NE503)",
 	Long: `Read or write GPIO pins.
+
+NOTE: the MCU host-link protocol has no GPIO command, so the server
+rejects every GPIO request on NE503 (after checking the pin against the
+configured catalog).
 
 Arguments:
   read <pin>        - Read GPIO pin value
@@ -561,12 +565,13 @@ func formatIrCutMode(mode devicepb.IrCutMode) string {
 }
 
 func protoDeviceStatusToMap(s *devicepb.DeviceStatus) map[string]interface{} {
+	// ptz_pan_pos/ptz_tilt_pos/mcu_uptime_ms stay unreported: the platform
+	// fills none of them (no PTZ hardware, no uptime field in the MCU
+	// host-link status), so printing them only showed hard zeros.
 	return map[string]interface{}{
 		"soc_temp_c":        s.SocTempC,
 		"mcu_temp_c":        s.McuTempC,
 		"light_sensor":      s.LightSensor,
-		"ptz_pan_pos":       s.PtzPanPos,
-		"ptz_tilt_pos":      s.PtzTiltPos,
 		"zoom_pos":          s.ZoomPos,
 		"focus_pos":         s.FocusPos,
 		"autofocus_enabled": s.AutofocusEnabled,
@@ -574,7 +579,6 @@ func protoDeviceStatusToMap(s *devicepb.DeviceStatus) map[string]interface{} {
 		"white_light_level": s.WhiteLightLevel,
 		"ir_led_level":      s.IrLedLevel,
 		"mcu_version":       s.McuVersion,
-		"mcu_uptime_ms":     s.McuUptimeMs,
 	}
 }
 
