@@ -28,7 +28,7 @@ func TestOSVerifyDoesNotPullRuntimeBeforeCondition(t *testing.T) {
 	if !strings.Contains(unit, "ExecCondition=/usr/libexec/aipc-os-updater needs-verify") {
 		t.Fatal("verify unit is missing the upgrade-state ExecCondition")
 	}
-	if !strings.Contains(unit, "ExecStartPre=/usr/bin/systemctl restart aipc-autostart.service") {
+	if !strings.Contains(unit, "ExecStartPre=/bin/systemctl restart aipc-autostart.service") {
 		t.Fatal("verify unit does not restore the runtime for a real verify boot")
 	}
 }
