@@ -43,22 +43,82 @@ func TestFirstbootDoesNotEnableRuntimeServices(t *testing.T) {
 	}
 }
 
+func TestPlatformAPIDoesNotLogEveryForwardedEvent(t *testing.T) {
+	raw, err := os.ReadFile("../../platform/platform-api/websocket/events.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, noisy := range []string{"Received event: topic=", "Broadcasted event to %d clients"} {
+		if strings.Contains(string(raw), noisy) {
+			t.Fatalf("per-event log remains enabled under the default debug level: %q", noisy)
+		}
+	}
+}
+
+func TestBootPrepMCURTCUsesExactEpochWindow(t *testing.T) {
+	raw, err := os.ReadFile("../../hal_v2/examples/ne503_boot_prep/ne503_boot_prep.cpp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	for _, want := range []string{"1704067200LL", "2208988800LL", "sec < min_plausible_ts || sec > max_plausible_ts"} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("MCU RTC pre-set validation is missing %q", want)
+		}
+	}
+	if strings.Index(source, "sec < min_plausible_ts") > strings.Index(source, "clock_settime(CLOCK_REALTIME") {
+		t.Fatal("MCU RTC epoch validation occurs after clock_settime")
+	}
+}
+
+func TestTimeSaveScriptIsPackagedAndValidated(t *testing.T) {
+	checks := map[string]string{
+		"../../Makefile":                             `scripts/aipc-time-save.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-time-save.sh"`,
+		"../../scripts/install.sh":                   `scripts/aipc-time-save.sh ${INSTALL_PREFIX}/scripts/aipc-time-save.sh`,
+		"../../scripts/aipc-install-current-root.sh": `$DATA_ROOT/scripts/aipc-time-save.sh`,
+		"../../scripts/aipc-restore.sh":              `/data/aipc/scripts/aipc-time-save.sh`,
+		"../../scripts/deploy.sh":                    `aipc-time-save.sh`,
+	}
+	for path, want := range checks {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("%s does not package or validate %q", path, want)
+		}
+	}
+}
+
+func TestFirstbootCreatesLoginRecordTargetsBeforeBind(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	create := strings.Index(script, `: >"$ut_dst"`)
+	mount := strings.Index(script, `mount -o bind "$ut_src" "$ut_dst"`)
+	if create < 0 || mount < 0 || create > mount {
+		t.Fatal("firstboot must create volatile login-record targets before bind mounting")
+	}
+}
+
 func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := string(raw)
-	start := strings.Index(script, "migrate_containerd_root() {")
+	start := strings.Index(script, "recover_pending_containerd_migration() {")
 	if start < 0 {
-		t.Fatal("could not find migrate_containerd_root in firstboot script")
+		t.Fatal("could not find containerd migration helpers in firstboot script")
 	}
-	endMarker := "\n}\n\nconfigure_containerd_root() {"
+	endMarker := "\nconfigure_containerd_root() {"
 	end := strings.Index(script[start:], endMarker)
 	if end < 0 {
-		t.Fatal("could not extract migrate_containerd_root from firstboot script")
+		t.Fatal("could not extract containerd migration helpers from firstboot script")
 	}
-	function := script[start : start+end+len("\n}")]
+	functions := script[start : start+end]
 
 	t.Run("persistent destination wins over fresh rootfs", func(t *testing.T) {
 		tmp := t.TempDir()
@@ -78,7 +138,7 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		runFirstbootMigration(t, function, source, destination)
+		runFirstbootMigration(t, functions, source, destination, source)
 
 		got, err := os.ReadFile(destinationMeta)
 		if err != nil {
@@ -87,10 +147,15 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 		if string(got) != "persistent-image-index" {
 			t.Fatalf("persistent meta.db was overwritten: got %q", got)
 		}
-		assertSymlinkTarget(t, source, destination)
+		if _, err := os.Stat(sourceMeta); err != nil {
+			t.Fatalf("authoritative source was removed before config cutover: %v", err)
+		}
+		if _, err := os.Stat(destination + ".migration-pending"); !os.IsNotExist(err) {
+			t.Fatalf("pre-existing destination unexpectedly marked pending: %v", err)
+		}
 	})
 
-	t.Run("empty destination is seeded", func(t *testing.T) {
+	t.Run("interrupted seed is refreshed from authoritative source", func(t *testing.T) {
 		tmp := t.TempDir()
 		source := filepath.Join(tmp, "old-containerd")
 		destination := filepath.Join(tmp, "persistent-containerd")
@@ -101,7 +166,7 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		runFirstbootMigration(t, function, source, destination)
+		runFirstbootMigration(t, functions, source, destination, source)
 
 		got, err := os.ReadFile(filepath.Join(destination, "seed"))
 		if err != nil {
@@ -110,16 +175,123 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 		if string(got) != "old-state" {
 			t.Fatalf("destination was not seeded: got %q", got)
 		}
+		if _, err := os.Stat(filepath.Join(source, "seed")); err != nil {
+			t.Fatalf("source removed before config cutover: %v", err)
+		}
+		if _, err := os.Stat(destination + ".migration-pending"); err != nil {
+			t.Fatalf("seed publication missing pending marker: %v", err)
+		}
+
+		// Simulate firstboot timing out after destination publication but before
+		// the atomic config rename. containerd continues on source and writes
+		// newer metadata; the next boot must discard and refresh the stale seed.
+		if err := os.WriteFile(filepath.Join(source, "seed"), []byte("newer-source-state"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runFirstbootMigration(t, functions, source, destination, source)
+		got, err = os.ReadFile(filepath.Join(destination, "seed"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "newer-source-state" {
+			t.Fatalf("interrupted seed was treated as authoritative: got %q", got)
+		}
+
+		// Once the config commit points at destination, recovery keeps the
+		// published tree and only clears the stale marker.
+		runFirstbootRecovery(t, functions, destination, destination)
+		if _, err := os.Stat(destination + ".migration-pending"); !os.IsNotExist(err) {
+			t.Fatalf("committed migration marker not cleared: %v", err)
+		}
+		got, err = os.ReadFile(filepath.Join(destination, "seed"))
+		if err != nil || string(got) != "newer-source-state" {
+			t.Fatalf("committed destination changed during recovery: %q, %v", got, err)
+		}
+
+		// Compatibility path replacement happens only after config commit.
+		runFirstbootLink(t, functions, source, destination)
 		assertSymlinkTarget(t, source, destination)
 	})
 }
 
-func runFirstbootMigration(t *testing.T, function, source, destination string) {
+func TestFirstbootContainerdConfigCommitPreservesExistingConfig(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "containerd_set_config_value() {")
+	end := strings.Index(script[start:], "\nrecover_pending_containerd_migration() {")
+	if start < 0 || end < 0 {
+		t.Fatal("could not extract containerd config helpers")
+	}
+	functions := script[start : start+end]
+
+	tmp := t.TempDir()
+	config := filepath.Join(tmp, "config.toml")
+	original := "version = 1\nroot = \"/var/lib/containerd\"\nstate = \"/run/old\"\n[plugins]\n  keep = true\n"
+	if err := os.WriteFile(config, []byte(original), 0640); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tmp, "persistent-containerd")
+	command := "set -euo pipefail\n" + functions + "\ncontainerd_commit_config \"$1\" \"$2\""
+	cmd := exec.Command("bash", "-c", command, "config-test", target, config)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("containerd config commit failed: %v\n%s", err, output)
+	}
+
+	gotBytes, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(gotBytes)
+	for _, want := range []string{
+		`root = "` + target + `"`,
+		`state = "/run/containerd"`,
+		`version = 2`,
+		`[plugins]`,
+		`keep = true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("committed config missing %q:\n%s", want, got)
+		}
+	}
+	info, err := os.Stat(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0640 {
+		t.Fatalf("config mode changed to %o, want 0640", info.Mode().Perm())
+	}
+}
+
+func runFirstbootMigration(t *testing.T, functions, source, destination, configuredRoot string) {
 	t.Helper()
-	command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + function + "\nmigrate_containerd_root \"$1\" \"$2\""
-	cmd := exec.Command("bash", "-c", command, "migration-test", source, destination)
+	command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + functions +
+		"\nrecover_pending_containerd_migration \"$2\" \"$3\"\nmigrate_containerd_root \"$1\" \"$2\""
+	cmd := exec.Command("bash", "-c", command, "migration-test", source, destination, configuredRoot)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("migration failed: %v\n%s", err, output)
+	}
+}
+
+func runFirstbootRecovery(t *testing.T, functions, destination, configuredRoot string) {
+	t.Helper()
+	command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + functions +
+		"\nrecover_pending_containerd_migration \"$1\" \"$2\""
+	cmd := exec.Command("bash", "-c", command, "migration-test", destination, configuredRoot)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("migration recovery failed: %v\n%s", err, output)
+	}
+}
+
+func runFirstbootLink(t *testing.T, functions, source, destination string) {
+	t.Helper()
+	command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + functions +
+		"\nensure_containerd_varlib_link \"$2\" \"$1\""
+	cmd := exec.Command("bash", "-c", command, "migration-test", source, destination)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("containerd compatibility link failed: %v\n%s", err, output)
 	}
 }
 

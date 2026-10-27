@@ -46,7 +46,8 @@ validate_restored_release() {
         /data/aipc/libexec/aipc-compat-check \
         /data/aipc/libexec/aipc-os-updater \
         /data/aipc/scripts/aipc-install-current-root.sh \
-        /data/aipc/scripts/aipc-firstboot.sh; do
+        /data/aipc/scripts/aipc-firstboot.sh \
+        /data/aipc/scripts/aipc-time-save.sh; do
         require_executable "$file"
     done
     # Runtime state under etc/ is rewritten in place by the platform and a

@@ -47,10 +47,12 @@ printf '#!/bin/sh\nexit 0\n' >"$DATA/libexec/aipc-os-updater"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-configure-platform-api-gateway.py"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-install-current-root.sh"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-firstboot.sh"
+printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-time-save.sh"
 chmod 0755 "$DATA/bin/platform-api" "$DATA/bin/camera-daemon" \
     "$DATA/libexec/aipc-restore" "$DATA/libexec/aipc-os-updater" \
     "$DATA/scripts/aipc-configure-platform-api-gateway.py" \
-    "$DATA/scripts/aipc-install-current-root.sh" "$DATA/scripts/aipc-firstboot.sh"
+    "$DATA/scripts/aipc-install-current-root.sh" "$DATA/scripts/aipc-firstboot.sh" \
+    "$DATA/scripts/aipc-time-save.sh"
 printf 'listen: 8443\n' >"$DATA/etc/platform-api.yaml"
 printf 'driver: test\n' >"$DATA/etc/camera-daemon.yaml"
 printf '[Unit]\nDescription=Test\n' >"$DATA/systemd/aipc-platform.target"

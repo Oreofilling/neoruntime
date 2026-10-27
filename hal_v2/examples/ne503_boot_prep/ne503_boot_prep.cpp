@@ -270,6 +270,17 @@ static int rtc_sync_linux_from_mcu(void *mcu)
         HAL_LOG_ERROR("timegm failed");
         return HAL_ERROR;
     }
+    // Keep this exact epoch window aligned with aipc-firstboot.sh. A year-only
+    // check accepts dates later in 2040 even though firstboot caps the value at
+    // 2040-01-01; once such a value is applied, the shell's stale-clock-only
+    // fallback cannot move it back to last-known-time.
+    constexpr time_t min_plausible_ts = (time_t)1704067200LL; // 2024-01-01 UTC
+    constexpr time_t max_plausible_ts = (time_t)2208988800LL; // 2040-01-01 UTC
+    if (sec < min_plausible_ts || sec > max_plausible_ts) {
+        HAL_LOG_ERROR("MCU RTC epoch outside plausible range (%lld); refusing clock_settime",
+                      (long long)sec);
+        return HAL_ERROR;
+    }
     struct timespec ts {};
     ts.tv_sec = sec;
     ts.tv_nsec = 0;

@@ -631,7 +631,7 @@ containerd_config_root() {
 }
 
 containerd_set_config_value() {
-    local key="$1" value="$2" config="/etc/containerd/config.toml" tmp
+    local config="$1" key="$2" value="$3" tmp
 
     if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$config" 2>/dev/null; then
         sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$config"
@@ -648,7 +648,7 @@ containerd_set_config_value() {
 }
 
 containerd_set_config_version() {
-    local config="/etc/containerd/config.toml" tmp
+    local config="$1" tmp
 
     if grep -q '^[[:space:]]*version[[:space:]]*=' "$config" 2>/dev/null; then
         sed -i -E 's|^[[:space:]]*version[[:space:]]*=.*|version = 2|' "$config"
@@ -664,9 +664,57 @@ containerd_set_config_version() {
     rm -f "$tmp"
 }
 
+containerd_commit_config() {
+    local target="$1" config="${2:-/etc/containerd/config.toml}" tmp
+
+    mkdir -p "$(dirname "$config")" 2>/dev/null || return 1
+    tmp="$(mktemp "${config}.tmp.XXXXXX")" || return 1
+    if [[ -f "$config" ]]; then
+        cp -a "$config" "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            return 1
+        }
+    else
+        : >"$tmp"
+        chmod 0644 "$tmp" 2>/dev/null || true
+    fi
+
+    if ! containerd_set_config_value "$tmp" root "$target" ||
+       ! containerd_set_config_value "$tmp" state "/run/containerd" ||
+       ! containerd_set_config_version "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # This rename is the migration commit point. Before it, containerd still
+    # uses the untouched source. After it, containerd uses the fully published
+    # persistent destination even if firstboot is killed a moment later.
+    mv -f "$tmp" "$config"
+}
+
+recover_pending_containerd_migration() {
+    local destination="$1" configured_root="$2"
+    local marker="${destination}.migration-pending"
+
+    [[ -e "$marker" ]] || return 0
+    if [[ "$configured_root" == "$destination" ]]; then
+        # The atomic config rename committed before firstboot was interrupted.
+        rm -f "$marker" 2>/dev/null || true
+        log "Recovered committed containerd migration to $destination"
+        return 0
+    fi
+
+    # The destination was published but config still points at the source.
+    # containerd may have written newer metadata there after the timeout, so
+    # the staged snapshot is no longer authoritative. Discard and reseed it.
+    warn "Discarding uncommitted containerd seed at $destination"
+    rm -rf "$destination" "$(dirname "$destination")"/.containerd-migrate.* 2>/dev/null || true
+    mkdir -p "$destination" 2>/dev/null || return 1
+}
+
 migrate_containerd_root() {
     local source="$1" destination="$2" link_target destination_has_data=0
-    local stage_parent stage_dir copy_src=""
+    local stage_parent stage_dir copy_src="" marker
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
@@ -710,31 +758,54 @@ migrate_containerd_root() {
         # left behind by an interrupted attempt is partial by definition —
         # always discard it.
         stage_parent="$(dirname "$destination")"
+        marker="${destination}.migration-pending"
         rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true
         stage_dir="${stage_parent}/.containerd-migrate.$$"
         if mkdir -p "$stage_dir" 2>/dev/null && \
            cp -a "$copy_src"/. "$stage_dir"/ 2>/dev/null && \
+           : >"$marker" && \
            rmdir "$destination" 2>/dev/null && \
            mv "$stage_dir" "$destination" 2>/dev/null; then
             log "Seeded containerd root $destination from $copy_src (staged + atomic rename)"
         else
             rm -rf "$stage_dir" 2>/dev/null || true
             mkdir -p "$destination" 2>/dev/null || true
+            rm -f "$marker" 2>/dev/null || true
             warn "containerd seed copy did not complete; keeping source $copy_src intact"
             return 0
         fi
     fi
+}
 
-    # Only now — the destination either already held authoritative state or
-    # was fully seeded — is it safe to drop the replaceable source.
-    if [[ -L "$source" ]]; then
-        rm -f "$source" 2>/dev/null || true
-    else
-        rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
+ensure_containerd_varlib_link() {
+    local target="$1" source="${2:-/var/lib/containerd}"
+    local backup="$(dirname "$source")/.containerd.aipc-migration-backup"
+    local resolved
+
+    resolved="$(readlink -f "$source" 2>/dev/null || true)"
+    if [[ -L "$source" && "$resolved" == "$target" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
+        return 0
     fi
 
-    mkdir -p "$(dirname "$source")" 2>/dev/null || true
-    ln -s "$destination" "$source" 2>/dev/null || true
+    # Config already points directly at $target, so moving the compatibility
+    # path cannot make containerd use an incomplete tree. Keep a same-filesystem
+    # backup until the symlink exists; every interruption point is recoverable.
+    if [[ -e "$source" || -L "$source" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
+        if [[ -L "$source" ]]; then
+            rm -f "$source" 2>/dev/null || return 1
+        else
+            mv "$source" "$backup" 2>/dev/null || return 1
+        fi
+    fi
+    mkdir -p "$(dirname "$source")" 2>/dev/null || return 1
+    if ! ln -s "$target" "$source" 2>/dev/null; then
+        [[ -e "$source" || -L "$source" || ! -e "$backup" ]] || \
+            mv "$backup" "$source" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$backup" 2>/dev/null || true
 }
 
 configure_containerd_root() {
@@ -753,6 +824,10 @@ configure_containerd_root() {
 
     current_root="$(containerd_config_root)"
     [[ -n "$current_root" ]] || current_root="/var/lib/containerd"
+    recover_pending_containerd_migration "$target" "$current_root" || {
+        warn "Failed to recover interrupted containerd migration"
+        return 0
+    }
     varlib_target="$(readlink -f /var/lib/containerd 2>/dev/null || true)"
 
     [[ -f "$config" && "$current_root" == "$target" ]] || needs_fix=1
@@ -776,18 +851,13 @@ configure_containerd_root() {
     migrate_containerd_root "$current_root" "$target"
     migrate_containerd_root "/var/lib/containerd" "$target"
 
-    mkdir -p /etc/containerd 2>/dev/null || true
-    if [[ ! -f "$config" ]]; then
-        cat >"$config" <<EOF
-root = "$target"
-state = "/run/containerd"
-version = 2
-EOF
-    else
-        containerd_set_config_value root "$target"
-        containerd_set_config_value state "/run/containerd"
-        containerd_set_config_version
+    if ! containerd_commit_config "$target"; then
+        warn "Failed to commit containerd config; source remains authoritative"
+        return 0
     fi
+    rm -f "${target}.migration-pending" 2>/dev/null || true
+    ensure_containerd_varlib_link "$target" || \
+        warn "Failed to link /var/lib/containerd to $target (config is already committed)"
 
     log "containerd root ready: $target"
 
@@ -964,6 +1034,13 @@ for ut_file in wtmp lastlog; do
         : >"$ut_src" 2>/dev/null || true
         chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
         chmod 664 "$ut_src" 2>/dev/null || true
+    fi
+    # A file bind mount requires the destination file to exist. /var/log is
+    # volatile on the BSP, so fresh boots may have neither wtmp nor lastlog.
+    if [[ ! -e "$ut_dst" ]]; then
+        : >"$ut_dst" 2>/dev/null || true
+        chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
+        chmod 664 "$ut_dst" 2>/dev/null || true
     fi
     if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
         echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \

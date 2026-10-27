@@ -417,7 +417,7 @@ validate_release_integrity() {
     for item in aipc-firstboot aipc-autostart aipc-restore aipc-os-updater aipc-compat-check aipc-osd-apply; do
         require_executable_file "$context" "$root/libexec/$item" || failed=1
     done
-    for item in aipc-firstboot.sh aipc-install-current-root.sh aipc-configure-platform-api-gateway.py aipc-healthmon.sh aipc-logrotate.sh aipc-os-layout-check.sh; do
+    for item in aipc-firstboot.sh aipc-install-current-root.sh aipc-configure-platform-api-gateway.py aipc-healthmon.sh aipc-logrotate.sh aipc-os-layout-check.sh aipc-time-save.sh; do
         require_executable_file "$context" "$root/scripts/$item" || failed=1
     done
 

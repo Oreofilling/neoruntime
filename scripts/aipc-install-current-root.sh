@@ -79,7 +79,8 @@ validate_release_root() {
         "$DATA_ROOT/libexec/aipc-os-updater" \
         "$DATA_ROOT/scripts/aipc-configure-platform-api-gateway.py" \
         "$DATA_ROOT/scripts/aipc-install-current-root.sh" \
-        "$DATA_ROOT/scripts/aipc-firstboot.sh"; do
+        "$DATA_ROOT/scripts/aipc-firstboot.sh" \
+        "$DATA_ROOT/scripts/aipc-time-save.sh"; do
         require_executable "$file"
     done
     # etc/ also holds runtime state that the platform rewrites in place

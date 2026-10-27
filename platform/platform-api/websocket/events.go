@@ -187,13 +187,6 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 			return // Return to reconnect
 		}
 
-		// Debug, not Info: event-bus forwards thousands of these per minute
-		// when inference apps publish per-frame results. At Info they flood
-		// the journal (~12-20MB per 15min observed), force rotation/vacuum
-		// storms and crowd out the logs that matter during incident
-		// forensics (2026-10-21).
-		logger.Debug("Received event: topic=%s, id=%s, timestamp_ns=%d", event.Topic, event.EventId, event.TimestampNs)
-
 		eventJSON := map[string]interface{}{
 			"topic":        event.Topic,
 			"payload":      string(event.Payload),
@@ -210,11 +203,6 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 		}
 
 		es.broadcast(jsonData)
-		// Debug, same reasoning as the "Received event" line above: one log
-		// line per forwarded event kept the flood alive after that one was
-		// demoted. Connection-level events (connect/disconnect) stay Info —
-		// they are low-frequency and diagnostically useful.
-		logger.Debug("Broadcasted event to %d clients", len(es.clients))
 	}
 }
 
