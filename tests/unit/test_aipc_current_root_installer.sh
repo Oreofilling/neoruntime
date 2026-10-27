@@ -76,6 +76,42 @@ cmp "$DATA/etc/sysctl.d/panic.conf" "$ROOTFS/etc/sysctl.d/panic.conf"
 cmp "$DATA/etc/security/seccomp-default.json" "$ROOTFS/etc/aipc/seccomp-default.json"
 grep -qx "$DATA/lib/hal" "$ROOTFS/etc/ld.so.conf.d/aipc.conf"
 
+# Runtime state under etc/ is rewritten in place at runtime (periodic
+# last-known-time snapshot, time user config, OSD logo, TLS certs, plus
+# tmp+rename siblings). A crash mid-write can leave any of them zero bytes;
+# the every-boot current-root rebuild must tolerate that instead of
+# bricking the device.
+mkdir -p "$DATA/etc/ssl"
+: >"$DATA/etc/last-known-time.json"
+: >"$DATA/etc/last-known-time.json.tmp"
+: >"$DATA/etc/time-config.json"
+: >"$DATA/etc/osd-logo.conf"
+: >"$DATA/etc/ssl/server.key"
+AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" "$INSTALLER" \
+    >"$TMP/runtime-state.out" 2>&1 || {
+    echo "installer aborted on zero-byte runtime-state files:" >&2
+    cat "$TMP/runtime-state.out" >&2
+    exit 1
+}
+rm -rf "$DATA/etc/ssl"
+rm -f "$DATA/etc/last-known-time.json" "$DATA/etc/last-known-time.json.tmp" \
+    "$DATA/etc/time-config.json" "$DATA/etc/osd-logo.conf"
+
+# A genuinely truncated release file under etc/ must stay fatal.
+: >"$DATA/etc/swagger.yaml"
+if AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" \
+    "$INSTALLER" >"$TMP/empty-release.out" 2>&1; then
+    echo "installer accepted an empty release file" >&2
+    exit 1
+fi
+grep -q "empty immutable release file: $DATA/etc/swagger.yaml" \
+    "$TMP/empty-release.out" || {
+    echo "empty release file rejection mismatch:" >&2
+    cat "$TMP/empty-release.out" >&2
+    exit 1
+}
+rm -f "$DATA/etc/swagger.yaml"
+
 # The OS bootstrap invokes the current-root installer on every boot. Existing
 # disabled units must stay disabled, and the stable platform target must not be
 # started because it Wants the entire runtime regardless of enable state.

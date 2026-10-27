@@ -49,7 +49,17 @@ validate_restored_release() {
         /data/aipc/scripts/aipc-firstboot.sh; do
         require_executable "$file"
     done
+    # Runtime state under etc/ is rewritten in place by the platform and a
+    # crash mid-write can leave it zero bytes; consumers tolerate empty or
+    # missing content, so it must not fail restore validation. Keep this
+    # list in sync with aipc-install-current-root.sh and deploy.sh.
     while IFS= read -r empty; do
+        case "$empty" in
+            /data/aipc/etc/last-known-time.json*|\
+            /data/aipc/etc/time-config.json*|\
+            /data/aipc/etc/osd-logo.conf|/data/aipc/etc/ssl/*)
+                continue ;;
+        esac
         fail "empty immutable restored file: $empty"
     done < <(find /data/aipc/bin /data/aipc/docs /data/aipc/etc \
         /data/aipc/firmware /data/aipc/libexec /data/aipc/recovery \
