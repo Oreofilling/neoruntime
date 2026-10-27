@@ -719,7 +719,7 @@ migrate_containerd_root() {
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
         warn "Failed to create containerd root $destination"
-        return 0
+        return 1
     }
 
     # The destination lives on persistent /data and is authoritative once it
@@ -744,7 +744,7 @@ migrate_containerd_root() {
         copy_src="$source"
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
-        return 0
+        return 1
     fi
 
     if [[ $destination_has_data -eq 1 ]]; then
@@ -772,7 +772,7 @@ migrate_containerd_root() {
             mkdir -p "$destination" 2>/dev/null || true
             rm -f "$marker" 2>/dev/null || true
             warn "containerd seed copy did not complete; keeping source $copy_src intact"
-            return 0
+            return 1
         fi
     fi
 }
@@ -848,11 +848,24 @@ configure_containerd_root() {
         systemctl stop app-manager ai-runtime containerd 2>/dev/null || true
     fi
 
-    migrate_containerd_root "$current_root" "$target"
-    migrate_containerd_root "/var/lib/containerd" "$target"
+    if ! migrate_containerd_root "$current_root" "$target" ||
+       ! migrate_containerd_root "/var/lib/containerd" "$target"; then
+        warn "Failed to seed containerd root; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
+    fi
 
     if ! containerd_commit_config "$target"; then
         warn "Failed to commit containerd config; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
         return 0
     fi
     rm -f "${target}.migration-pending" 2>/dev/null || true

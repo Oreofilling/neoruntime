@@ -286,33 +286,68 @@ func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
 	return nil
 }
 
-// SaveImageTar copies the image tar file to the persistent images directory
-// for self-healing recovery after power loss.
-func SaveImageTar(appID, srcPath string) error {
-	if err := os.MkdirAll(SavedImagesDir, 0755); err != nil {
-		return fmt.Errorf("failed to create images dir: %w", err)
-	}
-
-	dstPath := SavedImageTarPath(appID)
+func saveImageTarAt(srcPath, dstPath string) error {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to open source: %w", err)
 	}
 	defer src.Close()
 
-	dst, err := os.Create(dstPath)
-	if err != nil {
-		return fmt.Errorf("failed to create dest: %w", err)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("failed to create images dir: %w", err)
 	}
-	defer dst.Close()
+	dst, err := os.CreateTemp(filepath.Dir(dstPath), ".image-recovery-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary archive: %w", err)
+	}
+	tmpPath := dst.Name()
+	defer os.Remove(tmpPath)
 
 	if _, err := io.Copy(dst, src); err != nil {
-		os.Remove(dstPath)
+		dst.Close()
 		return fmt.Errorf("failed to copy: %w", err)
+	}
+	if err := dst.Sync(); err != nil {
+		dst.Close()
+		return fmt.Errorf("failed to sync temporary archive: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary archive: %w", err)
+	}
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		return fmt.Errorf("failed to set archive mode: %w", err)
+	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return fmt.Errorf("failed to publish archive: %w", err)
+	}
+
+	return nil
+}
+
+// SaveImageTar atomically replaces the persistent recovery archive. A failed
+// update therefore cannot truncate the archive owned by the installed app.
+func SaveImageTar(appID, srcPath string) error {
+	dstPath := SavedImageTarPath(appID)
+	if err := saveImageTarAt(srcPath, dstPath); err != nil {
+		return err
 	}
 
 	logger.Info("Saved image tar for recovery: %s -> %s", srcPath, dstPath)
 	return nil
+}
+
+// RemoveSavedImageTar invalidates local recovery when an install commits an
+// image obtained from another source. Keeping the old archive would allow a
+// later metadata repair to run an old image under the new reference.
+func removeSavedImageTarAt(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove stale recovery archive %s: %w", path, err)
+	}
+	return nil
+}
+
+func RemoveSavedImageTar(appID string) error {
+	return removeSavedImageTarAt(SavedImageTarPath(appID))
 }
 
 // RepairResult describes the outcome of snapshot repair for one image.

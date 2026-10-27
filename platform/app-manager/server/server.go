@@ -514,6 +514,8 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	var oldWebURL string
 	var oldRestartCount int
 	var oldInstalledAt time.Time
+	var savedImageSource string
+	var discardSavedImageArchive bool
 
 	if s.registry.Exists(appID) {
 		if !req.Force {
@@ -576,6 +578,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 				}, nil
 			}
 			logger.Info("Image pulled successfully: %s", req.ImagePath)
+			discardSavedImageArchive = true
 
 			// IMPORTANT: After pulling, override the manifest's image to match
 			// the normalized reference that containerd stores. This ensures
@@ -599,13 +602,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 			}
 			logger.Info("Image imported successfully: %s", importedName)
 
-			// Save tar file for self-healing recovery after power loss
-			if saveErr := containerd.SaveImageTar(appManifest.Metadata.ID, req.ImagePath); saveErr != nil {
-				logger.Warn("Failed to save image tar for recovery: %v", saveErr)
-			}
-
-			// Clean up uploaded tar file after successful import
-			s.cleanupUploadedTar(req.ImagePath)
+			// Publish the recovery archive only when the install transaction
+			// commits; replacing it here would bind a failed update's tar to
+			// the still-installed old app.
+			savedImageSource = req.ImagePath
 		}
 	}
 
@@ -777,6 +777,20 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}, nil
 	}
 
+	// Bind persistent recovery state to the image that is about to commit.
+	// Local archives replace the previous one atomically; installs from a
+	// registry invalidate any archive left by an older local installation.
+	if savedImageSource != "" {
+		if archiveErr := containerd.SaveImageTar(appInfo.ID, savedImageSource); archiveErr != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr), Code: 500}}, nil
+		}
+		s.cleanupUploadedTar(savedImageSource)
+	} else if discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to invalidate stale image recovery archive: %v", archiveErr), Code: 500}}, nil
+		}
+	}
+
 	// Register plugin capabilities
 	if appInfo.IsPlugin && s.pluginRegistry != nil {
 		s.pluginRegistry.Register(appInfo.ID, appInfo.Capabilities)
@@ -938,6 +952,8 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	asyncAppID := appManifest.Metadata.ID
 	var isUpdate, wasRunning bool
 	var oldAppInfo *registry.AppInfo
+	var savedImageSource string
+	var discardSavedImageArchive bool
 	if s.registry.Exists(asyncAppID) {
 		if !force {
 			task.Fail(fmt.Sprintf("App %s already exists. Use force=true to overwrite.", asyncAppID))
@@ -991,6 +1007,7 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 			}
 			normalizedRef := manifest.NormalizeImageName(imagePath)
 			appManifest.Spec.Image = normalizedRef
+			discardSavedImageArchive = true
 			task.Update("pulling", 80, "Image pull complete")
 		} else {
 			// Local file — import (fast)
@@ -1071,13 +1088,8 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 				}
 			}
 
-			// Save tar file for self-healing recovery after power loss
-			if saveErr := containerd.SaveImageTar(appManifest.Metadata.ID, imagePath); saveErr != nil {
-				logger.Warn("Failed to save image tar for recovery: %v", saveErr)
-			}
-
-			// Clean up uploaded tar file after successful import
-			s.cleanupUploadedTar(imagePath)
+			// Publish the recovery archive only at the transaction commit point.
+			savedImageSource = imagePath
 		}
 	} else if s.client != nil && len(imageRefs) > 0 {
 		// No local tar was uploaded. Before proceeding, verify every image
@@ -1237,6 +1249,20 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	task.Update("registering", 95, "Registering permissions...")
 	if err := s.registerAppPermissions(ctx, appInfo.ID, appManifest); err != nil {
 		logger.Warn("Failed to register app permissions: %v", err)
+	}
+
+	// Bind persistent recovery state to the image that is about to commit.
+	if savedImageSource != "" {
+		if archiveErr := containerd.SaveImageTar(appInfo.ID, savedImageSource); archiveErr != nil {
+			task.Fail(fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr))
+			return
+		}
+		s.cleanupUploadedTar(savedImageSource)
+	} else if discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			task.Fail(fmt.Sprintf("Failed to invalidate stale image recovery archive: %v", archiveErr))
+			return
+		}
 	}
 
 	// The install is committed from here: discard the old bundled tree backup.

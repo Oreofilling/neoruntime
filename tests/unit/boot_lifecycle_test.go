@@ -90,6 +90,91 @@ func TestTimeSaveScriptIsPackagedAndValidated(t *testing.T) {
 	}
 }
 
+func TestTimeSaveUsesExactWindowAndUniqueTemporaryFile(t *testing.T) {
+	script := "../../scripts/aipc-time-save.sh"
+	raw, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"MIN_PLAUSIBLE_TS=1704067200",
+		"MAX_PLAUSIBLE_TS=2208988800",
+		`mktemp "${DEST}.tmp.XXXXXX"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("time saver is missing %q", want)
+		}
+	}
+
+	fakeBin := t.TempDir()
+	dateStub := `#!/bin/sh
+if [ "$1" = "+%s" ]; then
+    printf '%s\n' "$FAKE_TS"
+else
+    printf '%s\n' '2024-01-01T00:00:00Z'
+fi
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "date"), []byte(dateStub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "timedatectl"), []byte("#!/bin/sh\nprintf 'UTC\\n'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	destination := filepath.Join(t.TempDir(), "last-known-time.json")
+	fixedTmp := destination + ".tmp"
+	if err := os.WriteFile(destination, []byte("known-good"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixedTmp, []byte("platform-api-writer"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(ts string) {
+		t.Helper()
+		cmd := exec.Command("bash", script)
+		cmd.Env = append(os.Environ(),
+			"PATH="+fakeBin+":"+os.Getenv("PATH"),
+			"FAKE_TS="+ts,
+			"AIPC_TIME_SAVE_DEST="+destination,
+		)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("time saver failed: %v\n%s", err, output)
+		}
+	}
+
+	run("2208988801")
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "known-good" {
+		t.Fatalf("out-of-range clock overwrote snapshot: %q", got)
+	}
+
+	run("1704067200")
+	got, err = os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"unix_timestamp": 1704067200`) {
+		t.Fatalf("valid clock was not persisted: %q", got)
+	}
+	fixed, err := os.ReadFile(fixedTmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fixed) != "platform-api-writer" {
+		t.Fatalf("time saver collided with platform-api temporary file: %q", fixed)
+	}
+	leftovers, err := filepath.Glob(destination + ".tmp.*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("unique temporary files remain: %v", leftovers)
+	}
+}
+
 func TestFirstbootCreatesLoginRecordTargetsBeforeBind(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
 	if err != nil {
@@ -211,6 +296,36 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 		// Compatibility path replacement happens only after config commit.
 		runFirstbootLink(t, functions, source, destination)
 		assertSymlinkTarget(t, source, destination)
+	})
+
+	t.Run("copy failure keeps source authoritative", func(t *testing.T) {
+		tmp := t.TempDir()
+		source := filepath.Join(tmp, "rootfs-containerd")
+		destination := filepath.Join(tmp, "persistent-containerd")
+		if err := os.MkdirAll(source, 0755); err != nil {
+			t.Fatal(err)
+		}
+		sourceData := filepath.Join(source, "meta.db")
+		if err := os.WriteFile(sourceData, []byte("only-complete-copy"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\ncp() { return 1; }\n" + functions +
+			"\nmigrate_containerd_root \"$1\" \"$2\""
+		cmd := exec.Command("bash", "-c", command, "migration-copy-failure", source, destination)
+		if output, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("migration succeeded despite copy failure:\n%s", output)
+		}
+		got, err := os.ReadFile(sourceData)
+		if err != nil || string(got) != "only-complete-copy" {
+			t.Fatalf("copy failure damaged source: %q, %v", got, err)
+		}
+		if entries, err := os.ReadDir(destination); err != nil || len(entries) != 0 {
+			t.Fatalf("copy failure published destination: entries=%v err=%v", entries, err)
+		}
+		if _, err := os.Stat(destination + ".migration-pending"); !os.IsNotExist(err) {
+			t.Fatalf("copy failure left migration marker: %v", err)
+		}
 	})
 }
 
