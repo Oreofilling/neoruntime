@@ -5326,6 +5326,40 @@ paths:
                           type: integer
                           format: int64
 
+  /system/time/mcu-rtc:
+    get:
+      tags: [System]
+      summary: Read the MCU RTC back over the host link
+      description: |
+        Diagnostic readback of the MCU real-time clock. The boot flow only
+        pushes time host-to-MCU, so this verifies the sync landed and flags
+        an implausible MCU clock (e.g. a dead RTC reporting year 2000).
+      operationId: getMcuRtcTime
+      responses:
+        '200':
+          description: MCU RTC time, host time and absolute drift
+          content:
+            application/json:
+              schema:
+                allOf:
+                - $ref: '#/components/schemas/APIResponse'
+                - type: object
+                  properties:
+                    data:
+                      type: object
+                      properties:
+                        mcu_time:
+                          type: string
+                          format: date-time
+                        host_time:
+                          type: string
+                          format: date-time
+                        drift_seconds:
+                          type: integer
+                          format: int64
+                        plausible:
+                          type: boolean
+
   /system/time/set:
     post:
       tags: [System]

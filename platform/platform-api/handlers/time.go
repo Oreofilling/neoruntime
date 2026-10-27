@@ -163,6 +163,7 @@ const (
 	ntpSyncVerificationWait = 15 * time.Second
 	timesyncdProviderPath   = "/etc/systemd/ntp-units.d/10-aipc-timesyncd.list"
 
+	hostLinkCmdRTCGet       = 0x0011
 	hostLinkCmdRTCSet       = 0x0012
 	mcuRTCSyncTimeout       = 5 * time.Second
 	minPlausibleMCURTCYear  = 2024
@@ -829,6 +830,72 @@ func goWeekdayToMCU(w time.Weekday) byte {
 		return byte(w)
 	}
 	return 1
+}
+
+// McuRtcTime reports the MCU RTC readback next to the host clock it was
+// compared against. DriftSeconds is absolute.
+type McuRtcTime struct {
+	McuTime      string `json:"mcu_time"` // RFC3339, UTC
+	HostTime     string `json:"host_time"`
+	DriftSeconds int64  `json:"drift_seconds"`
+	Plausible    bool   `json:"plausible"`
+}
+
+// GetMcuRtcTime reads the MCU RTC back over the raw host-link path. The boot
+// flow only ever pushes time host→MCU (boot_prep and the post-set syncs), so
+// this readback is the only way to verify the sync landed and to spot a dead
+// MCU RTC, which reports as year 2000.
+func (h *TimeHandler) GetMcuRtcTime(c *gin.Context) {
+	if h.mcuRaw == nil {
+		Resp(c).FailMsg(CodeServiceError, "camera-control client is not available")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), mcuRTCSyncTimeout)
+	defer cancel()
+
+	resp, err := h.mcuRaw.McuRawRequest(ctx, &camerapb.McuRawRequestMessage{
+		Cmd: hostLinkCmdRTCGet,
+	})
+	if err != nil {
+		Resp(c).FailMsg(CodeServiceError, fmt.Sprintf("MCU RTC read failed: %v", err))
+		return
+	}
+	if resp == nil {
+		Resp(c).FailMsg(CodeServiceError, "MCU RTC read failed: empty camera-control response")
+		return
+	}
+	if !resp.GetSuccess() {
+		Resp(c).FailMsg(CodeServiceError,
+			fmt.Sprintf("MCU RTC read failed: %s (hal=%d)", resp.GetMessage(), resp.GetHalCode()))
+		return
+	}
+
+	payload := resp.GetPayload()
+	if len(payload) < mcuRTCPayloadFieldCount {
+		Resp(c).FailMsg(CodeServiceError,
+			fmt.Sprintf("MCU RTC read failed: payload too short (%d bytes)", len(payload)))
+		return
+	}
+
+	// host_link_rtc_tm_t: BIN year 0-99 (2000-based), month 1-12, day 1-31,
+	// weekday 1-7, 24h time — the mirror of the SET payload built in
+	// mcuRTCPayloadFromTime. The RTC itself runs in UTC.
+	mcuTime := time.Date(
+		2000+int(payload[0]), time.Month(payload[1]), int(payload[2]),
+		int(payload[4]), int(payload[5]), int(payload[6]), 0, time.UTC)
+	hostNow := time.Now().UTC()
+	drift := hostNow.Unix() - mcuTime.Unix()
+	if drift < 0 {
+		drift = -drift
+	}
+
+	Resp(c).OK(McuRtcTime{
+		McuTime:      mcuTime.Format(time.RFC3339),
+		HostTime:     hostNow.Format(time.RFC3339),
+		DriftSeconds: drift,
+		Plausible:    mcuTime.Year() >= minPlausibleMCURTCYear,
+	})
 }
 
 // Helper functions
