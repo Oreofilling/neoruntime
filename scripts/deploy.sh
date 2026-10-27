@@ -354,14 +354,14 @@ validate_no_empty_immutable_files() {
 
     while IFS= read -r empty; do
         # Runtime state under etc/ (last-known-time snapshot, time user
-        # config, OSD logo, TLS certs, plus tmp+rename siblings) is
-        # rewritten in place by the platform and can be left zero bytes by
-        # a crash; consumers tolerate that, so it is not release
+        # config, OSD logo, plus tmp+rename siblings) is rewritten in place
+        # by the platform and can be left zero bytes by a crash; consumers
+        # tolerate that, so it is not release
         # corruption. Keep in sync with aipc-install-current-root.sh and
         # aipc-restore.sh.
         case "$empty" in
             */etc/last-known-time.json*|*/etc/time-config.json*|\
-            */etc/osd-logo.conf|*/etc/ssl/*)
+            */etc/osd-logo.conf)
                 continue ;;
         esac
         local msg="$context validation failed: empty immutable file $empty"

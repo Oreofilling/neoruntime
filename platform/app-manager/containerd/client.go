@@ -286,42 +286,89 @@ func (c *Client) EnsureImageUnpacked(ctx context.Context, ref string) error {
 	return nil
 }
 
-func saveImageTarAt(srcPath, dstPath string) error {
+func stageImageTarAt(srcPath, destinationDir string) (string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
-		return fmt.Errorf("failed to open source: %w", err)
+		return "", fmt.Errorf("failed to open source: %w", err)
 	}
 	defer src.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return fmt.Errorf("failed to create images dir: %w", err)
+	if err := os.MkdirAll(destinationDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create images dir: %w", err)
 	}
-	dst, err := os.CreateTemp(filepath.Dir(dstPath), ".image-recovery-*.tmp")
+	dst, err := os.CreateTemp(destinationDir, ".image-recovery-*.tmp")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary archive: %w", err)
+		return "", fmt.Errorf("failed to create temporary archive: %w", err)
 	}
 	tmpPath := dst.Name()
-	defer os.Remove(tmpPath)
+	keep := false
+	defer func() {
+		if !keep {
+			os.Remove(tmpPath)
+		}
+	}()
 
 	if _, err := io.Copy(dst, src); err != nil {
 		dst.Close()
-		return fmt.Errorf("failed to copy: %w", err)
+		return "", fmt.Errorf("failed to copy: %w", err)
 	}
 	if err := dst.Sync(); err != nil {
 		dst.Close()
-		return fmt.Errorf("failed to sync temporary archive: %w", err)
+		return "", fmt.Errorf("failed to sync temporary archive: %w", err)
 	}
 	if err := dst.Close(); err != nil {
-		return fmt.Errorf("failed to close temporary archive: %w", err)
+		return "", fmt.Errorf("failed to close temporary archive: %w", err)
 	}
 	if err := os.Chmod(tmpPath, 0644); err != nil {
-		return fmt.Errorf("failed to set archive mode: %w", err)
+		return "", fmt.Errorf("failed to set archive mode: %w", err)
 	}
-	if err := os.Rename(tmpPath, dstPath); err != nil {
+	keep = true
+	return tmpPath, nil
+}
+
+func publishStagedImageTarAt(stagedPath, dstPath string) error {
+	if filepath.Dir(stagedPath) != filepath.Dir(dstPath) {
+		return fmt.Errorf("staged archive must share destination directory")
+	}
+	if err := os.Rename(stagedPath, dstPath); err != nil {
 		return fmt.Errorf("failed to publish archive: %w", err)
 	}
-
 	return nil
+}
+
+func saveImageTarAt(srcPath, dstPath string) error {
+	stagedPath, err := stageImageTarAt(srcPath, filepath.Dir(dstPath))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(stagedPath)
+	return publishStagedImageTarAt(stagedPath, dstPath)
+}
+
+// StageImageTar performs the only large/fallible copy before an update stops
+// the installed app or imports a replacement under its image reference.
+func StageImageTar(appID, srcPath string) (string, error) {
+	stagedPath, err := stageImageTarAt(srcPath, SavedImagesDir)
+	if err != nil {
+		return "", fmt.Errorf("stage recovery archive for %s: %w", appID, err)
+	}
+	return stagedPath, nil
+}
+
+// PublishStagedImageTar commits a fully synced same-directory archive with a
+// single rename; no large copy remains after the running app is stopped.
+func PublishStagedImageTar(appID, stagedPath string) error {
+	if err := publishStagedImageTarAt(stagedPath, SavedImageTarPath(appID)); err != nil {
+		return fmt.Errorf("publish recovery archive for %s: %w", appID, err)
+	}
+	logger.Info("Published staged image recovery archive: %s", SavedImageTarPath(appID))
+	return nil
+}
+
+func DiscardStagedImageTar(stagedPath string) {
+	if stagedPath != "" {
+		_ = os.Remove(stagedPath)
+	}
 }
 
 // SaveImageTar atomically replaces the persistent recovery archive. A failed

@@ -705,8 +705,8 @@ recover_pending_containerd_migration() {
     fi
 
     # The destination was published but config still points at the source.
-    # containerd may have written newer metadata there after the timeout, so
-    # the staged snapshot is no longer authoritative. Discard and reseed it.
+    # containerd may have written newer metadata there after an interruption,
+    # so the staged snapshot is no longer authoritative. Discard and reseed it.
     warn "Discarding uncommitted containerd seed at $destination"
     rm -rf "$destination" "$(dirname "$destination")"/.containerd-migrate.* 2>/dev/null || true
     mkdir -p "$destination" 2>/dev/null || return 1
@@ -750,13 +750,12 @@ migrate_containerd_root() {
     if [[ $destination_has_data -eq 1 ]]; then
         log "Preserving existing containerd state in $destination; ignoring $source"
     elif [[ -n "$copy_src" ]]; then
-        # Crash-safe seeding. firstboot runs under TimeoutStartSec, so a
-        # large image store can legitimately be killed mid-copy; a partial
-        # destination would then be treated as authoritative state on the
-        # next boot while the complete source gets deleted. Copy into a
-        # staging sibling and publish with a single rename instead. Staging
-        # left behind by an interrupted attempt is partial by definition —
-        # always discard it.
+        # Crash-safe seeding. Even without a fixed systemd startup deadline,
+        # power loss can interrupt a large copy. A partial destination would
+        # then be treated as authoritative state on the next boot while the
+        # complete source gets deleted. Copy into a staging sibling and
+        # publish with a single rename instead. Staging left behind by an
+        # interrupted attempt is partial by definition — always discard it.
         stage_parent="$(dirname "$destination")"
         marker="${destination}.migration-pending"
         rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true

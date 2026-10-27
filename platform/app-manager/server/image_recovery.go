@@ -22,6 +22,34 @@ func imageReferencesForApp(appInfo *registry.AppInfo, appManifest *manifest.AppM
 	return appManifest.ImageReferences()
 }
 
+func installedImageReferences(appInfo *registry.AppInfo) ([]string, error) {
+	if appInfo == nil || appInfo.ManifestPath == "" {
+		return nil, fmt.Errorf("installed app manifest is unavailable")
+	}
+	appManifest, err := manifest.LoadManifest(appInfo.ManifestPath)
+	if err != nil {
+		return nil, err
+	}
+	return imageReferencesForApp(appInfo, appManifest), nil
+}
+
+func sameImageReferences(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldDiscardSavedImageArchive(isUpdate, hasNewArchive, oldRefsKnown bool, oldRefs, newRefs []string) bool {
+	return isUpdate && !hasNewArchive &&
+		(!oldRefsKnown || !sameImageReferences(oldRefs, newRefs))
+}
+
 // recoverySourceCandidates returns only archive images that can legitimately
 // satisfy requiredRef. The primary image retains the install-time behavior of
 // binding the archive's first image to the manifest's primary reference; all

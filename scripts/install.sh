@@ -203,9 +203,9 @@ for unit in systemd/*.service systemd/*.timer systemd/*.target; do
 done
 systemctl daemon-reload
 if os_manages_aipc_boot; then
-    systemctl reenable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service 2>/dev/null || true
+    systemctl reenable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service aipc-time-save.service 2>/dev/null || true
 else
-    systemctl enable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service 2>/dev/null || true
+    systemctl enable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service aipc-time-save.service 2>/dev/null || true
 fi
 echo "✓ Systemd services installed"
 

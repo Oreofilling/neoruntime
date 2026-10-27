@@ -250,7 +250,7 @@ static int rtc_sync_linux_from_mcu(void *mcu)
     const int full_year = 2000 + (int)ht.year;
     if (full_year < 2024 || full_year > 2040 ||
         ht.month < 1 || ht.month > 12 || ht.day < 1 || ht.day > 31 ||
-        ht.hour > 23 || ht.minute > 59 || ht.second > 60) {
+        ht.hour > 23 || ht.minute > 59 || ht.second > 59) {
         HAL_LOG_ERROR("MCU RTC time outside plausible range "
                       "(%04d-%02u-%02u %02u:%02u:%02u); refusing clock_settime",
                       full_year, ht.month, ht.day, ht.hour, ht.minute, ht.second);
@@ -265,9 +265,19 @@ static int rtc_sync_linux_from_mcu(void *mcu)
     tm.tm_min = (int)ht.minute;
     tm.tm_sec = (int)ht.second;
     tm.tm_isdst = 0;
+    const struct tm requested_tm = tm;
     time_t sec = timegm(&tm);
     if (sec == (time_t)-1) {
         HAL_LOG_ERROR("timegm failed");
+        return HAL_ERROR;
+    }
+    // timegm normalizes impossible calendar values (for example, Feb 31)
+    // instead of rejecting them. Require an exact round trip so corrupt MCU
+    // fields cannot silently become a different, but plausible, date.
+    if (tm.tm_year != requested_tm.tm_year || tm.tm_mon != requested_tm.tm_mon ||
+        tm.tm_mday != requested_tm.tm_mday || tm.tm_hour != requested_tm.tm_hour ||
+        tm.tm_min != requested_tm.tm_min || tm.tm_sec != requested_tm.tm_sec) {
+        HAL_LOG_ERROR("MCU RTC calendar date is invalid; refusing clock_settime");
         return HAL_ERROR;
     }
     // Keep this exact epoch window aligned with aipc-firstboot.sh. A year-only

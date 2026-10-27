@@ -63,3 +63,47 @@ func TestRecoverySourceCandidates(t *testing.T) {
 		})
 	}
 }
+
+func TestSameImageReferences(t *testing.T) {
+	if !sameImageReferences(
+		[]string{"docker.io/acme/main:2", "docker.io/acme/worker:2"},
+		[]string{"docker.io/acme/main:2", "docker.io/acme/worker:2"},
+	) {
+		t.Fatal("identical image references were treated as changed")
+	}
+	for _, changed := range [][]string{
+		{"docker.io/acme/main:3", "docker.io/acme/worker:2"},
+		{"docker.io/acme/worker:2", "docker.io/acme/main:2"},
+		{"docker.io/acme/main:2"},
+	} {
+		if sameImageReferences([]string{"docker.io/acme/main:2", "docker.io/acme/worker:2"}, changed) {
+			t.Fatalf("changed image references were treated as identical: %v", changed)
+		}
+	}
+}
+
+func TestShouldDiscardSavedImageArchive(t *testing.T) {
+	oldRefs := []string{"docker.io/acme/main:2"}
+	tests := []struct {
+		name          string
+		isUpdate      bool
+		hasNewArchive bool
+		oldRefsKnown  bool
+		newRefs       []string
+		want          bool
+	}{
+		{name: "no-upload changed image", isUpdate: true, oldRefsKnown: true, newRefs: []string{"docker.io/acme/main:3"}, want: true},
+		{name: "no-upload unchanged image", isUpdate: true, oldRefsKnown: true, newRefs: oldRefs, want: false},
+		{name: "unverifiable old binding", isUpdate: true, oldRefsKnown: false, newRefs: oldRefs, want: true},
+		{name: "new local archive replaces old binding", isUpdate: true, hasNewArchive: true, oldRefsKnown: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
+		{name: "fresh install has no stale binding", isUpdate: false, oldRefsKnown: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldDiscardSavedImageArchive(tt.isUpdate, tt.hasNewArchive, tt.oldRefsKnown, oldRefs, tt.newRefs)
+			if got != tt.want {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -28,7 +28,18 @@ func TestSaveImageTarAtPublishesAtomically(t *testing.T) {
 	if err := os.WriteFile(source, []byte("new archive"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveImageTarAt(source, destination); err != nil {
+	staged, err := stageImageTarAt(source, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old archive" {
+		t.Fatalf("staging replaced installed archive early: %q", got)
+	}
+	if err := publishStagedImageTarAt(staged, destination); err != nil {
 		t.Fatal(err)
 	}
 	got, err = os.ReadFile(destination)

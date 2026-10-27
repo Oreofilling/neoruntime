@@ -61,7 +61,13 @@ func TestBootPrepMCURTCUsesExactEpochWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(raw)
-	for _, want := range []string{"1704067200LL", "2208988800LL", "sec < min_plausible_ts || sec > max_plausible_ts"} {
+	for _, want := range []string{
+		"1704067200LL",
+		"2208988800LL",
+		"sec < min_plausible_ts || sec > max_plausible_ts",
+		"const struct tm requested_tm = tm",
+		"tm.tm_mday != requested_tm.tm_mday",
+	} {
 		if !strings.Contains(source, want) {
 			t.Fatalf("MCU RTC pre-set validation is missing %q", want)
 		}
@@ -87,6 +93,43 @@ func TestTimeSaveScriptIsPackagedAndValidated(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("%s does not package or validate %q", path, want)
 		}
+	}
+}
+
+func TestDirectInstallerEnablesTimeSaver(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(raw), "aipc-os-verify.service aipc-time-save.service") != 2 {
+		t.Fatal("direct installer does not enable time saver in both boot ownership modes")
+	}
+}
+
+func TestReleaseValidatorsRejectEmptyTLSCredentials(t *testing.T) {
+	for _, path := range []string{
+		"../../scripts/deploy.sh",
+		"../../scripts/aipc-install-current-root.sh",
+		"../../scripts/aipc-restore.sh",
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "etc/ssl/*") {
+			t.Fatalf("%s still exempts empty TLS credentials", path)
+		}
+	}
+}
+
+func TestFirstbootAllowsLargeContainerdMigrationToFinish(t *testing.T) {
+	raw, err := os.ReadFile("../../systemd/aipc-firstboot.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := string(raw)
+	if !strings.Contains(unit, "TimeoutStartSec=0") || strings.Contains(unit, "TimeoutStartSec=180") {
+		t.Fatal("firstboot still imposes a fixed deadline on containerd migration")
 	}
 }
 
@@ -267,7 +310,7 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 			t.Fatalf("seed publication missing pending marker: %v", err)
 		}
 
-		// Simulate firstboot timing out after destination publication but before
+		// Simulate firstboot being interrupted after destination publication but before
 		// the atomic config rename. containerd continues on source and writes
 		// newer metadata; the next boot must discard and refresh the stale seed.
 		if err := os.WriteFile(filepath.Join(source, "seed"), []byte("newer-source-state"), 0644); err != nil {
