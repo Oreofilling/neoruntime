@@ -2,14 +2,16 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	devicepb "aipc/platform/device-control/proto"
-	"aipc/tools/aipc-cli/pkg/output"
 )
 
 var deviceCmd = &cobra.Command{
@@ -538,6 +540,75 @@ Examples:
 	},
 }
 
+// ============ device rtc ============
+
+var deviceAPIBase string
+
+var deviceRtcCmd = &cobra.Command{
+	Use:   "rtc",
+	Short: "Read the MCU RTC time (diagnostic)",
+	Long: `Read the MCU real-time clock back from the MCU.
+
+The boot flow only pushes time host-to-MCU; this reads it back to verify
+the sync landed and to spot a dead MCU RTC (which reports year 2000).
+Goes through the platform REST API (--api), not the device-control
+channel — the MCU raw host-link path lives behind platform-api.
+
+Examples:
+  aipc-cli device rtc
+  aipc-cli device rtc --api http://<device>:8080
+`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		url := strings.TrimRight(deviceAPIBase, "/") + "/api/v1/system/time/mcu-rtc"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := apiHTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("platform API unreachable at %s: %w", deviceAPIBase, err)
+		}
+		defer resp.Body.Close()
+
+		var envelope struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
+				McuTime      string `json:"mcu_time"`
+				HostTime     string `json:"host_time"`
+				DriftSeconds int64  `json:"drift_seconds"`
+				Plausible    bool   `json:"plausible"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+			return fmt.Errorf("invalid response from platform API: %w", err)
+		}
+		if envelope.Code != 0 {
+			return fmt.Errorf("MCU RTC read failed: %s", envelope.Message)
+		}
+
+		if outputFmt == "json" || outputFmt == "yaml" {
+			return printer.Print(map[string]interface{}{
+				"mcu_time":      envelope.Data.McuTime,
+				"host_time":     envelope.Data.HostTime,
+				"drift_seconds": envelope.Data.DriftSeconds,
+				"plausible":     envelope.Data.Plausible,
+			})
+		}
+
+		printer.Printf("MCU RTC:   %s\n", envelope.Data.McuTime)
+		printer.Printf("Host Time: %s\n", envelope.Data.HostTime)
+		printer.Printf("Drift:     %ds\n", envelope.Data.DriftSeconds)
+		if !envelope.Data.Plausible {
+			printer.Printf("Plausible: No (MCU clock reads implausible; RTC was reset or never synced)\n")
+		}
+		return nil
+	},
+}
+
 // ============ Helper functions ============
 
 func formatBool(b bool) string {
@@ -591,4 +662,7 @@ func init() {
 	deviceCmd.AddCommand(deviceZoomCmd)
 	deviceCmd.AddCommand(deviceFocusCmd)
 	deviceCmd.AddCommand(deviceGpioCmd)
+	deviceCmd.AddCommand(deviceRtcCmd)
+
+	deviceRtcCmd.Flags().StringVar(&deviceAPIBase, "api", "http://localhost:8080", "Platform API base URL")
 }
