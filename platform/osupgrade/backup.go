@@ -63,6 +63,7 @@ func (r *Runner) createUpgradeBackup(job *Job) error {
 	deviceConfigPaths := []string{
 		"/etc/timezone",
 		"/etc/localtime",
+		"/etc/machine-id",
 		"/etc/systemd/timesyncd.conf",
 		"/etc/systemd/ntp-units.d/10-aipc-timesyncd.list",
 		"/usr/local/share/ca-certificates",
@@ -235,10 +236,20 @@ func aipcUnitPaths(root string) []string {
 		"ai-runtime.service", "device-control.service", "device-discovery.service",
 		"platform-api.service", "app-manager.service",
 	}
-	paths := make([]string, 0, len(names)*2)
+	paths := make([]string, 0, len(names)*2+4)
 	for _, name := range names {
 		paths = append(paths, filepath.Join(root, name), filepath.Join(root, "multi-user.target.wants", name))
 	}
+	// The shutdown time saver is enabled through halt/reboot/shutdown target
+	// wants links instead of multi-user; a rootfs replacement wipes them, so
+	// without them in the backup the saver stays silently disabled until the
+	// runtime is redeployed.
+	paths = append(paths,
+		filepath.Join(root, "aipc-time-save.service"),
+		filepath.Join(root, "halt.target.wants", "aipc-time-save.service"),
+		filepath.Join(root, "reboot.target.wants", "aipc-time-save.service"),
+		filepath.Join(root, "shutdown.target.wants", "aipc-time-save.service"),
+	)
 	return paths
 }
 

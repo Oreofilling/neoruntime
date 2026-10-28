@@ -643,7 +643,9 @@ func (h *TimeHandler) saveTimeUserConfig(cfg *timeUserConfig) error {
 		return err
 	}
 
-	return os.WriteFile(configPath, data, 0644)
+	// Same tmp+rename contract as the last-known-time snapshot: this file
+	// lives in the release etc/ tree and must never be exposed truncated.
+	return atomicWriteJSON(configPath, json.RawMessage(data))
 }
 
 // projectTimezone projects /etc/timezone through the Config Controller when
@@ -1314,7 +1316,10 @@ func (h *TimeHandler) persistCurrentTime() {
 		return
 	}
 
-	if err := os.WriteFile(defaultLastKnownTimePath, data, 0644); err != nil {
+	// tmp+rename via atomicWriteJSON, matching aipc-time-save.sh: a bare
+	// os.WriteFile truncates in place, so a crash mid-write would leave a
+	// zero-byte file in /data/aipc/etc.
+	if err := atomicWriteJSON(defaultLastKnownTimePath, json.RawMessage(data)); err != nil {
 		logger.Warn("Failed to write last-known-time: %v", err)
 	}
 }

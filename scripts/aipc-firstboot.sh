@@ -40,6 +40,26 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ---------- systemctl/timedatectl timeout guard ----------
+# 2026-10-21 field incident (.216 bench unit): PID1's reload transaction
+# wedged inside a generator for 5h16m; every systemctl call — including
+# this script's `enable --now serial-getty` — blocked on the unresponsive
+# manager and took the whole boot down with it (no IP, no SSH, silent
+# journal). Shadow both binaries with a bounded wrapper so no single call
+# can wedge the boot: an abandoned call exits 124, the caller's `|| warn`
+# handles it, and every firstboot step is idempotent so the work simply
+# retries on the next boot. Boot progress must never depend on the
+# manager being healthy.
+if command -v timeout >/dev/null 2>&1; then
+    # Resolve binary paths once: `timeout` execs its argument, so the shell
+    # builtin `command` cannot appear there (verified on-device: it exits
+    # 125/127 instantly and would silently break every call).
+    _SYSTEMCTL_BIN="$(command -v systemctl)"
+    _TIMEDATECTL_BIN="$(command -v timedatectl)"
+    systemctl()   { timeout 60 "${_SYSTEMCTL_BIN:?systemctl binary not found}" "$@"; }
+    timedatectl() { timeout 60 "${_TIMEDATECTL_BIN:?timedatectl binary not found}" "$@"; }
+fi
+
 # ---------- Parse args ----------
 ACTION="boot"
 while [[ $# -gt 0 ]]; do
@@ -76,8 +96,14 @@ if [[ "$ACTION" == "boot" ]]; then
 fi
 
 # ---------- Constants ----------
-# Minimum plausible epoch — reject timestamps before 2024-01-01 (bad RTC / empty battery)
+# Plausible epoch window — reject timestamps outside [2024-01-01, 2040-01-01].
+# The lower bound catches dead RTCs / epoch-1970 boots; the UPPER bound
+# catches corrupt RTCs reading the far future (the MCU RTC year field is
+# 2-digit, so 2099 is representable): accepting it would skip the
+# last-known-time fallback and jump the wall clock by decades — another
+# journald retention storm (2026-10-21).
 MIN_PLAUSIBLE_TS=1704067200
+MAX_PLAUSIBLE_TS=2208988800
 
 # Detect install prefix for status display. /data/aipc is the sole canonical
 # root; legacy /data (flat) and /opt/aipc (rootfs) are kept as transition
@@ -259,6 +285,38 @@ provision_network() {
 }
 provision_network
 
+# Re-apply packaged journald limits from the persistent install root. The
+# drop-ins (SystemMaxUse / rate limits, packaged under configs/systemd/
+# journald.conf.d) are installed into /etc by deploy.sh — but a rootfs
+# reflash wipes /etc, and the very first boot after the reflash is exactly
+# when the clock-restore jump triggers a journald retention/vacuum storm
+# (2026-10-21: the storm congested I/O and contributed to a 5h16m boot
+# hang). /data/aipc survives the reflash, so promoting the caps here —
+# before Step 2 touches the clock — means the storm window is already
+# bounded. Only a factory-fresh flash (empty /data) stays unprotected;
+# that case needs the drop-ins baked into the OS image itself.
+journald_caps_applied=0
+if [[ -d "${AIPC_PREFIX}/etc/systemd/journald.conf.d" ]]; then
+    shopt -s nullglob
+    for jconf in "${AIPC_PREFIX}"/etc/systemd/journald.conf.d/*.conf; do
+        jbase="$(basename "$jconf")"
+        if ! cmp -s "$jconf" "/etc/systemd/journald.conf.d/${jbase}" 2>/dev/null; then
+            if install -D -m 0644 "$jconf" "/etc/systemd/journald.conf.d/${jbase}" 2>/dev/null; then
+                log "journald drop-in promoted: ${jbase}"
+                journald_caps_applied=1
+            else
+                warn "Failed to promote journald drop-in: ${jbase}"
+            fi
+        fi
+    done
+    shopt -u nullglob
+    if [[ ${journald_caps_applied} -eq 1 ]]; then
+        # Apply now so the caps are live before the clock jump below; a
+        # later restart in Step 6 re-reads them harmlessly.
+        systemctl restart systemd-journald 2>/dev/null || true
+    fi
+fi
+
 # ============================================================================
 # Step 1: Kernel modules (Hailo NPU + RTC)
 # ============================================================================
@@ -339,11 +397,44 @@ log "=== [2/5] Time synchronization ==="
 # Sync hardware RTC → system clock if RTC is present and plausible
 if [[ -e /dev/rtc0 ]]; then
     rtc_ts=$(hwclock -u --show 2>/dev/null | xargs -I{} date -d "{}" +%s 2>/dev/null || echo "0")
-    if [[ "${rtc_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]]; then
+    if [[ "${rtc_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]] && [[ "${rtc_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
         hwclock --hctosys 2>/dev/null && log "System clock synced from hardware RTC" || \
             warn "hwclock --hctosys failed"
     else
-        warn "RTC time is implausible (ts=${rtc_ts}), skipping hctosys"
+        warn "RTC time is outside the plausible window (ts=${rtc_ts}), skipping hctosys"
+    fi
+fi
+
+# Pull time from the baseboard MCU RTC when the SoC clock is stale and the
+# SoC itself has no RTC. On NE503 the only battery-backed RTC lives on the
+# STM32 baseboard MCU behind the exclusive UART /dev/ttyS0 (verified
+# 2026-10-23: keeps time across full mains power loss). firstboot runs
+# before camera-daemon/device-control claim the UART, so it is safe to use
+# it here. Plausibility-checked: an MCU whose battery also died returns
+# garbage and we fall through to last-known-time below. A 4.5-year wall
+# clock jump later in boot is what ignited the journald retention storm of
+# 2026-10-21 — restoring time this early minimises how many journal
+# entries are ever written with a bogus clock.
+BOOT_PREP="${AIPC_PREFIX}/bin/ne503_boot_prep"
+if [[ "$(date +%s)" -lt "${MIN_PLAUSIBLE_TS}" ]] && \
+   [[ ! -e /dev/rtc0 ]] && \
+   [[ -x "${BOOT_PREP}" ]] && [[ -e /dev/ttyS0 ]]; then
+    info "SoC clock stale and no /dev/rtc0 — pulling time from MCU RTC"
+    mkdir -p /run/aipc/mcu-prep/.hailo 2>/dev/null || true
+    if HOME=/run/aipc/mcu-prep timeout 15 "${BOOT_PREP}" \
+            --serial /dev/ttyS0 --baud 921600 \
+            --version-check off --rtc sync-from-mcu >/dev/null 2>&1; then
+        # The tool sets the clock itself, so re-check AFTER it ran and
+        # two-sided: a corrupt MCU RTC reading e.g. 2099 must be rejected
+        # here so the last-known-time fallback below still applies.
+        _mcu_ts="$(date +%s)"
+        if [[ "${_mcu_ts}" -ge "${MIN_PLAUSIBLE_TS}" ]] && [[ "${_mcu_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
+            log "System time restored from MCU RTC: $(date '+%Y-%m-%d %H:%M:%S')"
+        else
+            warn "MCU RTC time is outside the plausible window ($(date '+%Y-%m-%d %H:%M:%S')), falling back"
+        fi
+    else
+        warn "sync-from-mcu failed (MCU not answering or UART busy)"
     fi
 fi
 
@@ -354,7 +445,7 @@ LAST_KNOWN_TIME="${AIPC_ETC}/last-known-time.json"
 
 if [[ "${current_ts}" -lt "${MIN_PLAUSIBLE_TS}" ]] && [[ -f "${LAST_KNOWN_TIME}" ]]; then
     saved_ts=$(grep -o '"unix_timestamp": *[0-9]*' "${LAST_KNOWN_TIME}" 2>/dev/null | grep -o '[0-9]*' || true)
-    if [[ -n "${saved_ts}" ]] && [[ "${saved_ts}" -gt "${MIN_PLAUSIBLE_TS}" ]]; then
+    if [[ -n "${saved_ts}" ]] && [[ "${saved_ts}" -gt "${MIN_PLAUSIBLE_TS}" ]] && [[ "${saved_ts}" -le "${MAX_PLAUSIBLE_TS}" ]]; then
         saved_date=$(date -d "@${saved_ts}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
         if [[ -n "${saved_date}" ]]; then
             systemctl stop systemd-timesyncd.service ntpd.service chronyd.service 2>/dev/null || true
@@ -482,16 +573,90 @@ else
     info "Systemd log level already info"
 fi
 
+# Persist login records (wtmp/lastlog) across reboots and rootfs reflashes —
+# BEFORE the serial getty below is enabled. /var/log is tmpfs on this BSP:
+# every reboot wipes the login audit trail, and every OS reflash loses it
+# entirely — the 2026-10-21 incident forensics hit exactly this (wtmp began
+# at the reflash, all earlier logins unrecoverable). Mirrors the journal bind
+# pattern: keep the files on /data and bind-mount them onto /var/log.
+# Ordering matters: this script may spend minutes migrating the containerd
+# store (step 6b) after the getty is up, and logins landing on the volatile
+# files during that window would be hidden by the bind mount.
+for ut_file in wtmp lastlog; do
+    ut_src="/data/aipc-data/log/${ut_file}"
+    ut_dst="/var/log/${ut_file}"
+    mkdir -p /data/aipc-data/log 2>/dev/null || true
+    # Seed the persistent copy from the current boot's file if it exists.
+    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
+        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
+    elif [[ -f "$ut_src" ]] && [[ -f "$ut_dst" ]] && [[ -s "$ut_dst" ]] && [[ ! "$ut_dst" -ef "$ut_src" ]]; then
+        # Records already written this boot (utmp boot/runlevel entries or a
+        # pre-firstboot console login) would be hidden by the bind mount.
+        # wtmp is an append-only record stream, so splicing this boot's tail
+        # onto the persistent copy preserves them; this service is a oneshot
+        # with RemainAfterExit, so the merge runs at most once per boot.
+        # lastlog is a sparse UID-indexed table that cannot be merged — the
+        # persistent copy wins and this boot's lastlog entries are dropped.
+        # The -ef guard skips the merge on every boot after /etc/fstab has
+        # the bind entry: this service runs After=local-fs.target, so by
+        # then ut_dst is the bind-mounted ut_src (same inode). BusyBox cat
+        # lacks GNU cat's same-file rejection, so appending the file to
+        # itself never reaches EOF, fills /data, and blocks every After=
+        # service forever under TimeoutStartSec=0.
+        if [[ "$ut_file" == "wtmp" ]]; then
+            cat "$ut_dst" >>"$ut_src" 2>/dev/null || true
+        fi
+    fi
+    if [[ ! -f "$ut_src" ]]; then
+        : >"$ut_src" 2>/dev/null || true
+        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
+        chmod 664 "$ut_src" 2>/dev/null || true
+    fi
+    # A file bind mount requires the destination file to exist. /var/log is
+    # volatile on the BSP, so fresh boots may have neither wtmp nor lastlog.
+    if [[ ! -e "$ut_dst" ]]; then
+        : >"$ut_dst" 2>/dev/null || true
+        chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
+        chmod 664 "$ut_dst" 2>/dev/null || true
+    fi
+    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
+        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
+            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
+    fi
+    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
+        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
+            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
+    fi
+done
+log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
+
 # Ensure serial-getty is running on the kernel console device
 # (console=ttySX on kernel cmdline). systemd-getty-generator usually handles
 # this, but some BSPs ship with it masked or targeting the wrong device.
+#
+# Enable via a plain wants-symlink: creating the link is a pure filesystem
+# operation and never talks to the manager, so a wedged PID1 cannot hang the
+# boot here. (Root cause of the 2026-10-21 5h16m boot hang: `systemctl
+# enable --now` blocked behind a manager reload stuck in a generator.) The
+# best-effort start is bounded by the systemctl timeout guard above; if it
+# is abandoned, the getty comes up on the next boot via the symlink.
 if ! systemctl is-active --quiet serial-getty@* 2>/dev/null; then
     console_dev=$(grep -o 'console=tty[^ ,]*' /proc/cmdline 2>/dev/null | head -1 | sed 's/console=//' | cut -d, -f1)
     if [[ -n "${console_dev}" ]] && [[ -e "/dev/${console_dev}" ]]; then
         info "Enabling serial-getty on /dev/${console_dev}"
-        systemctl enable --now "serial-getty@${console_dev}.service" 2>/dev/null && \
-            log "serial-getty@${console_dev} enabled" || \
-            warn "Failed to enable serial-getty@${console_dev}"
+        getty_unit="serial-getty@${console_dev}.service"
+        getty_src="/lib/systemd/system/serial-getty@.service"
+        [[ -f "$getty_src" ]] || getty_src="/usr/lib/systemd/system/serial-getty@.service"
+        if [[ -f "$getty_src" ]] && \
+           mkdir -p /etc/systemd/system/getty.target.wants 2>/dev/null && \
+           ln -sfn "$getty_src" "/etc/systemd/system/getty.target.wants/${getty_unit}"; then
+            log "${getty_unit} enabled (wants-symlink)"
+        else
+            warn "Failed to enable ${getty_unit} via wants-symlink"
+        fi
+        systemctl start "${getty_unit}" 2>/dev/null && \
+            log "${getty_unit} started" || \
+            warn "Failed to start ${getty_unit} this boot (enabled for next boot)"
     fi
 else
     info "Serial getty already running"
@@ -523,7 +688,7 @@ containerd_config_root() {
 }
 
 containerd_set_config_value() {
-    local key="$1" value="$2" config="/etc/containerd/config.toml" tmp
+    local config="$1" key="$2" value="$3" tmp
 
     if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$config" 2>/dev/null; then
         sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$config"
@@ -540,7 +705,7 @@ containerd_set_config_value() {
 }
 
 containerd_set_config_version() {
-    local config="/etc/containerd/config.toml" tmp
+    local config="$1" tmp
 
     if grep -q '^[[:space:]]*version[[:space:]]*=' "$config" 2>/dev/null; then
         sed -i -E 's|^[[:space:]]*version[[:space:]]*=.*|version = 2|' "$config"
@@ -556,14 +721,74 @@ containerd_set_config_version() {
     rm -f "$tmp"
 }
 
+containerd_commit_config() {
+    local target="$1" config="${2:-/etc/containerd/config.toml}" tmp
+
+    mkdir -p "$(dirname "$config")" 2>/dev/null || return 1
+    tmp="$(mktemp "${config}.tmp.XXXXXX")" || return 1
+    if [[ -f "$config" ]]; then
+        cp -a "$config" "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            return 1
+        }
+    else
+        : >"$tmp"
+        chmod 0644 "$tmp" 2>/dev/null || true
+    fi
+
+    if ! containerd_set_config_value "$tmp" root "$target" ||
+       ! containerd_set_config_value "$tmp" state "/run/containerd" ||
+       ! containerd_set_config_version "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # This rename is the migration commit point. Before it, containerd still
+    # uses the untouched source. After it, containerd uses the fully published
+    # persistent destination even if firstboot is killed a moment later.
+    mv -f "$tmp" "$config"
+}
+
+recover_pending_containerd_migration() {
+    local destination="$1" configured_root="$2"
+    local marker="${destination}.migration-pending"
+
+    [[ -e "$marker" ]] || return 0
+    if [[ "$configured_root" == "$destination" ]]; then
+        # The atomic config rename committed before firstboot was interrupted.
+        rm -f "$marker" 2>/dev/null || true
+        log "Recovered committed containerd migration to $destination"
+        return 0
+    fi
+
+    # The destination was published but config still points at the source.
+    # containerd may have written newer metadata there after an interruption,
+    # so the staged snapshot is no longer authoritative. Discard and reseed it.
+    warn "Discarding uncommitted containerd seed at $destination"
+    rm -rf "$destination" "$(dirname "$destination")"/.containerd-migrate.* 2>/dev/null || true
+    mkdir -p "$destination" 2>/dev/null || return 1
+}
+
 migrate_containerd_root() {
-    local source="$1" destination="$2" link_target
+    local source="$1" destination="$2" configured_root="${3:-}"
+    local link_target destination_has_data=0
+    local stage_parent stage_dir copy_src="" marker legacy_keep
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
         warn "Failed to create containerd root $destination"
-        return 0
+        return 1
     }
+
+    # The destination lives on persistent /data and is authoritative once it
+    # contains any containerd state. After an OS reflash, /var/lib/containerd
+    # can contain a freshly initialized (empty) meta.db; copying it over the
+    # persistent root destroys the image/tag index while leaving blobs and
+    # snapshots behind. Only seed an empty destination. Existing persistent
+    # state must never be overlaid by the replaceable rootfs copy.
+    if find "$destination" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+        destination_has_data=1
+    fi
 
     if [[ -L "$source" ]]; then
         link_target="$(readlink -f "$source" 2>/dev/null || true)"
@@ -571,19 +796,103 @@ migrate_containerd_root() {
             return 0
         fi
         if [[ -n "$link_target" && -d "$link_target" ]]; then
-            cp -a "$link_target"/. "$destination"/ 2>/dev/null || true
+            copy_src="$link_target"
         fi
-        rm -f "$source" 2>/dev/null || true
     elif [[ -d "$source" ]]; then
-        cp -a "$source"/. "$destination"/ 2>/dev/null || true
-        rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
+        copy_src="$source"
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
+        return 1
+    fi
+
+    # Triage an unmarked nonempty destination. Neither the migration marker
+    # nor the config names it, so it is either (a) the persistent root of a
+    # device that reflashed its rootfs — config reset to the stock
+    # /var/lib/containerd — where it must stay authoritative, or (b) the
+    # partial leftover of a pre-staging firstboot (direct cp -a under a
+    # 180s deadline) killed mid-copy, with the complete source untouched.
+    # The tell is the source: a fresh rootfs store holds no image content,
+    # so real blobs under the source mean the destination is suspect. Move
+    # it aside — never delete — and reseed from the complete source; if the
+    # heuristic ever misfires (fresh store that pulled before firstboot),
+    # the moved copy survives and images re-import from saved archives.
+    #
+    # A destination carrying the pending marker is exempt from this triage:
+    # recovery runs before the migration passes and consumes any stale
+    # marker, so one present here was written moments ago by an earlier
+    # pass in this same configure run. configure_containerd_root invokes
+    # this helper twice with the same default source, and triaging the
+    # just-published store aside would re-copy multi-GB of content and
+    # could exhaust /data.
+    marker="${destination}.migration-pending"
+    if [[ $destination_has_data -eq 1 && "$configured_root" != "$destination" && -n "$copy_src" && ! -e "$marker" ]] && \
+       find "$copy_src/io.containerd.content.v1.content" -type f -print -quit 2>/dev/null | grep -q .; then
+        legacy_keep="${destination}.legacy-partial.$(date +%s)"
+        if mv "$destination" "$legacy_keep" 2>/dev/null && mkdir -p "$destination" 2>/dev/null; then
+            warn "Moved unmarked partial containerd state aside: $legacy_keep"
+            destination_has_data=0
+        else
+            warn "Cannot move unmarked partial containerd state at $destination; preserving it"
+        fi
+    fi
+
+    if [[ $destination_has_data -eq 1 ]]; then
+        log "Preserving existing containerd state in $destination; ignoring $source"
+    elif [[ -n "$copy_src" ]]; then
+        # Crash-safe seeding. Even without a fixed systemd startup deadline,
+        # power loss can interrupt a large copy. A partial destination would
+        # then be treated as authoritative state on the next boot while the
+        # complete source gets deleted. Copy into a staging sibling and
+        # publish with a single rename instead. Staging left behind by an
+        # interrupted attempt is partial by definition — always discard it.
+        stage_parent="$(dirname "$destination")"
+        rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true
+        stage_dir="${stage_parent}/.containerd-migrate.$$"
+        if mkdir -p "$stage_dir" 2>/dev/null && \
+           cp -a "$copy_src"/. "$stage_dir"/ 2>/dev/null && \
+           : >"$marker" && \
+           rmdir "$destination" 2>/dev/null && \
+           mv "$stage_dir" "$destination" 2>/dev/null; then
+            log "Seeded containerd root $destination from $copy_src (staged + atomic rename)"
+        else
+            rm -rf "$stage_dir" 2>/dev/null || true
+            mkdir -p "$destination" 2>/dev/null || true
+            rm -f "$marker" 2>/dev/null || true
+            warn "containerd seed copy did not complete; keeping source $copy_src intact"
+            return 1
+        fi
+    fi
+}
+
+ensure_containerd_varlib_link() {
+    local target="$1" source="${2:-/var/lib/containerd}"
+    local backup="$(dirname "$source")/.containerd.aipc-migration-backup"
+    local resolved
+
+    resolved="$(readlink -f "$source" 2>/dev/null || true)"
+    if [[ -L "$source" && "$resolved" == "$target" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
         return 0
     fi
 
-    mkdir -p "$(dirname "$source")" 2>/dev/null || true
-    ln -s "$destination" "$source" 2>/dev/null || true
+    # Config already points directly at $target, so moving the compatibility
+    # path cannot make containerd use an incomplete tree. Keep a same-filesystem
+    # backup until the symlink exists; every interruption point is recoverable.
+    if [[ -e "$source" || -L "$source" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
+        if [[ -L "$source" ]]; then
+            rm -f "$source" 2>/dev/null || return 1
+        else
+            mv "$source" "$backup" 2>/dev/null || return 1
+        fi
+    fi
+    mkdir -p "$(dirname "$source")" 2>/dev/null || return 1
+    if ! ln -s "$target" "$source" 2>/dev/null; then
+        [[ -e "$source" || -L "$source" || ! -e "$backup" ]] || \
+            mv "$backup" "$source" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$backup" 2>/dev/null || true
 }
 
 configure_containerd_root() {
@@ -594,6 +903,7 @@ configure_containerd_root() {
     local restart_containerd=0
     local restart_app_manager=0
     local restart_ai_runtime=0
+    local stop_state stop_confirmed
 
     mkdir -p "$target" 2>/dev/null || {
         warn "Failed to prepare containerd root $target"
@@ -602,6 +912,10 @@ configure_containerd_root() {
 
     current_root="$(containerd_config_root)"
     [[ -n "$current_root" ]] || current_root="/var/lib/containerd"
+    recover_pending_containerd_migration "$target" "$current_root" || {
+        warn "Failed to recover interrupted containerd migration"
+        return 0
+    }
     varlib_target="$(readlink -f /var/lib/containerd 2>/dev/null || true)"
 
     [[ -f "$config" && "$current_root" == "$target" ]] || needs_fix=1
@@ -622,21 +936,58 @@ configure_containerd_root() {
         systemctl stop app-manager ai-runtime containerd 2>/dev/null || true
     fi
 
-    migrate_containerd_root "$current_root" "$target"
-    migrate_containerd_root "/var/lib/containerd" "$target"
-
-    mkdir -p /etc/containerd 2>/dev/null || true
-    if [[ ! -f "$config" ]]; then
-        cat >"$config" <<EOF
-root = "$target"
-state = "/run/containerd"
-version = 2
-EOF
-    else
-        containerd_set_config_value root "$target"
-        containerd_set_config_value state "/run/containerd"
-        containerd_set_config_version
+    # Confirm the daemon is actually down before touching the store — and
+    # confirm even when the probe above reported inactive, because the
+    # bounded-systemctl wrapper turns a hung probe into a 124 that reads as
+    # "not active", and a stop timeout swallowed by || true does not mean
+    # the stop job finished. Only an explicit terminal state counts as
+    # stopped; an empty or unrecognized probe result means the wrapper
+    # killed the probe, so the loop stops right there instead of paying the
+    # 60-second bound once per iteration. Migrating a store the daemon is
+    # still writing corrupts it, so on timeout keep the source
+    # authoritative and retry on the next boot instead.
+    stop_confirmed=0
+    for _ in $(seq 1 30); do
+        stop_state="$(systemctl is-active containerd 2>/dev/null || true)"
+        case "$stop_state" in
+            inactive|failed|unknown) stop_confirmed=1; break ;;
+            active|reloading|activating|deactivating) sleep 1 ;;
+            *) break ;;
+        esac
+    done
+    if [[ $stop_confirmed -ne 1 ]]; then
+        warn "containerd still active after stop (state: ${stop_state:-unresponsive}); refusing to migrate its store"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
     fi
+
+    if ! migrate_containerd_root "$current_root" "$target" "$current_root" ||
+       ! migrate_containerd_root "/var/lib/containerd" "$target" "$current_root"; then
+        warn "Failed to seed containerd root; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    if ! containerd_commit_config "$target"; then
+        warn "Failed to commit containerd config; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
+    fi
+    rm -f "${target}.migration-pending" 2>/dev/null || true
+    ensure_containerd_varlib_link "$target" || \
+        warn "Failed to link /var/lib/containerd to $target (config is already committed)"
 
     log "containerd root ready: $target"
 

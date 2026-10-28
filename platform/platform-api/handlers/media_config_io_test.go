@@ -16,11 +16,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,6 +194,52 @@ func TestReadJSONRawAndAtomicWrite(t *testing.T) {
 	_ = os.WriteFile(bad, []byte(`{broken`), 0644)
 	if r := readJSONRaw(bad); r != nil {
 		t.Errorf("invalid JSON on disk should yield nil, got %s", r)
+	}
+}
+
+// TestAtomicWriteJSONConcurrentWriters pins the unique-temporary-file fix:
+// the periodic time saver and time-setting handlers can write the same
+// destination concurrently. With a shared tmp name two writers interleave
+// into one inode and the first rename publishes the mixed bytes; with a
+// unique temp per call every published file is exactly one writer's JSON.
+func TestAtomicWriteJSONConcurrentWriters(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "last-known-time.json")
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(writer int) {
+			defer wg.Done()
+			payload := fmt.Sprintf(`{"writer":%d,"filler":"%060d"}`, writer, writer)
+			for i := 0; i < iterations; i++ {
+				if err := atomicWriteJSON(path, json.RawMessage(payload)); err != nil {
+					t.Errorf("writer %d: atomicWriteJSON: %v", writer, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Writer int    `json:"writer"`
+		Filler string `json:"filler"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("published file is not valid JSON (interleaved writers?): %v\n%s", err, raw)
+	}
+	if expected := fmt.Sprintf("%060d", got.Writer); got.Filler != expected {
+		t.Fatalf("payload from two writers mixed: writer=%d filler=%q", got.Writer, got.Filler)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, "*.tmp.*"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("temporary files left behind: %v (err %v)", leftovers, err)
 	}
 }
 

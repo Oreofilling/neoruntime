@@ -21,7 +21,7 @@ ExecCondition=/usr/libexec/aipc-os-updater needs-verify
 # An actual verify boot deliberately restores the platform so health checking
 # and the remote recovery channel are available. restart also executes the
 # oneshot if it was left active from an in-place current-root activation.
-ExecStartPre=/usr/bin/systemctl restart aipc-autostart.service
+ExecStartPre=/bin/systemctl restart aipc-autostart.service
 ExecStart=/usr/libexec/aipc-os-updater verify
 StandardOutput=journal+console
 StandardError=journal+console

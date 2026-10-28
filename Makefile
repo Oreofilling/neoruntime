@@ -490,6 +490,7 @@ _pack-stage:
 	@cp -f scripts/deploy.sh "$(STAGE_DIR)/deploy.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/deploy.sh" || true
 	@install -m 0755 scripts/aipc-install-current-root.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-install-current-root.sh"
 	@cp -f scripts/aipc-firstboot.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-firstboot.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-firstboot.sh" || true
+	@install -m 0755 scripts/aipc-time-save.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-time-save.sh"
 	@cp -f scripts/aipc-healthmon.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-healthmon.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-healthmon.sh" || true
 	@cp -f scripts/aipc-configure-platform-api-gateway.py "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-configure-platform-api-gateway.py" || true
 	@cp -f scripts/aipc-logrotate.sh "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" 2>/dev/null && chmod +x "$(STAGE_DIR)/opt/aipc/scripts/aipc-logrotate.sh" || true

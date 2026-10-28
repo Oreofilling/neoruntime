@@ -104,6 +104,7 @@ mkdir -p ${INSTALL_PREFIX}/recovery
 install -m 0755 scripts/aipc-os-layout-check.sh ${INSTALL_PREFIX}/scripts/aipc-os-layout-check.sh
 install -m 0755 scripts/aipc-install-current-root.sh ${INSTALL_PREFIX}/scripts/aipc-install-current-root.sh
 install -m 0755 scripts/aipc-configure-platform-api-gateway.py ${INSTALL_PREFIX}/scripts/aipc-configure-platform-api-gateway.py
+install -m 0755 scripts/aipc-time-save.sh ${INSTALL_PREFIX}/scripts/aipc-time-save.sh
 if [ -d build/recovery/hailo15-ne503 ]; then
     install -m 0644 build/recovery/hailo15-ne503/* ${INSTALL_PREFIX}/recovery/
 fi
@@ -202,9 +203,9 @@ for unit in systemd/*.service systemd/*.timer systemd/*.target; do
 done
 systemctl daemon-reload
 if os_manages_aipc_boot; then
-    systemctl reenable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service 2>/dev/null || true
+    systemctl reenable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service aipc-time-save.service 2>/dev/null || true
 else
-    systemctl enable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service 2>/dev/null || true
+    systemctl enable aipc-restore.service aipc-firstboot.service aipc-autostart.service aipc-os-verify.service aipc-time-save.service 2>/dev/null || true
 fi
 echo "✓ Systemd services installed"
 

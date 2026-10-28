@@ -87,9 +87,10 @@ if [[ "${AIPC_MCU_PREP_ONCE:-1}" != "0" ]]; then
 fi
 
 # --- Phase 1: RTC — push host Linux UTC into the MCU RTC --------------------
-# Only push when the host clock is plausible. aipc-firstboot has already run
-# hwclock --hctosys (battery-backed RTC) by this point; if the battery RTC is
-# empty / NTP has not converged, year < 2024 and we refuse to push bogus time.
+# Only push when the host clock is plausible. By this point aipc-firstboot
+# Step 2 has already restored the host clock (SoC has NO /dev/rtc0; sources,
+# in order: baseboard MCU RTC via sync-from-mcu, last-known-time, NTP). If
+# all of those failed, year < 2024 and we refuse to push bogus time.
 args=(--serial /dev/ttyS0 --baud 921600)
 year="$(date +%Y 2>/dev/null || echo 0)"
 if [[ "$year" -ge 2024 ]]; then

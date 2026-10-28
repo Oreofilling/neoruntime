@@ -187,8 +187,6 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 			return // Return to reconnect
 		}
 
-		logger.Info("Received event: topic=%s, id=%s, timestamp_ns=%d", event.Topic, event.EventId, event.TimestampNs)
-
 		eventJSON := map[string]interface{}{
 			"topic":        event.Topic,
 			"payload":      string(event.Payload),
@@ -205,7 +203,6 @@ func (es *EventStream) receiveEvents(ctx context.Context, stream eventpb.EventBu
 		}
 
 		es.broadcast(jsonData)
-		logger.Info("Broadcasted event to %d clients", len(es.clients))
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,6 +23,19 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	// is retained.
 	writeBackupFixture(t, sourceRoot, "/etc/aipc/aipc.conf", "key=value\n")
 	writeBackupFixture(t, sourceRoot, "/etc/systemd/system/camera-daemon.service", "[Service]\n")
+	// The shutdown time saver is enabled through halt/reboot/shutdown target
+	// wants links; a rootfs upgrade must restore both the unit and its links.
+	writeBackupFixture(t, sourceRoot, "/etc/systemd/system/aipc-time-save.service", "[Unit]\n")
+	for _, target := range []string{"halt", "reboot", "shutdown"} {
+		linkDir := filepath.Join(sourceRoot, "etc/systemd/system", target+".target.wants")
+		if err := os.MkdirAll(linkDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(linkDir, "aipc-time-save.service")
+		if err := os.Symlink("/etc/systemd/system/aipc-time-save.service", link); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// network + ssh groups
 	writeBackupFixture(t, sourceRoot, "/etc/systemd/network/20-wired.network", "Address=192.0.2.72/24\n")
 	writeBackupFixture(t, sourceRoot, "/etc/resolv.conf", "nameserver 192.0.2.1\n")
@@ -29,6 +43,7 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	writeBackupFixture(t, sourceRoot, "/etc/ssh/sshd_config", "PermitRootLogin prohibit-password\n")
 	// device-config group
 	writeBackupFixture(t, sourceRoot, "/etc/timezone", "Asia/Shanghai\n")
+	writeBackupFixture(t, sourceRoot, "/etc/machine-id", "0123456789abcdef0123456789abcdef\n")
 	writeBackupFixture(t, sourceRoot, "/etc/systemd/timesyncd.conf", "[Time]\nNTP=ntp.example\n")
 	writeBackupFixture(t, sourceRoot, "/usr/local/share/ca-certificates/site.crt", "test certificate\n")
 	writeBackupFixture(t, sourceRoot, "/home/root/apps/resources/final_calibration.json", "{}\n")
@@ -78,6 +93,12 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	if !containsString(systemdNames, "etc/systemd/system/camera-daemon.service") {
 		t.Fatalf("application unit missing from systemd archive: %v", systemdNames)
 	}
+	for _, target := range []string{"halt", "reboot", "shutdown"} {
+		want := fmt.Sprintf("etc/systemd/system/%s.target.wants/aipc-time-save.service", target)
+		if !containsString(systemdNames, want) {
+			t.Fatalf("time saver enablement link missing from systemd archive: %v", systemdNames)
+		}
+	}
 	sshNames := readTarNames(t, filepath.Join(runner.BackupRoot, job.ID, "ssh.tar.gz"))
 	if !containsString(sshNames, "etc/ssh/sshd_config") {
 		t.Fatalf("sshd_config missing from ssh archive: %v", sshNames)
@@ -85,6 +106,7 @@ func TestCreateUpgradeBackup(t *testing.T) {
 	deviceConfigNames := readTarNames(t, filepath.Join(runner.BackupRoot, job.ID, "device-config.tar.gz"))
 	for _, want := range []string{
 		"etc/timezone",
+		"etc/machine-id",
 		"etc/systemd/timesyncd.conf",
 		"etc/resolv.conf",
 		"usr/local/share/ca-certificates/site.crt",

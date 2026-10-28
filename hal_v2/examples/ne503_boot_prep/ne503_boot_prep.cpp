@@ -240,6 +240,22 @@ static int rtc_sync_linux_from_mcu(void *mcu)
     if (r != HAL_OK) {
         return r;
     }
+    // Sanity-bound the date BEFORE touching the system clock. The MCU RTC
+    // year field is 2-digit (2000+yy), so a corrupt or misbehaving RTC can
+    // report 1999/2099 or impossible month/day/time values. The caller
+    // (aipc-firstboot) only re-checks AFTER this tool returns, and a
+    // clock_settime with a far-future value would skip its
+    // last-known-time fallback and jump the wall clock by decades — the
+    // journald retention-storm trigger of 2026-10-21. Refuse instead of set.
+    const int full_year = 2000 + (int)ht.year;
+    if (full_year < 2024 || full_year > 2040 ||
+        ht.month < 1 || ht.month > 12 || ht.day < 1 || ht.day > 31 ||
+        ht.hour > 23 || ht.minute > 59 || ht.second > 59) {
+        HAL_LOG_ERROR("MCU RTC time outside plausible range "
+                      "(%04d-%02u-%02u %02u:%02u:%02u); refusing clock_settime",
+                      full_year, ht.month, ht.day, ht.hour, ht.minute, ht.second);
+        return HAL_ERROR;
+    }
     struct tm tm {};
     std::memset(&tm, 0, sizeof(tm));
     tm.tm_year = ht.year + 100;
@@ -249,9 +265,30 @@ static int rtc_sync_linux_from_mcu(void *mcu)
     tm.tm_min = (int)ht.minute;
     tm.tm_sec = (int)ht.second;
     tm.tm_isdst = 0;
+    const struct tm requested_tm = tm;
     time_t sec = timegm(&tm);
     if (sec == (time_t)-1) {
         HAL_LOG_ERROR("timegm failed");
+        return HAL_ERROR;
+    }
+    // timegm normalizes impossible calendar values (for example, Feb 31)
+    // instead of rejecting them. Require an exact round trip so corrupt MCU
+    // fields cannot silently become a different, but plausible, date.
+    if (tm.tm_year != requested_tm.tm_year || tm.tm_mon != requested_tm.tm_mon ||
+        tm.tm_mday != requested_tm.tm_mday || tm.tm_hour != requested_tm.tm_hour ||
+        tm.tm_min != requested_tm.tm_min || tm.tm_sec != requested_tm.tm_sec) {
+        HAL_LOG_ERROR("MCU RTC calendar date is invalid; refusing clock_settime");
+        return HAL_ERROR;
+    }
+    // Keep this exact epoch window aligned with aipc-firstboot.sh. A year-only
+    // check accepts dates later in 2040 even though firstboot caps the value at
+    // 2040-01-01; once such a value is applied, the shell's stale-clock-only
+    // fallback cannot move it back to last-known-time.
+    constexpr time_t min_plausible_ts = (time_t)1704067200LL; // 2024-01-01 UTC
+    constexpr time_t max_plausible_ts = (time_t)2208988800LL; // 2040-01-01 UTC
+    if (sec < min_plausible_ts || sec > max_plausible_ts) {
+        HAL_LOG_ERROR("MCU RTC epoch outside plausible range (%lld); refusing clock_settime",
+                      (long long)sec);
         return HAL_ERROR;
     }
     struct timespec ts {};

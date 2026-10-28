@@ -49,13 +49,34 @@ validate_restored_release() {
         /data/aipc/scripts/aipc-firstboot.sh; do
         require_executable "$file"
     done
+    # Runtime state under etc/ is rewritten in place by the platform and a
+    # crash mid-write can leave it zero bytes; consumers tolerate empty or
+    # missing content, so it must not fail restore validation. Keep this
+    # list in sync with aipc-install-current-root.sh and deploy.sh.
     while IFS= read -r empty; do
+        case "$empty" in
+            /data/aipc/etc/last-known-time.json*|\
+            /data/aipc/etc/time-config.json*|\
+            /data/aipc/etc/osd-logo.conf)
+                continue ;;
+        esac
         fail "empty immutable restored file: $empty"
     done < <(find /data/aipc/bin /data/aipc/docs /data/aipc/etc \
         /data/aipc/firmware /data/aipc/libexec /data/aipc/recovery \
         /data/aipc/scripts /data/aipc/share /data/aipc/swagger-ui \
         /data/aipc/systemd /data/aipc/web \
         -type f -size 0 -print 2>/dev/null)
+    # The shutdown time saver arrived with the v1.2.0 runtime. An OS A/B
+    # upgrade can boot against an older independently deployed runtime whose
+    # /data tree never shipped this script; failing validation here would
+    # roll back an otherwise healthy OS upgrade. aipc-time-save.service
+    # already carries ConditionPathExists for the same reason, and the
+    # deployment-time validators (deploy.sh, install.sh,
+    # aipc-install-current-root.sh) still hard-require it whenever a full
+    # runtime tree is installed.
+    if [[ ! -x /data/aipc/scripts/aipc-time-save.sh ]]; then
+        log "WARN: RESTORE_LEGACY_LAYOUT: /data/aipc/scripts/aipc-time-save.sh missing (runtime predates the shutdown time saver)"
+    fi
 }
 
 json_string() {
@@ -253,6 +274,14 @@ restore_device_config() {
         restored_time=1
     fi
     restore_regular_file "$tmp" "etc/systemd/ntp-units.d/10-aipc-timesyncd.list" 0644 >/dev/null 2>&1 || true
+    # Restore the commissioned machine-id so journals stay unified across
+    # rootfs upgrades: a regenerated id forks a new /var/log/journal/<id>
+    # tree and re-fragments history (plus the retention-vacuum storms that
+    # come with it). PID1 of the CURRENT boot already committed the freshly
+    # generated id, so the restored value takes effect from the next boot.
+    if restore_regular_file "$tmp" "etc/machine-id" 0444 >/dev/null 2>&1; then
+        log "Restored commissioned /etc/machine-id (effective next boot)"
+    fi
     if [[ $restored_time -eq 1 ]]; then
         log "Restored time and NTP projection"
     fi
