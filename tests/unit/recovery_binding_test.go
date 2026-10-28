@@ -65,3 +65,64 @@ func TestArchiveBindingInvalidatedBeforeRegistryCommit(t *testing.T) {
 		}
 	}
 }
+
+// The digest-mismatch branch of restoreAppImagesFromSavedTar must purge the
+// references the import just created before returning the rejection. Deleting
+// the tar alone leaves the stale images resolving as available in containerd,
+// so ensureAppImagesAvailable would recompute the missing set as empty and
+// return success — the rejected content would keep running.
+func TestRecoveryMismatchPurgesRejectedReferences(t *testing.T) {
+	raw, err := os.ReadFile("../../platform/app-manager/server/image_recovery.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	purge := strings.Index(source, "s.client.RemoveImage(ctx, rejected, true)")
+	reject := strings.Index(source, "does not match the binding recorded at publication")
+	if purge < 0 || reject < 0 {
+		t.Fatal("digest-mismatch branch must purge the imported references before rejecting")
+	}
+	if purge > reject {
+		t.Fatal("rejected references must be purged before the mismatch error returns")
+	}
+}
+
+// deploy.sh must confirm containerd is actually inactive before migrating its
+// store: the bounded-systemctl wrapper only kills the waiting systemctl
+// client, so a stop timeout (124) swallowed by `|| true` leaves the daemon
+// running while the migration copies and deletes underneath it.
+func TestDeployVerifiesContainerdStoppedBeforeMigration(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/deploy.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	guardAt := strings.Index(script, `if ! systemctl is-active --quiet containerd 2>/dev/null; then`)
+	migrateAt := strings.Index(script, `migrate_persistent_dir "$CONTAINERD_OLD_ROOT"`)
+	if guardAt < 0 || migrateAt < 0 {
+		t.Fatal("deploy.sh must verify containerd is inactive before migrating its store")
+	}
+	if guardAt > migrateAt {
+		t.Fatal("the is-active containerd guard must run before migrate_persistent_dir")
+	}
+	if !strings.Contains(script, "refusing to migrate its store") {
+		t.Fatal("deploy.sh must fail loudly when containerd stays active after stop")
+	}
+}
+
+// The time saver's DefaultDependencies=no unit must order itself against
+// umount.target: with only the shutdown targets in Before=, the unit runs as
+// an unordered sibling of the unmounts and /data can be gone by ExecStart.
+func TestTimeSaveUnitOrderedAgainstUmountTarget(t *testing.T) {
+	raw, err := os.ReadFile("../../systemd/aipc-time-save.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := string(raw)
+	if !strings.Contains(unit, "Before=shutdown.target reboot.target halt.target umount.target") {
+		t.Fatal("aipc-time-save.service must run Before=umount.target or /data may unmount first")
+	}
+	if !strings.Contains(unit, "RequiresMountsFor=/data") {
+		t.Fatal("aipc-time-save.service must keep the /data mount alive until it finishes")
+	}
+}

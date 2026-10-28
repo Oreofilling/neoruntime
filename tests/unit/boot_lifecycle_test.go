@@ -322,6 +322,81 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy partial destination is moved aside and reseeded", func(t *testing.T) {
+		tmp := t.TempDir()
+		source := filepath.Join(tmp, "rootfs-containerd")
+		destination := filepath.Join(tmp, "persistent-containerd")
+		// A complete source store carries real image content.
+		blobs := filepath.Join(source, "io.containerd.content.v1.content", "blobs", "sha256")
+		if err := os.MkdirAll(blobs, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(blobs, "layer"), []byte("complete-store"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(source, "io.containerd.metadata.v1.bolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source, "io.containerd.metadata.v1.bolt", "meta.db"), []byte("complete-index"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// A pre-staging firstboot killed mid cp -a leaves a partial
+		// destination with no migration marker and the config still on the
+		// source.
+		if err := os.MkdirAll(filepath.Join(destination, "io.containerd.metadata.v1.bolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(destination, "io.containerd.metadata.v1.bolt", "meta.db"), []byte("partial-index"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		runFirstbootMigration(t, functions, source, destination, source)
+
+		got, err := os.ReadFile(filepath.Join(destination, "io.containerd.metadata.v1.bolt", "meta.db"))
+		if err != nil || string(got) != "complete-index" {
+			t.Fatalf("destination was not reseeded from the complete source: %q, %v", got, err)
+		}
+		legacy, err := filepath.Glob(destination + ".legacy-partial.*")
+		if err != nil || len(legacy) != 1 {
+			t.Fatalf("the partial copy must be preserved aside, got %v (err %v)", legacy, err)
+		}
+		partial, err := os.ReadFile(filepath.Join(legacy[0], "io.containerd.metadata.v1.bolt", "meta.db"))
+		if err != nil || string(partial) != "partial-index" {
+			t.Fatalf("the moved-aside partial copy changed: %q, %v", partial, err)
+		}
+	})
+
+	t.Run("committed destination survives a contentful source", func(t *testing.T) {
+		tmp := t.TempDir()
+		source := filepath.Join(tmp, "rootfs-containerd")
+		destination := filepath.Join(tmp, "persistent-containerd")
+		blobs := filepath.Join(source, "io.containerd.content.v1.content", "blobs", "sha256")
+		if err := os.MkdirAll(blobs, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(blobs, "layer"), []byte("complete-store"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(destination, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(destination, "committed"), []byte("persistent-state"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// The configured root names the destination, so it is committed
+		// state no matter how much content the source carries.
+		runFirstbootMigration(t, functions, source, destination, destination)
+
+		got, err := os.ReadFile(filepath.Join(destination, "committed"))
+		if err != nil || string(got) != "persistent-state" {
+			t.Fatalf("committed destination was disturbed: %q, %v", got, err)
+		}
+		if legacy, _ := filepath.Glob(destination + ".legacy-partial.*"); len(legacy) != 0 {
+			t.Fatalf("committed destination must never be triaged aside: %v", legacy)
+		}
+	})
+
 	t.Run("interrupted seed is refreshed from authoritative source", func(t *testing.T) {
 		tmp := t.TempDir()
 		source := filepath.Join(tmp, "old-containerd")
@@ -465,7 +540,7 @@ func TestFirstbootContainerdConfigCommitPreservesExistingConfig(t *testing.T) {
 func runFirstbootMigration(t *testing.T, functions, source, destination, configuredRoot string) {
 	t.Helper()
 	command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + functions +
-		"\nrecover_pending_containerd_migration \"$2\" \"$3\"\nmigrate_containerd_root \"$1\" \"$2\""
+		"\nrecover_pending_containerd_migration \"$2\" \"$3\"\nmigrate_containerd_root \"$1\" \"$2\" \"$3\""
 	cmd := exec.Command("bash", "-c", command, "migration-test", source, destination, configuredRoot)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("migration failed: %v\n%s", err, output)

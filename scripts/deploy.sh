@@ -2068,7 +2068,25 @@ fi
 if [[ $CONTAINERD_NEEDS_FIX -eq 1 ]]; then
     log "  Configuring containerd root -> $CONTAINERD_ROOT"
     systemctl stop app-manager containerd 2>/dev/null || true
-    sleep 1
+    # The bounded-systemctl wrapper kills only the waiting systemctl client,
+    # never the stop job itself, so a 124 here does not mean containerd is
+    # down. Migrating a store the daemon is still writing corrupts it: require
+    # inactivity, with a bounded retry because is-active can also stall under
+    # a wedged PID1.
+    containerd_stopped=0
+    for _ in $(seq 1 30); do
+        if ! systemctl is-active --quiet containerd 2>/dev/null; then
+            containerd_stopped=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $containerd_stopped -ne 1 ]]; then
+        record_failure "containerd still active after stop; refusing to migrate its store"
+        err "ERROR: containerd still active after stop; refusing to migrate its store."
+        err "       Reboot the device and re-run the deploy."
+        exit 1
+    fi
 
     # Generate default config if missing
     mkdir -p /etc/containerd

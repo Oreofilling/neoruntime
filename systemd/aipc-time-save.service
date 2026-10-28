@@ -6,7 +6,12 @@ Documentation=file:///data/aipc/docs/baseboard-mcu-rtc-ota.md
 # bring-up, commissioning) that power off before the periodic saver ever
 # fires. Enabled by deploy.sh alongside aipc-logrotate.timer.
 DefaultDependencies=no
-Before=shutdown.target reboot.target halt.target
+# umount.target runs as a sibling of the shutdown targets with no implicit
+# ordering against this unit; without an explicit edge /data can be unmounted
+# before ExecStart runs, silently skipping the snapshot. RequiresMountsFor
+# keeps the /data mount itself alive until the saver finishes.
+Before=shutdown.target reboot.target halt.target umount.target
+RequiresMountsFor=/data
 ConditionPathExists=/data/aipc/scripts/aipc-time-save.sh
 
 [Service]

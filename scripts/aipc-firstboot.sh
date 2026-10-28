@@ -770,8 +770,9 @@ recover_pending_containerd_migration() {
 }
 
 migrate_containerd_root() {
-    local source="$1" destination="$2" link_target destination_has_data=0
-    local stage_parent stage_dir copy_src="" marker
+    local source="$1" destination="$2" configured_root="${3:-}"
+    local link_target destination_has_data=0
+    local stage_parent stage_dir copy_src="" marker legacy_keep
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
@@ -802,6 +803,28 @@ migrate_containerd_root() {
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
         return 1
+    fi
+
+    # Triage an unmarked nonempty destination. Neither the migration marker
+    # nor the config names it, so it is either (a) the persistent root of a
+    # device that reflashed its rootfs — config reset to the stock
+    # /var/lib/containerd — where it must stay authoritative, or (b) the
+    # partial leftover of a pre-staging firstboot (direct cp -a under a
+    # 180s deadline) killed mid-copy, with the complete source untouched.
+    # The tell is the source: a fresh rootfs store holds no image content,
+    # so real blobs under the source mean the destination is suspect. Move
+    # it aside — never delete — and reseed from the complete source; if the
+    # heuristic ever misfires (fresh store that pulled before firstboot),
+    # the moved copy survives and images re-import from saved archives.
+    if [[ $destination_has_data -eq 1 && "$configured_root" != "$destination" && -n "$copy_src" ]] && \
+       find "$copy_src/io.containerd.content.v1.content" -type f -print -quit 2>/dev/null | grep -q .; then
+        legacy_keep="${destination}.legacy-partial.$(date +%s)"
+        if mv "$destination" "$legacy_keep" 2>/dev/null && mkdir -p "$destination" 2>/dev/null; then
+            warn "Moved unmarked partial containerd state aside: $legacy_keep"
+            destination_has_data=0
+        else
+            warn "Cannot move unmarked partial containerd state at $destination; preserving it"
+        fi
     fi
 
     if [[ $destination_has_data -eq 1 ]]; then
@@ -904,8 +927,8 @@ configure_containerd_root() {
         systemctl stop app-manager ai-runtime containerd 2>/dev/null || true
     fi
 
-    if ! migrate_containerd_root "$current_root" "$target" ||
-       ! migrate_containerd_root "/var/lib/containerd" "$target"; then
+    if ! migrate_containerd_root "$current_root" "$target" "$current_root" ||
+       ! migrate_containerd_root "/var/lib/containerd" "$target" "$current_root"; then
         warn "Failed to seed containerd root; source remains authoritative"
         if [[ $restart_containerd -eq 1 ]]; then
             systemctl start --no-block containerd 2>/dev/null || true

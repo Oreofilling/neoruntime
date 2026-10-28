@@ -289,6 +289,17 @@ func (s *AppManagerServer) restoreAppImagesFromSavedTar(ctx context.Context, app
 				if rmErr := containerd.RemoveSavedImageTar(appID); rmErr != nil {
 					logger.Warn("[IMAGE-RECOVERY] Failed to drop digest-mismatched archive for %s: %v", appID, rmErr)
 				}
+				// The import above already populated the stale references, so
+				// merely failing would leave them resolving as available:
+				// callers that re-check availability would find nothing
+				// missing, skip the registry pull, and run the rejected
+				// binary. Purge what the rejected archive brought in so the
+				// fallback actually engages.
+				for _, rejected := range refs {
+					if rmErr := s.client.RemoveImage(ctx, rejected, true); rmErr != nil {
+						logger.Warn("[IMAGE-RECOVERY] Failed to purge rejected reference %s: %v", rejected, rmErr)
+					}
+				}
 				return fmt.Errorf("saved archive digest for %s does not match the binding recorded at publication", ref)
 			}
 		}
