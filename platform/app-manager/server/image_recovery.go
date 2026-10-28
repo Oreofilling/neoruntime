@@ -102,6 +102,21 @@ func readSavedImageDigestsAt(path string) (map[string]string, bool) {
 	return sidecar.Digests, true
 }
 
+// publishSavedImageDigestsAt records digests next to a freshly published
+// archive. A failed write must never leave the previous binding in place:
+// the archive on disk is already the new one, so after a metadata reset
+// recovery would compare it against the stale digest, reject a valid
+// archive, and strand an offline app whose registry fallback cannot run.
+// Removing the sidecar instead reads as unproven — the conservative
+// direction already used for archives published before this scheme.
+func publishSavedImageDigestsAt(path string, digests map[string]string) error {
+	if err := writeSavedImageDigestsAt(path, digests); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
 // recordSavedImageDigests binds a freshly published archive to the digests
 // containerd currently holds behind refs, so a later no-upload update can
 // prove the archive still belongs to the installed images instead of trusting
@@ -118,7 +133,7 @@ func (s *AppManagerServer) recordSavedImageDigests(ctx context.Context, appID st
 		}
 		digests[ref] = image.Target().Digest.String()
 	}
-	if err := writeSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID), digests); err != nil {
+	if err := publishSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID), digests); err != nil {
 		logger.Warn("[IMAGE-RECOVERY] Failed to record archive digest binding for %s: %v", appID, err)
 	}
 }

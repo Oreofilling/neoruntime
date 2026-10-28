@@ -589,7 +589,7 @@ for ut_file in wtmp lastlog; do
     # Seed the persistent copy from the current boot's file if it exists.
     if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
         cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
-    elif [[ -f "$ut_src" ]] && [[ -f "$ut_dst" ]] && [[ -s "$ut_dst" ]]; then
+    elif [[ -f "$ut_src" ]] && [[ -f "$ut_dst" ]] && [[ -s "$ut_dst" ]] && [[ ! "$ut_dst" -ef "$ut_src" ]]; then
         # Records already written this boot (utmp boot/runlevel entries or a
         # pre-firstboot console login) would be hidden by the bind mount.
         # wtmp is an append-only record stream, so splicing this boot's tail
@@ -597,6 +597,12 @@ for ut_file in wtmp lastlog; do
         # with RemainAfterExit, so the merge runs at most once per boot.
         # lastlog is a sparse UID-indexed table that cannot be merged — the
         # persistent copy wins and this boot's lastlog entries are dropped.
+        # The -ef guard skips the merge on every boot after /etc/fstab has
+        # the bind entry: this service runs After=local-fs.target, so by
+        # then ut_dst is the bind-mounted ut_src (same inode). BusyBox cat
+        # lacks GNU cat's same-file rejection, so appending the file to
+        # itself never reaches EOF, fills /data, and blocks every After=
+        # service forever under TimeoutStartSec=0.
         if [[ "$ut_file" == "wtmp" ]]; then
             cat "$ut_dst" >>"$ut_src" 2>/dev/null || true
         fi

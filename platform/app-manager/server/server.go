@@ -765,6 +765,21 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		appInfo.InstalledAt = oldInstalledAt
 	}
 
+	// Invalidate the previous recovery archive BEFORE committing app state,
+	// whenever this install is about to replace or discard it. A crash
+	// between the registry commit below and the archive switch after it
+	// would leave the old tar with its still-matching digest sidecar behind
+	// a registry that already describes new content under the same mutable
+	// reference; after a metadata reset that stale pair verifies as valid
+	// and silently restores the old binary. Removing the binding first
+	// turns every crash window into "no archive", which fails forward to
+	// the registry instead of resurrecting stale content.
+	if stagedImageArchive != "" || discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to invalidate previous image recovery archive: %v", archiveErr), Code: 500}}, nil
+		}
+	}
+
 	// Register or update app
 	if isUpdate {
 		if err := s.registry.Update(appInfo); err != nil {
@@ -800,9 +815,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		}, nil
 	}
 
-	// Bind persistent recovery state to the image that is about to commit.
-	// Local archives replace the previous one atomically; installs from a
-	// registry invalidate any archive left by an older local installation.
+	// Publish the new recovery archive only after app state has committed;
+	// any previous archive was already invalidated above, so a failure here
+	// leaves "no archive" behind a committed app — recovery falls back to
+	// the registry rather than resurrecting stale content.
 	if stagedImageArchive != "" {
 		if archiveErr := containerd.PublishStagedImageTar(appInfo.ID, stagedImageArchive); archiveErr != nil {
 			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr), Code: 500}}, nil
@@ -810,10 +826,6 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
 		stagedImageArchive = ""
 		s.cleanupUploadedTar(savedImageSource)
-	} else if discardSavedImageArchive {
-		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
-			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to invalidate stale image recovery archive: %v", archiveErr), Code: 500}}, nil
-		}
 	}
 
 	// Register plugin capabilities
@@ -1279,6 +1291,22 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 		appInfo.InstalledAt = oldAppInfo.InstalledAt
 	}
 
+	// Invalidate the previous recovery archive BEFORE committing app state,
+	// whenever this install is about to replace or discard it. A crash
+	// between the registry commit below and the archive switch after it
+	// would leave the old tar with its still-matching digest sidecar behind
+	// a registry that already describes new content under the same mutable
+	// reference; after a metadata reset that stale pair verifies as valid
+	// and silently restores the old binary. Removing the binding first
+	// turns every crash window into "no archive", which fails forward to
+	// the registry instead of resurrecting stale content.
+	if stagedImageArchive != "" || discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			task.Fail(fmt.Sprintf("Failed to invalidate previous image recovery archive: %v", archiveErr))
+			return
+		}
+	}
+
 	task.Update("registering", 90, "Saving app registry...")
 	if isUpdate {
 		err = s.registry.Update(appInfo)
@@ -1302,7 +1330,10 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 		logger.Warn("Failed to register app permissions: %v", err)
 	}
 
-	// Bind persistent recovery state to the image that is about to commit.
+	// Publish the new recovery archive only after app state has committed;
+	// any previous archive was already invalidated above, so a failure here
+	// leaves "no archive" behind a committed app — recovery falls back to
+	// the registry rather than resurrecting stale content.
 	if stagedImageArchive != "" {
 		if archiveErr := containerd.PublishStagedImageTar(appInfo.ID, stagedImageArchive); archiveErr != nil {
 			task.Fail(fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr))
@@ -1311,11 +1342,6 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
 		stagedImageArchive = ""
 		s.cleanupUploadedTar(savedImageSource)
-	} else if discardSavedImageArchive {
-		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
-			task.Fail(fmt.Sprintf("Failed to invalidate stale image recovery archive: %v", archiveErr))
-			return
-		}
 	}
 
 	// The install is committed from here: discard the old bundled tree backup.

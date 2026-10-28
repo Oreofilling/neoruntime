@@ -140,3 +140,24 @@ func TestSavedImageDigestsSidecar(t *testing.T) {
 		t.Fatal("corrupt sidecar must read as unproven")
 	}
 }
+
+func TestPublishSavedImageDigestsRemovesStaleBindingOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.tar.digests.json")
+	if err := writeSavedImageDigestsAt(path, map[string]string{"docker.io/acme/main:2": "sha256:aaaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	// Force the same-dir temporary write to fail for any user, including
+	// root: opening a directory for writing fails with EISDIR.
+	if err := os.Mkdir(path+".tmp", 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishSavedImageDigestsAt(path, map[string]string{"docker.io/acme/main:2": "sha256:bbbbbbbb"}); err == nil {
+		t.Fatal("publish unexpectedly succeeded against a blocking temporary path")
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatal("failed publish must remove the stale binding instead of leaving it beside the new archive")
+	}
+	if _, ok := readSavedImageDigestsAt(path); ok {
+		t.Fatal("stale sidecar must read as unproven after a failed publish")
+	}
+}
