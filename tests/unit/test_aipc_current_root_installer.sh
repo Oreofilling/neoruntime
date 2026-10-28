@@ -47,10 +47,12 @@ printf '#!/bin/sh\nexit 0\n' >"$DATA/libexec/aipc-os-updater"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-configure-platform-api-gateway.py"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-install-current-root.sh"
 printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-firstboot.sh"
+printf '#!/bin/sh\nexit 0\n' >"$DATA/scripts/aipc-time-save.sh"
 chmod 0755 "$DATA/bin/platform-api" "$DATA/bin/camera-daemon" \
     "$DATA/libexec/aipc-restore" "$DATA/libexec/aipc-os-updater" \
     "$DATA/scripts/aipc-configure-platform-api-gateway.py" \
-    "$DATA/scripts/aipc-install-current-root.sh" "$DATA/scripts/aipc-firstboot.sh"
+    "$DATA/scripts/aipc-install-current-root.sh" "$DATA/scripts/aipc-firstboot.sh" \
+    "$DATA/scripts/aipc-time-save.sh"
 printf 'listen: 8443\n' >"$DATA/etc/platform-api.yaml"
 printf 'driver: test\n' >"$DATA/etc/camera-daemon.yaml"
 printf '[Unit]\nDescription=Test\n' >"$DATA/systemd/aipc-platform.target"
@@ -77,25 +79,38 @@ cmp "$DATA/etc/security/seccomp-default.json" "$ROOTFS/etc/aipc/seccomp-default.
 grep -qx "$DATA/lib/hal" "$ROOTFS/etc/ld.so.conf.d/aipc.conf"
 
 # Runtime state under etc/ is rewritten in place at runtime (periodic
-# last-known-time snapshot, time user config, OSD logo, TLS certs, plus
-# tmp+rename siblings). A crash mid-write can leave any of them zero bytes;
-# the every-boot current-root rebuild must tolerate that instead of
-# bricking the device.
-mkdir -p "$DATA/etc/ssl"
+# last-known-time snapshot, time user config, OSD logo, plus tmp+rename
+# siblings). A crash mid-write can leave any of them zero bytes; the
+# every-boot current-root rebuild must tolerate that instead of bricking the
+# device. TLS credentials are security-critical release inputs and remain
+# subject to the non-empty check.
 : >"$DATA/etc/last-known-time.json"
 : >"$DATA/etc/last-known-time.json.tmp"
 : >"$DATA/etc/time-config.json"
 : >"$DATA/etc/osd-logo.conf"
-: >"$DATA/etc/ssl/server.key"
 AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" "$INSTALLER" \
     >"$TMP/runtime-state.out" 2>&1 || {
     echo "installer aborted on zero-byte runtime-state files:" >&2
     cat "$TMP/runtime-state.out" >&2
     exit 1
 }
-rm -rf "$DATA/etc/ssl"
 rm -f "$DATA/etc/last-known-time.json" "$DATA/etc/last-known-time.json.tmp" \
     "$DATA/etc/time-config.json" "$DATA/etc/osd-logo.conf"
+
+mkdir -p "$DATA/etc/ssl"
+: >"$DATA/etc/ssl/server.key"
+if AIPC_INSTALL_ROOT="$DATA" AIPC_ROOTFS_PREFIX="$ROOTFS" \
+    "$INSTALLER" >"$TMP/empty-tls.out" 2>&1; then
+    echo "installer accepted an empty TLS credential" >&2
+    exit 1
+fi
+grep -q "empty immutable release file: $DATA/etc/ssl/server.key" \
+    "$TMP/empty-tls.out" || {
+    echo "empty TLS credential rejection mismatch:" >&2
+    cat "$TMP/empty-tls.out" >&2
+    exit 1
+}
+rm -rf "$DATA/etc/ssl"
 
 # A genuinely truncated release file under etc/ must stay fatal.
 : >"$DATA/etc/swagger.yaml"

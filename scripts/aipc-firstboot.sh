@@ -573,6 +573,63 @@ else
     info "Systemd log level already info"
 fi
 
+# Persist login records (wtmp/lastlog) across reboots and rootfs reflashes —
+# BEFORE the serial getty below is enabled. /var/log is tmpfs on this BSP:
+# every reboot wipes the login audit trail, and every OS reflash loses it
+# entirely — the 2026-10-21 incident forensics hit exactly this (wtmp began
+# at the reflash, all earlier logins unrecoverable). Mirrors the journal bind
+# pattern: keep the files on /data and bind-mount them onto /var/log.
+# Ordering matters: this script may spend minutes migrating the containerd
+# store (step 6b) after the getty is up, and logins landing on the volatile
+# files during that window would be hidden by the bind mount.
+for ut_file in wtmp lastlog; do
+    ut_src="/data/aipc-data/log/${ut_file}"
+    ut_dst="/var/log/${ut_file}"
+    mkdir -p /data/aipc-data/log 2>/dev/null || true
+    # Seed the persistent copy from the current boot's file if it exists.
+    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
+        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
+    elif [[ -f "$ut_src" ]] && [[ -f "$ut_dst" ]] && [[ -s "$ut_dst" ]] && [[ ! "$ut_dst" -ef "$ut_src" ]]; then
+        # Records already written this boot (utmp boot/runlevel entries or a
+        # pre-firstboot console login) would be hidden by the bind mount.
+        # wtmp is an append-only record stream, so splicing this boot's tail
+        # onto the persistent copy preserves them; this service is a oneshot
+        # with RemainAfterExit, so the merge runs at most once per boot.
+        # lastlog is a sparse UID-indexed table that cannot be merged — the
+        # persistent copy wins and this boot's lastlog entries are dropped.
+        # The -ef guard skips the merge on every boot after /etc/fstab has
+        # the bind entry: this service runs After=local-fs.target, so by
+        # then ut_dst is the bind-mounted ut_src (same inode). BusyBox cat
+        # lacks GNU cat's same-file rejection, so appending the file to
+        # itself never reaches EOF, fills /data, and blocks every After=
+        # service forever under TimeoutStartSec=0.
+        if [[ "$ut_file" == "wtmp" ]]; then
+            cat "$ut_dst" >>"$ut_src" 2>/dev/null || true
+        fi
+    fi
+    if [[ ! -f "$ut_src" ]]; then
+        : >"$ut_src" 2>/dev/null || true
+        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
+        chmod 664 "$ut_src" 2>/dev/null || true
+    fi
+    # A file bind mount requires the destination file to exist. /var/log is
+    # volatile on the BSP, so fresh boots may have neither wtmp nor lastlog.
+    if [[ ! -e "$ut_dst" ]]; then
+        : >"$ut_dst" 2>/dev/null || true
+        chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
+        chmod 664 "$ut_dst" 2>/dev/null || true
+    fi
+    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
+        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
+            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
+    fi
+    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
+        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
+            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
+    fi
+done
+log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
+
 # Ensure serial-getty is running on the kernel console device
 # (console=ttySX on kernel cmdline). systemd-getty-generator usually handles
 # this, but some BSPs ship with it masked or targeting the wrong device.
@@ -631,7 +688,7 @@ containerd_config_root() {
 }
 
 containerd_set_config_value() {
-    local key="$1" value="$2" config="/etc/containerd/config.toml" tmp
+    local config="$1" key="$2" value="$3" tmp
 
     if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$config" 2>/dev/null; then
         sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$config"
@@ -648,7 +705,7 @@ containerd_set_config_value() {
 }
 
 containerd_set_config_version() {
-    local config="/etc/containerd/config.toml" tmp
+    local config="$1" tmp
 
     if grep -q '^[[:space:]]*version[[:space:]]*=' "$config" 2>/dev/null; then
         sed -i -E 's|^[[:space:]]*version[[:space:]]*=.*|version = 2|' "$config"
@@ -664,14 +721,63 @@ containerd_set_config_version() {
     rm -f "$tmp"
 }
 
+containerd_commit_config() {
+    local target="$1" config="${2:-/etc/containerd/config.toml}" tmp
+
+    mkdir -p "$(dirname "$config")" 2>/dev/null || return 1
+    tmp="$(mktemp "${config}.tmp.XXXXXX")" || return 1
+    if [[ -f "$config" ]]; then
+        cp -a "$config" "$tmp" 2>/dev/null || {
+            rm -f "$tmp"
+            return 1
+        }
+    else
+        : >"$tmp"
+        chmod 0644 "$tmp" 2>/dev/null || true
+    fi
+
+    if ! containerd_set_config_value "$tmp" root "$target" ||
+       ! containerd_set_config_value "$tmp" state "/run/containerd" ||
+       ! containerd_set_config_version "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # This rename is the migration commit point. Before it, containerd still
+    # uses the untouched source. After it, containerd uses the fully published
+    # persistent destination even if firstboot is killed a moment later.
+    mv -f "$tmp" "$config"
+}
+
+recover_pending_containerd_migration() {
+    local destination="$1" configured_root="$2"
+    local marker="${destination}.migration-pending"
+
+    [[ -e "$marker" ]] || return 0
+    if [[ "$configured_root" == "$destination" ]]; then
+        # The atomic config rename committed before firstboot was interrupted.
+        rm -f "$marker" 2>/dev/null || true
+        log "Recovered committed containerd migration to $destination"
+        return 0
+    fi
+
+    # The destination was published but config still points at the source.
+    # containerd may have written newer metadata there after an interruption,
+    # so the staged snapshot is no longer authoritative. Discard and reseed it.
+    warn "Discarding uncommitted containerd seed at $destination"
+    rm -rf "$destination" "$(dirname "$destination")"/.containerd-migrate.* 2>/dev/null || true
+    mkdir -p "$destination" 2>/dev/null || return 1
+}
+
 migrate_containerd_root() {
-    local source="$1" destination="$2" link_target destination_has_data=0
-    local stage_parent stage_dir copy_src=""
+    local source="$1" destination="$2" configured_root="${3:-}"
+    local link_target destination_has_data=0
+    local stage_parent stage_dir copy_src="" marker legacy_keep
 
     [[ -n "$source" && "$source" != "$destination" ]] || return 0
     mkdir -p "$destination" 2>/dev/null || {
         warn "Failed to create containerd root $destination"
-        return 0
+        return 1
     }
 
     # The destination lives on persistent /data and is authoritative once it
@@ -696,45 +802,97 @@ migrate_containerd_root() {
         copy_src="$source"
     elif [[ -e "$source" ]]; then
         warn "Cannot migrate containerd root because it is not a directory: $source"
-        return 0
+        return 1
+    fi
+
+    # Triage an unmarked nonempty destination. Neither the migration marker
+    # nor the config names it, so it is either (a) the persistent root of a
+    # device that reflashed its rootfs — config reset to the stock
+    # /var/lib/containerd — where it must stay authoritative, or (b) the
+    # partial leftover of a pre-staging firstboot (direct cp -a under a
+    # 180s deadline) killed mid-copy, with the complete source untouched.
+    # The tell is the source: a fresh rootfs store holds no image content,
+    # so real blobs under the source mean the destination is suspect. Move
+    # it aside — never delete — and reseed from the complete source; if the
+    # heuristic ever misfires (fresh store that pulled before firstboot),
+    # the moved copy survives and images re-import from saved archives.
+    #
+    # A destination carrying the pending marker is exempt from this triage:
+    # recovery runs before the migration passes and consumes any stale
+    # marker, so one present here was written moments ago by an earlier
+    # pass in this same configure run. configure_containerd_root invokes
+    # this helper twice with the same default source, and triaging the
+    # just-published store aside would re-copy multi-GB of content and
+    # could exhaust /data.
+    marker="${destination}.migration-pending"
+    if [[ $destination_has_data -eq 1 && "$configured_root" != "$destination" && -n "$copy_src" && ! -e "$marker" ]] && \
+       find "$copy_src/io.containerd.content.v1.content" -type f -print -quit 2>/dev/null | grep -q .; then
+        legacy_keep="${destination}.legacy-partial.$(date +%s)"
+        if mv "$destination" "$legacy_keep" 2>/dev/null && mkdir -p "$destination" 2>/dev/null; then
+            warn "Moved unmarked partial containerd state aside: $legacy_keep"
+            destination_has_data=0
+        else
+            warn "Cannot move unmarked partial containerd state at $destination; preserving it"
+        fi
     fi
 
     if [[ $destination_has_data -eq 1 ]]; then
         log "Preserving existing containerd state in $destination; ignoring $source"
     elif [[ -n "$copy_src" ]]; then
-        # Crash-safe seeding. firstboot runs under TimeoutStartSec, so a
-        # large image store can legitimately be killed mid-copy; a partial
-        # destination would then be treated as authoritative state on the
-        # next boot while the complete source gets deleted. Copy into a
-        # staging sibling and publish with a single rename instead. Staging
-        # left behind by an interrupted attempt is partial by definition —
-        # always discard it.
+        # Crash-safe seeding. Even without a fixed systemd startup deadline,
+        # power loss can interrupt a large copy. A partial destination would
+        # then be treated as authoritative state on the next boot while the
+        # complete source gets deleted. Copy into a staging sibling and
+        # publish with a single rename instead. Staging left behind by an
+        # interrupted attempt is partial by definition — always discard it.
         stage_parent="$(dirname "$destination")"
         rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true
         stage_dir="${stage_parent}/.containerd-migrate.$$"
         if mkdir -p "$stage_dir" 2>/dev/null && \
            cp -a "$copy_src"/. "$stage_dir"/ 2>/dev/null && \
+           : >"$marker" && \
            rmdir "$destination" 2>/dev/null && \
            mv "$stage_dir" "$destination" 2>/dev/null; then
             log "Seeded containerd root $destination from $copy_src (staged + atomic rename)"
         else
             rm -rf "$stage_dir" 2>/dev/null || true
             mkdir -p "$destination" 2>/dev/null || true
+            rm -f "$marker" 2>/dev/null || true
             warn "containerd seed copy did not complete; keeping source $copy_src intact"
-            return 0
+            return 1
         fi
     fi
+}
 
-    # Only now — the destination either already held authoritative state or
-    # was fully seeded — is it safe to drop the replaceable source.
-    if [[ -L "$source" ]]; then
-        rm -f "$source" 2>/dev/null || true
-    else
-        rm -rf "$source" 2>/dev/null || warn "Failed to remove old containerd root $source"
+ensure_containerd_varlib_link() {
+    local target="$1" source="${2:-/var/lib/containerd}"
+    local backup="$(dirname "$source")/.containerd.aipc-migration-backup"
+    local resolved
+
+    resolved="$(readlink -f "$source" 2>/dev/null || true)"
+    if [[ -L "$source" && "$resolved" == "$target" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
+        return 0
     fi
 
-    mkdir -p "$(dirname "$source")" 2>/dev/null || true
-    ln -s "$destination" "$source" 2>/dev/null || true
+    # Config already points directly at $target, so moving the compatibility
+    # path cannot make containerd use an incomplete tree. Keep a same-filesystem
+    # backup until the symlink exists; every interruption point is recoverable.
+    if [[ -e "$source" || -L "$source" ]]; then
+        rm -rf "$backup" 2>/dev/null || true
+        if [[ -L "$source" ]]; then
+            rm -f "$source" 2>/dev/null || return 1
+        else
+            mv "$source" "$backup" 2>/dev/null || return 1
+        fi
+    fi
+    mkdir -p "$(dirname "$source")" 2>/dev/null || return 1
+    if ! ln -s "$target" "$source" 2>/dev/null; then
+        [[ -e "$source" || -L "$source" || ! -e "$backup" ]] || \
+            mv "$backup" "$source" 2>/dev/null || true
+        return 1
+    fi
+    rm -rf "$backup" 2>/dev/null || true
 }
 
 configure_containerd_root() {
@@ -745,6 +903,7 @@ configure_containerd_root() {
     local restart_containerd=0
     local restart_app_manager=0
     local restart_ai_runtime=0
+    local stop_state stop_confirmed
 
     mkdir -p "$target" 2>/dev/null || {
         warn "Failed to prepare containerd root $target"
@@ -753,6 +912,10 @@ configure_containerd_root() {
 
     current_root="$(containerd_config_root)"
     [[ -n "$current_root" ]] || current_root="/var/lib/containerd"
+    recover_pending_containerd_migration "$target" "$current_root" || {
+        warn "Failed to recover interrupted containerd migration"
+        return 0
+    }
     varlib_target="$(readlink -f /var/lib/containerd 2>/dev/null || true)"
 
     [[ -f "$config" && "$current_root" == "$target" ]] || needs_fix=1
@@ -773,21 +936,58 @@ configure_containerd_root() {
         systemctl stop app-manager ai-runtime containerd 2>/dev/null || true
     fi
 
-    migrate_containerd_root "$current_root" "$target"
-    migrate_containerd_root "/var/lib/containerd" "$target"
-
-    mkdir -p /etc/containerd 2>/dev/null || true
-    if [[ ! -f "$config" ]]; then
-        cat >"$config" <<EOF
-root = "$target"
-state = "/run/containerd"
-version = 2
-EOF
-    else
-        containerd_set_config_value root "$target"
-        containerd_set_config_value state "/run/containerd"
-        containerd_set_config_version
+    # Confirm the daemon is actually down before touching the store — and
+    # confirm even when the probe above reported inactive, because the
+    # bounded-systemctl wrapper turns a hung probe into a 124 that reads as
+    # "not active", and a stop timeout swallowed by || true does not mean
+    # the stop job finished. Only an explicit terminal state counts as
+    # stopped; an empty or unrecognized probe result means the wrapper
+    # killed the probe, so the loop stops right there instead of paying the
+    # 60-second bound once per iteration. Migrating a store the daemon is
+    # still writing corrupts it, so on timeout keep the source
+    # authoritative and retry on the next boot instead.
+    stop_confirmed=0
+    for _ in $(seq 1 30); do
+        stop_state="$(systemctl is-active containerd 2>/dev/null || true)"
+        case "$stop_state" in
+            inactive|failed|unknown) stop_confirmed=1; break ;;
+            active|reloading|activating|deactivating) sleep 1 ;;
+            *) break ;;
+        esac
+    done
+    if [[ $stop_confirmed -ne 1 ]]; then
+        warn "containerd still active after stop (state: ${stop_state:-unresponsive}); refusing to migrate its store"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
     fi
+
+    if ! migrate_containerd_root "$current_root" "$target" "$current_root" ||
+       ! migrate_containerd_root "/var/lib/containerd" "$target" "$current_root"; then
+        warn "Failed to seed containerd root; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    if ! containerd_commit_config "$target"; then
+        warn "Failed to commit containerd config; source remains authoritative"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
+    fi
+    rm -f "${target}.migration-pending" 2>/dev/null || true
+    ensure_containerd_varlib_link "$target" || \
+        warn "Failed to link /var/lib/containerd to $target (config is already committed)"
 
     log "containerd root ready: $target"
 
@@ -945,36 +1145,6 @@ if findmnt --mountpoint "$JOURNAL_DST" >/dev/null 2>&1; then
 else
     warn "Journal bind not active — persistent journal unavailable this boot"
 fi
-
-# 6c.3 Persist login records (wtmp/lastlog) across reboots and rootfs
-#     reflashes. /var/log is tmpfs on this BSP: every reboot wipes the login
-#     audit trail, and every OS reflash loses it entirely — the 2026-10-21
-#     incident forensics hit exactly this (wtmp began at the reflash, all
-#     earlier logins unrecoverable). Mirrors the journal bind pattern: keep
-#     the files on /data and bind-mount them onto /var/log.
-for ut_file in wtmp lastlog; do
-    ut_src="/data/aipc-data/log/${ut_file}"
-    ut_dst="/var/log/${ut_file}"
-    mkdir -p /data/aipc-data/log 2>/dev/null || true
-    # Seed the persistent copy from the current boot's file if it exists.
-    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
-        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
-    fi
-    if [[ ! -f "$ut_src" ]]; then
-        : >"$ut_src" 2>/dev/null || true
-        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
-        chmod 664 "$ut_src" 2>/dev/null || true
-    fi
-    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
-        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
-            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
-    fi
-    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
-        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
-            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
-    fi
-done
-log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
 
 # Runtime service lifecycle (including aipc-healthmon) belongs exclusively to
 # aipc-autostart and aipc-cli. Enabling a unit here would silently undo

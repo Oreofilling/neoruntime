@@ -79,18 +79,19 @@ validate_release_root() {
         "$DATA_ROOT/libexec/aipc-os-updater" \
         "$DATA_ROOT/scripts/aipc-configure-platform-api-gateway.py" \
         "$DATA_ROOT/scripts/aipc-install-current-root.sh" \
-        "$DATA_ROOT/scripts/aipc-firstboot.sh"; do
+        "$DATA_ROOT/scripts/aipc-firstboot.sh" \
+        "$DATA_ROOT/scripts/aipc-time-save.sh"; do
         require_executable "$file"
     done
     # etc/ also holds runtime state that the platform rewrites in place
-    # (periodic last-known-time snapshot, time user config, OSD logo, TLS
-    # certs, plus the tmp+rename siblings of those writes). A crash
-    # mid-write can leave any of them zero bytes; their consumers tolerate
+    # (periodic last-known-time snapshot, time user config, OSD logo, plus
+    # the tmp+rename siblings of those writes). A crash mid-write can leave
+    # any of them zero bytes; their consumers tolerate
     # empty or missing content, so they must not fail release validation.
     while IFS= read -r empty; do
         case "$empty" in
             */etc/last-known-time.json*|*/etc/time-config.json*|\
-            */etc/osd-logo.conf|*/etc/ssl/*)
+            */etc/osd-logo.conf)
                 continue ;;
         esac
         fail "empty immutable release file: $empty"

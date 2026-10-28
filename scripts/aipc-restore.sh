@@ -57,7 +57,7 @@ validate_restored_release() {
         case "$empty" in
             /data/aipc/etc/last-known-time.json*|\
             /data/aipc/etc/time-config.json*|\
-            /data/aipc/etc/osd-logo.conf|/data/aipc/etc/ssl/*)
+            /data/aipc/etc/osd-logo.conf)
                 continue ;;
         esac
         fail "empty immutable restored file: $empty"
@@ -66,6 +66,17 @@ validate_restored_release() {
         /data/aipc/scripts /data/aipc/share /data/aipc/swagger-ui \
         /data/aipc/systemd /data/aipc/web \
         -type f -size 0 -print 2>/dev/null)
+    # The shutdown time saver arrived with the v1.2.0 runtime. An OS A/B
+    # upgrade can boot against an older independently deployed runtime whose
+    # /data tree never shipped this script; failing validation here would
+    # roll back an otherwise healthy OS upgrade. aipc-time-save.service
+    # already carries ConditionPathExists for the same reason, and the
+    # deployment-time validators (deploy.sh, install.sh,
+    # aipc-install-current-root.sh) still hard-require it whenever a full
+    # runtime tree is installed.
+    if [[ ! -x /data/aipc/scripts/aipc-time-save.sh ]]; then
+        log "WARN: RESTORE_LEGACY_LAYOUT: /data/aipc/scripts/aipc-time-save.sh missing (runtime predates the shutdown time saver)"
+    fi
 }
 
 json_string() {

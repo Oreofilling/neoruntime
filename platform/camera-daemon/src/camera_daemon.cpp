@@ -507,7 +507,9 @@ bool CameraDaemon::init(const DaemonConfig& config) {
                          persisted.auto_exposure() ? 1 : 0,
                          persisted.noise_reduction(), persisted.wdr_value(),
                          persisted.powerline_freq(), persisted.awb_index());
-            update_isp_settings(persisted);
+            // force_apply: the persisted snapshot typically equals the boot
+            // cache, and hardware here still carries profile defaults.
+            update_isp_settings(persisted, /*force_apply=*/true);
         }
     }
 #endif
@@ -866,6 +868,7 @@ void CameraDaemon::init_isp_cache() {
     if (isp_ops && ctx && isp_ops->get_current_image_config) {
         if (isp_ops->get_current_image_config(ctx, &cached_isp_state_) >= 0) {
             isp_state_initialized_ = true;
+            isp_cache_synthetic_ = false;
             HAL_LOG_INFO("CameraDaemon: ISP cache initialized from HAL");
             return;
         }
@@ -887,10 +890,57 @@ void CameraDaemon::init_isp_cache() {
     cached_isp_state_.exposure_config.exposure_time_us = 0;
     cached_isp_state_.exposure_config.gain = 0;
     isp_state_initialized_ = true;
-    HAL_LOG_INFO("CameraDaemon: ISP cache initialized with defaults");
+    // Fallback defaults are guesses, not hardware state: equality against
+    // this cache must not skip HAL writes (see update_isp_settings dedup).
+    isp_cache_synthetic_ = true;
+    HAL_LOG_INFO("CameraDaemon: ISP cache initialized with synthetic defaults (HAL read unavailable)");
 }
 
-bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& request) {
+// --- ISP update same-value dedup -------------------------------------------
+// Every HAL set call is heavyweight: full V4L2 control writes, a medialib
+// auto-algorithm-block re-application, and a config persist to disk. The web
+// form is a single-field PUT behind a 300ms debounce, so repeated saves and
+// panel re-entries re-send values that are already applied; under load those
+// stacked no-op sets were enough to blow the 10s gRPC deadline. Each group
+// below is skipped entirely when every explicitly-requested (has_xxx) field
+// equals the cached applied state.
+static bool isp_manual_group_changed(const aipc::camera::ISPUpdateRequest& request,
+                                     const HalIspManualConfig& cur) {
+    if (request.has_manual_mode() && request.manual_mode() != cur.manual_state) return true;
+    if (request.has_brightness()  && request.brightness()  != cur.brightness)   return true;
+    if (request.has_contrast()    && request.contrast()    != cur.contrast)     return true;
+    if (request.has_saturation()  && request.saturation()  != cur.saturation)   return true;
+    if (request.has_sharpness()   && request.sharpness()   != cur.sharpness)    return true;
+    return false;
+}
+
+static bool isp_exposure_group_changed(const aipc::camera::ISPUpdateRequest& request,
+                                       const HalIspExposureConfig& cur) {
+    if (request.has_auto_exposure()    && request.auto_exposure()    != cur.auto_exposure)    return true;
+    if (request.has_backlight()        && request.backlight()        != cur.backlight)        return true;
+    if (request.has_exposure_time_us() && request.exposure_time_us() != cur.exposure_time_us) return true;
+    if (request.has_gain()             && request.gain()             != cur.gain)             return true;
+    return false;
+}
+
+static bool isp_image_group_changed(const aipc::camera::ISPUpdateRequest& request,
+                                    const HalIspImageConfig& cur) {
+    if (request.has_noise_reduction() && request.noise_reduction() != cur.noise_reduction) return true;
+    if (request.has_wdr_value()       && request.wdr_value()       != cur.wdr_value)       return true;
+    if (request.has_powerline_freq()  && static_cast<HalIspPowerFreq>(request.powerline_freq()) != cur.pwr_freq) return true;
+    if (request.has_awb_index()       && request.awb_index()       != cur.awb_idx)         return true;
+    return false;
+}
+
+bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& request,
+                                       bool force_apply) {
+    // gRPC sync handlers run on the default thread pool, so concurrent ISP
+    // PUTs (web double-fire, ONVIF racing the web) enter here in parallel.
+    // Serialize the whole compare-apply-persist sequence: without this, a
+    // request arriving while another blocks inside set_*_config would dedup
+    // against a not-yet-updated cache and silently drop the newer value.
+    std::lock_guard<std::mutex> isp_guard(isp_update_mu_);
+
     auto* isp_ops = hal_loader_ ? hal_loader_->isp() : nullptr;
     if (!isp_ops) {
         HAL_LOG_WARNING("CameraDaemon: ISP ops not available");
@@ -908,8 +958,12 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
 
     // Apply manual tuning — use has_xxx() to detect explicitly-set fields
     // This correctly handles value=0 (e.g., brightness=0) as a valid setting
-    if (request.has_manual_mode() || request.has_brightness() || request.has_contrast()
-        || request.has_saturation() || request.has_sharpness()) {
+    const bool manual_requested = request.has_manual_mode() || request.has_brightness()
+        || request.has_contrast() || request.has_saturation() || request.has_sharpness();
+    const bool manual_changed = manual_requested
+        && (force_apply || isp_cache_synthetic_
+            || isp_manual_group_changed(request, cached_isp_state_.manual_config));
+    if (manual_changed) {
         HalIspManualConfig mc = cached_isp_state_.manual_config;
         if (request.has_manual_mode())  mc.manual_state = request.manual_mode();
         if (request.has_brightness())    mc.brightness   = request.brightness();
@@ -924,11 +978,17 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
         cached_isp_state_.manual_config = mc;
         HAL_LOG_INFO("CameraDaemon: Manual config applied: mode=%d B=%d C=%d S=%d Sh=%d",
                      mc.manual_state, mc.brightness, mc.contrast, mc.saturation, mc.sharpness);
+    } else if (manual_requested) {
+        HAL_LOG_INFO("CameraDaemon: Manual config no-op (requested values already applied), skipping HAL");
     }
 
     // Apply exposure config
-    if (request.has_auto_exposure() || request.has_backlight()
-        || request.has_exposure_time_us() || request.has_gain()) {
+    const bool exposure_requested = request.has_auto_exposure() || request.has_backlight()
+        || request.has_exposure_time_us() || request.has_gain();
+    const bool exposure_changed = exposure_requested
+        && (force_apply || isp_cache_synthetic_
+            || isp_exposure_group_changed(request, cached_isp_state_.exposure_config));
+    if (exposure_changed) {
         HalIspExposureConfig ec = cached_isp_state_.exposure_config;
         if (request.has_auto_exposure())    ec.auto_exposure   = request.auto_exposure();
         if (request.has_backlight())        ec.backlight       = request.backlight();
@@ -942,11 +1002,17 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
         cached_isp_state_.exposure_config = ec;
         HAL_LOG_INFO("CameraDaemon: Exposure config applied: AE=%d BL=%d ET=%d G=%d",
                      ec.auto_exposure, ec.backlight, ec.exposure_time_us, ec.gain);
+    } else if (exposure_requested) {
+        HAL_LOG_INFO("CameraDaemon: Exposure config no-op (requested values already applied), skipping HAL");
     }
 
     // Apply full image config (noise reduction, WDR, powerline freq, AWB)
-    if (request.has_noise_reduction() || request.has_wdr_value()
-        || request.has_powerline_freq() || request.has_awb_index()) {
+    const bool image_requested = request.has_noise_reduction() || request.has_wdr_value()
+        || request.has_powerline_freq() || request.has_awb_index();
+    const bool image_changed = image_requested
+        && (force_apply || isp_cache_synthetic_
+            || isp_image_group_changed(request, cached_isp_state_));
+    if (image_changed) {
         HalIspImageConfig ic = cached_isp_state_;
         if (request.has_noise_reduction()) ic.noise_reduction = request.noise_reduction();
         if (request.has_wdr_value())       ic.wdr_value       = request.wdr_value();
@@ -964,7 +1030,29 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
         HAL_LOG_INFO("CameraDaemon: Image config applied: NR=%d WDR=%d PF=%d AWB=%d",
                      cached_isp_state_.noise_reduction, cached_isp_state_.wdr_value,
                      (int)cached_isp_state_.pwr_freq, cached_isp_state_.awb_idx);
+    } else if (image_requested) {
+        HAL_LOG_INFO("CameraDaemon: Image config no-op (requested values already applied), skipping HAL");
     }
+
+    // Pure no-op request: every requested value already matches the applied
+    // state — nothing was sent to HAL, so there is nothing new to apply.
+    // Never taken on force_apply replays: those re-push onto rebuilt hardware
+    // regardless of cache equality. A dirty persist mirror still gets retried
+    // here: the in-memory state is unchanged, but the file is stale.
+    if (!force_apply && !manual_changed && !exposure_changed && !image_changed) {
+        HAL_LOG_INFO("CameraDaemon: ISP update no-op (all requested values already applied)");
+#ifdef HAS_GRPC
+        if (isp_persist_dirty_ && persist_isp_config()) {
+            isp_persist_dirty_ = false;
+            HAL_LOG_INFO("CameraDaemon: ISP mirror retry succeeded");
+        }
+#endif
+        return true;
+    }
+
+    // At least one group wrote through to HAL: the cache now mirrors real
+    // hardware state, so future same-value comparisons are meaningful.
+    isp_cache_synthetic_ = false;
 
     // Persist the full ISP snapshot (cached_isp_state_ as updated above) so the
     // web-tuned values survive restart/deploy/OS-upgrade. Best-effort: a failure
@@ -973,7 +1061,7 @@ bool CameraDaemon::update_isp_settings(const aipc::camera::ISPUpdateRequest& req
     // headers) live under HAS_GRPC, so the call is guarded to match (same pattern
     // as persist_privacy_mask_config / persist_transform_config).
 #ifdef HAS_GRPC
-    persist_isp_config();
+    isp_persist_dirty_ = !persist_isp_config();
 #endif
     return true;
 }
@@ -3194,7 +3282,9 @@ bool CameraDaemon::reapply_isp_config_after_pipeline_rebuild(const char* reason)
         return true;
     }
 
-    if (!update_isp_settings(persisted)) {
+    // force_apply: the rebuild reloaded profile defaults into the ISP while
+    // the cache (and this persisted snapshot) still hold the web-tuned values.
+    if (!update_isp_settings(persisted, /*force_apply=*/true)) {
         HAL_LOG_WARNING("CameraDaemon: ISP replay after %s failed",
                         reason ? reason : "pipeline rebuild");
         return false;
@@ -3601,7 +3691,11 @@ void CameraDaemon::build_isp_request_from_cache(aipc::camera::ISPUpdateRequest* 
 // Persist the full ISP snapshot (cached_isp_state_) atomically (tmp + rename).
 // Best-effort: a failure logs but never alters the (already-applied) update
 // result. Called from update_isp_settings after a successful HAL write.
-void CameraDaemon::persist_isp_config() {
+// Returns true when the mirror file now matches cached_isp_state_. A false
+// return never fails the in-memory/RPC result (values are already applied),
+// but the caller records it (isp_persist_dirty_) so later no-op updates
+// retry instead of leaving the mirror stale until the next real change.
+bool CameraDaemon::persist_isp_config() {
     aipc::camera::ISPUpdateRequest req;
     build_isp_request_from_cache(&req);
 
@@ -3613,7 +3707,7 @@ void CameraDaemon::persist_isp_config() {
     if (!st.ok()) {
         HAL_LOG_ERROR("CameraDaemon: persist isp: serialize failed: %s",
                       std::string(st.message()).c_str());
-        return;
+        return false;
     }
 
     const std::string tmp = std::string(kIspConfigPath) + ".tmp";
@@ -3621,14 +3715,14 @@ void CameraDaemon::persist_isp_config() {
         std::ofstream out(tmp, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
             HAL_LOG_ERROR("CameraDaemon: persist isp: open(%s) failed", tmp.c_str());
-            return;
+            return false;
         }
         out << json;
         out.flush();
         if (!out.good()) {
             HAL_LOG_ERROR("CameraDaemon: persist isp: write(%s) failed", tmp.c_str());
             ::unlink(tmp.c_str());
-            return;
+            return false;
         }
     }  // ofstream flushed + closed here
 
@@ -3636,8 +3730,9 @@ void CameraDaemon::persist_isp_config() {
         HAL_LOG_ERROR("CameraDaemon: persist isp: rename(%s -> %s) failed",
                       tmp.c_str(), kIspConfigPath);
         ::unlink(tmp.c_str());
-        return;
+        return false;
     }
+    return true;
 }
 
 // Read the ISP snapshot at startup. Returns false on missing file (first boot /

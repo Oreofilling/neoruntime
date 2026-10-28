@@ -514,6 +514,12 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	var oldWebURL string
 	var oldRestartCount int
 	var oldInstalledAt time.Time
+	var savedImageSource string
+	var stagedImageArchive string
+	var discardSavedImageArchive bool
+	var oldImageRefs []string
+	var oldImageRefsKnown bool
+	defer func() { containerd.DiscardStagedImageTar(stagedImageArchive) }()
 
 	if s.registry.Exists(appID) {
 		if !req.Force {
@@ -533,6 +539,11 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		oldRestartCount = existingApp.RestartCount
 		oldInstalledAt = existingApp.InstalledAt
 		isUpdate = true
+		oldImageRefs, err = installedImageReferences(existingApp)
+		oldImageRefsKnown = err == nil
+		if err != nil {
+			logger.Warn("Cannot verify saved archive binding for app %s: %v", appID, err)
+		}
 
 		logger.Info("Preparing update of existing app %s (was running=%v)", appID, wasRunning)
 	}
@@ -576,6 +587,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 				}, nil
 			}
 			logger.Info("Image pulled successfully: %s", req.ImagePath)
+			discardSavedImageArchive = true
 
 			// IMPORTANT: After pulling, override the manifest's image to match
 			// the normalized reference that containerd stores. This ensures
@@ -586,6 +598,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		} else {
 			// Import from local tar file
 			logger.Info("Importing image from local file: %s", req.ImagePath)
+			stagedImageArchive, err = containerd.StageImageTar(appID, req.ImagePath)
+			if err != nil {
+				return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to stage image recovery archive: %v", err), Code: 500}}, nil
+			}
 			importedName, err := s.client.ImportImage(ctx, req.ImagePath, imageName)
 			if err != nil {
 				logger.Warn("Failed to import image: %v", err)
@@ -599,14 +615,17 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 			}
 			logger.Info("Image imported successfully: %s", importedName)
 
-			// Save tar file for self-healing recovery after power loss
-			if saveErr := containerd.SaveImageTar(appManifest.Metadata.ID, req.ImagePath); saveErr != nil {
-				logger.Warn("Failed to save image tar for recovery: %v", saveErr)
-			}
-
-			// Clean up uploaded tar file after successful import
-			s.cleanupUploadedTar(req.ImagePath)
+			// Publish the recovery archive only when the install transaction
+			// commits; replacing it here would bind a failed update's tar to
+			// the still-installed old app.
+			savedImageSource = req.ImagePath
 		}
+	}
+	archiveBindingProven := oldImageRefsKnown &&
+		sameImageReferences(oldImageRefs, appManifest.ImageReferences()) &&
+		s.savedArchiveDigestsProven(ctx, appID, oldImageRefs)
+	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", archiveBindingProven, oldImageRefs, appManifest.ImageReferences()) {
+		discardSavedImageArchive = true
 	}
 
 	// Prepare every bundled package in a sibling tree. Force updates always run
@@ -617,6 +636,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 	defer func() {
 		if !committed && stoppedExisting && wasRunning {
 			go func() {
+				if stateErr := s.registry.SetState(appID, registry.AppStateStopped); stateErr != nil {
+					logger.Error("Rollback: failed to mark previous app %s stopped before restart: %v", appID, stateErr)
+					return
+				}
 				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: appID}); err != nil || st == nil || !st.Success {
 					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", appID, err, st)
 				}
@@ -742,6 +765,21 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		appInfo.InstalledAt = oldInstalledAt
 	}
 
+	// Invalidate the previous recovery archive BEFORE committing app state,
+	// whenever this install is about to replace or discard it. A crash
+	// between the registry commit below and the archive switch after it
+	// would leave the old tar with its still-matching digest sidecar behind
+	// a registry that already describes new content under the same mutable
+	// reference; after a metadata reset that stale pair verifies as valid
+	// and silently restores the old binary. Removing the binding first
+	// turns every crash window into "no archive", which fails forward to
+	// the registry instead of resurrecting stale content.
+	if stagedImageArchive != "" || discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to invalidate previous image recovery archive: %v", archiveErr), Code: 500}}, nil
+		}
+	}
+
 	// Register or update app
 	if isUpdate {
 		if err := s.registry.Update(appInfo); err != nil {
@@ -775,6 +813,19 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 				Code:    500,
 			},
 		}, nil
+	}
+
+	// Publish the new recovery archive only after app state has committed;
+	// any previous archive was already invalidated above, so a failure here
+	// leaves "no archive" behind a committed app — recovery falls back to
+	// the registry rather than resurrecting stale content.
+	if stagedImageArchive != "" {
+		if archiveErr := containerd.PublishStagedImageTar(appInfo.ID, stagedImageArchive); archiveErr != nil {
+			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr), Code: 500}}, nil
+		}
+		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
+		stagedImageArchive = ""
+		s.cleanupUploadedTar(savedImageSource)
 	}
 
 	// Register plugin capabilities
@@ -938,6 +989,12 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	asyncAppID := appManifest.Metadata.ID
 	var isUpdate, wasRunning bool
 	var oldAppInfo *registry.AppInfo
+	var savedImageSource string
+	var stagedImageArchive string
+	var discardSavedImageArchive bool
+	var oldImageRefs []string
+	var oldImageRefsKnown bool
+	defer func() { containerd.DiscardStagedImageTar(stagedImageArchive) }()
 	if s.registry.Exists(asyncAppID) {
 		if !force {
 			task.Fail(fmt.Sprintf("App %s already exists. Use force=true to overwrite.", asyncAppID))
@@ -946,6 +1003,13 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 		oldAppInfo, _ = s.registry.Get(asyncAppID)
 		isUpdate = oldAppInfo != nil
 		wasRunning = isUpdate && oldAppInfo.State == registry.AppStateRunning
+		if isUpdate {
+			oldImageRefs, err = installedImageReferences(oldAppInfo)
+			oldImageRefsKnown = err == nil
+			if err != nil {
+				logger.Warn("Cannot verify saved archive binding for app %s: %v", asyncAppID, err)
+			}
+		}
 		task.Update("validating", 4, "Preparing existing app replacement...")
 	}
 
@@ -991,10 +1055,16 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 			}
 			normalizedRef := manifest.NormalizeImageName(imagePath)
 			appManifest.Spec.Image = normalizedRef
+			discardSavedImageArchive = true
 			task.Update("pulling", 80, "Image pull complete")
 		} else {
 			// Local file — import (fast)
 			task.Update("pulling", 10, "Importing local image...")
+			stagedImageArchive, err = containerd.StageImageTar(asyncAppID, imagePath)
+			if err != nil {
+				task.Fail(fmt.Sprintf("Failed to stage image recovery archive: %v", err))
+				return
+			}
 			importedName, err := s.client.ImportImage(ctx, imagePath, imageName)
 			if err != nil {
 				task.Fail(fmt.Sprintf("Failed to import image: %v", err))
@@ -1071,13 +1141,8 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 				}
 			}
 
-			// Save tar file for self-healing recovery after power loss
-			if saveErr := containerd.SaveImageTar(appManifest.Metadata.ID, imagePath); saveErr != nil {
-				logger.Warn("Failed to save image tar for recovery: %v", saveErr)
-			}
-
-			// Clean up uploaded tar file after successful import
-			s.cleanupUploadedTar(imagePath)
+			// Publish the recovery archive only at the transaction commit point.
+			savedImageSource = imagePath
 		}
 	} else if s.client != nil && len(imageRefs) > 0 {
 		// No local tar was uploaded. Before proceeding, verify every image
@@ -1098,6 +1163,12 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	} else {
 		task.Update("pulling", 80, "No image to pull")
 	}
+	archiveBindingProven := oldImageRefsKnown &&
+		sameImageReferences(oldImageRefs, appManifest.ImageReferences()) &&
+		s.savedArchiveDigestsProven(ctx, asyncAppID, oldImageRefs)
+	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", archiveBindingProven, oldImageRefs, appManifest.ImageReferences()) {
+		discardSavedImageArchive = true
+	}
 
 	var modelTx *bundledModelTransaction
 	committed := false
@@ -1105,6 +1176,10 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	defer func() {
 		if !committed && stoppedExisting && wasRunning {
 			go func() {
+				if stateErr := s.registry.SetState(asyncAppID, registry.AppStateStopped); stateErr != nil {
+					logger.Error("Rollback: failed to mark previous app %s stopped before restart: %v", asyncAppID, stateErr)
+					return
+				}
 				if st, err := s.StartApp(context.Background(), &proto.StartRequest{AppId: asyncAppID}); err != nil || st == nil || !st.Success {
 					logger.Error("Rollback: failed to restart previous app %s: rpc=%v status=%v", asyncAppID, err, st)
 				}
@@ -1216,6 +1291,22 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 		appInfo.InstalledAt = oldAppInfo.InstalledAt
 	}
 
+	// Invalidate the previous recovery archive BEFORE committing app state,
+	// whenever this install is about to replace or discard it. A crash
+	// between the registry commit below and the archive switch after it
+	// would leave the old tar with its still-matching digest sidecar behind
+	// a registry that already describes new content under the same mutable
+	// reference; after a metadata reset that stale pair verifies as valid
+	// and silently restores the old binary. Removing the binding first
+	// turns every crash window into "no archive", which fails forward to
+	// the registry instead of resurrecting stale content.
+	if stagedImageArchive != "" || discardSavedImageArchive {
+		if archiveErr := containerd.RemoveSavedImageTar(appInfo.ID); archiveErr != nil {
+			task.Fail(fmt.Sprintf("Failed to invalidate previous image recovery archive: %v", archiveErr))
+			return
+		}
+	}
+
 	task.Update("registering", 90, "Saving app registry...")
 	if isUpdate {
 		err = s.registry.Update(appInfo)
@@ -1237,6 +1328,20 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	task.Update("registering", 95, "Registering permissions...")
 	if err := s.registerAppPermissions(ctx, appInfo.ID, appManifest); err != nil {
 		logger.Warn("Failed to register app permissions: %v", err)
+	}
+
+	// Publish the new recovery archive only after app state has committed;
+	// any previous archive was already invalidated above, so a failure here
+	// leaves "no archive" behind a committed app — recovery falls back to
+	// the registry rather than resurrecting stale content.
+	if stagedImageArchive != "" {
+		if archiveErr := containerd.PublishStagedImageTar(appInfo.ID, stagedImageArchive); archiveErr != nil {
+			task.Fail(fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr))
+			return
+		}
+		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
+		stagedImageArchive = ""
+		s.cleanupUploadedTar(savedImageSource)
 	}
 
 	// The install is committed from here: discard the old bundled tree backup.

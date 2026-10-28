@@ -354,14 +354,14 @@ validate_no_empty_immutable_files() {
 
     while IFS= read -r empty; do
         # Runtime state under etc/ (last-known-time snapshot, time user
-        # config, OSD logo, TLS certs, plus tmp+rename siblings) is
-        # rewritten in place by the platform and can be left zero bytes by
-        # a crash; consumers tolerate that, so it is not release
+        # config, OSD logo, plus tmp+rename siblings) is rewritten in place
+        # by the platform and can be left zero bytes by a crash; consumers
+        # tolerate that, so it is not release
         # corruption. Keep in sync with aipc-install-current-root.sh and
         # aipc-restore.sh.
         case "$empty" in
             */etc/last-known-time.json*|*/etc/time-config.json*|\
-            */etc/osd-logo.conf|*/etc/ssl/*)
+            */etc/osd-logo.conf)
                 continue ;;
         esac
         local msg="$context validation failed: empty immutable file $empty"
@@ -417,7 +417,7 @@ validate_release_integrity() {
     for item in aipc-firstboot aipc-autostart aipc-restore aipc-os-updater aipc-compat-check aipc-osd-apply; do
         require_executable_file "$context" "$root/libexec/$item" || failed=1
     done
-    for item in aipc-firstboot.sh aipc-install-current-root.sh aipc-configure-platform-api-gateway.py aipc-healthmon.sh aipc-logrotate.sh aipc-os-layout-check.sh; do
+    for item in aipc-firstboot.sh aipc-install-current-root.sh aipc-configure-platform-api-gateway.py aipc-healthmon.sh aipc-logrotate.sh aipc-os-layout-check.sh aipc-time-save.sh; do
         require_executable_file "$context" "$root/scripts/$item" || failed=1
     done
 
@@ -2068,7 +2068,32 @@ fi
 if [[ $CONTAINERD_NEEDS_FIX -eq 1 ]]; then
     log "  Configuring containerd root -> $CONTAINERD_ROOT"
     systemctl stop app-manager containerd 2>/dev/null || true
-    sleep 1
+    # The bounded-systemctl wrapper kills only the waiting systemctl client,
+    # never the stop job itself, so a 124 here does not mean containerd is
+    # down — and the same wrapper can stall the probe, whose 124 would
+    # otherwise read as "not active". Migrating a store the daemon is still
+    # writing corrupts it: require an explicit terminal state, with a
+    # bounded retry because the probe can hang under a wedged PID1.
+    containerd_stopped=0
+    for _ in $(seq 1 30); do
+        case "$(systemctl is-active containerd 2>/dev/null || true)" in
+            inactive|failed|unknown) containerd_stopped=1; break ;;
+            active|reloading|activating|deactivating) sleep 1 ;;
+            *)
+                # Empty or unrecognized output means the wrapper killed the
+                # probe (wedged PID1): stop waiting instead of paying the
+                # 60-second bound once per iteration, and let the refusal
+                # below fire.
+                break
+                ;;
+        esac
+    done
+    if [[ $containerd_stopped -ne 1 ]]; then
+        record_failure "containerd still active after stop; refusing to migrate its store"
+        err "ERROR: containerd still active after stop; refusing to migrate its store."
+        err "       Reboot the device and re-run the deploy."
+        exit 1
+    fi
 
     # Generate default config if missing
     mkdir -p /etc/containerd

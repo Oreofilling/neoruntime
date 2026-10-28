@@ -154,14 +154,32 @@ func readJSONRaw(path string) json.RawMessage {
 
 // atomicWriteJSON validates then writes a JSON file via tmp+rename (0644),
 // mirroring camera-daemon's persist_* pattern so a crash mid-write cannot
-// leave a truncated config behind.
+// leave a truncated config behind. The temporary file is unique per call:
+// the periodic time saver and time-setting handlers can write concurrently,
+// and two writers sharing one tmp name would interleave into the same inode
+// before either rename publishes it.
 func atomicWriteJSON(path string, raw json.RawMessage) error {
 	if !json.Valid(raw) {
 		return fmt.Errorf("refusing to write invalid JSON to %s", path)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0644); err != nil {
+	dir, base := filepath.Split(path)
+	tmpFile, err := os.CreateTemp(dir, base+".tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", path, err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(raw); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Chmod(tmp, 0644); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
