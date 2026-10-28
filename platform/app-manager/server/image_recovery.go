@@ -122,6 +122,9 @@ func publishSavedImageDigestsAt(path string, digests map[string]string) error {
 // prove the archive still belongs to the installed images instead of trusting
 // mutable reference strings.
 func (s *AppManagerServer) recordSavedImageDigests(ctx context.Context, appID string, refs []string) {
+	if s.client == nil {
+		return
+	}
 	digests := make(map[string]string, len(refs))
 	for _, ref := range refs {
 		image, err := s.client.GetImage(ctx, ref)
@@ -143,6 +146,12 @@ func (s *AppManagerServer) recordSavedImageDigests(ctx context.Context, appID st
 // tag re-pushed with different content keeps its name but changes its digest,
 // which reference-string comparison alone cannot see.
 func (s *AppManagerServer) savedArchiveDigestsProven(ctx context.Context, appID string, refs []string) bool {
+	if s.client == nil {
+		// The server deliberately continues with a nil client when
+		// containerd is unavailable; a binding that cannot be checked is
+		// unproven, never verified.
+		return false
+	}
 	saved, ok := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID))
 	if !ok {
 		return false
@@ -161,6 +170,47 @@ func (s *AppManagerServer) savedArchiveDigestsProven(ctx context.Context, appID 
 		}
 	}
 	return true
+}
+
+// purgeRestoredReferences drops a rejected archive and every reference its
+// import created. Deleting the tar alone leaves the stale references
+// resolving as available: callers that re-check availability would find
+// nothing missing, skip the registry pull, and run the rejected binary.
+func (s *AppManagerServer) purgeRestoredReferences(ctx context.Context, appID string, refs []string) {
+	if rmErr := containerd.RemoveSavedImageTar(appID); rmErr != nil {
+		logger.Warn("[IMAGE-RECOVERY] Failed to drop rejected archive for %s: %v", appID, rmErr)
+	}
+	if s.client == nil {
+		return
+	}
+	for _, rejected := range refs {
+		if rmErr := s.client.RemoveImage(ctx, rejected, true); rmErr != nil {
+			logger.Warn("[IMAGE-RECOVERY] Failed to purge rejected reference %s: %v", rejected, rmErr)
+		}
+	}
+}
+
+// migrateUnboundSavedArchive binds a legacy archive — one published before
+// the digest sidecar existed — to the images containerd currently holds,
+// while that metadata is still available. The binding is what lets a later
+// restore validate the archive instead of trusting it blindly: if a
+// pre-sidecar release force-updated the app remotely and left a stale tar
+// behind, the recorded current digests will not match it and recovery will
+// reject the archive rather than silently running the old binary. Best
+// effort — recordSavedImageDigests already removes the sidecar on failure,
+// which reads as unproven and keeps the conservative direction.
+func (s *AppManagerServer) migrateUnboundSavedArchive(ctx context.Context, appID string, refs []string) {
+	if s.client == nil || len(refs) == 0 {
+		return
+	}
+	if _, err := os.Stat(containerd.SavedImageTarPath(appID)); err != nil {
+		return // no archive, nothing to bind
+	}
+	if _, ok := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID)); ok {
+		return // already bound
+	}
+	logger.Info("[IMAGE-RECOVERY] Binding legacy archive for %s to the currently installed images", appID)
+	s.recordSavedImageDigests(ctx, appID, refs)
 }
 
 // recoverySourceCandidates returns only archive images that can legitimately
@@ -271,38 +321,45 @@ func (s *AppManagerServer) restoreAppImagesFromSavedTar(ctx context.Context, app
 		}
 	}
 
+	// Validate the archive's digest binding before declaring any outcome.
+	// This must precede the partial-failure return below: the import above
+	// already populated every reference it could, so a mismatched primary
+	// would otherwise stay resolvable, the caller's availability re-check
+	// would report only the failed secondary as missing, and the registry
+	// pull would complete around the rejected primary still being served.
+	saved, bound := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID))
+	if !bound {
+		// An archive with no binding (or an unreadable one) is unproven —
+		// the same conservative direction the update paths already use.
+		// Devices upgrading from a pre-sidecar release carry such archives,
+		// and a stale one left behind by an old force-update must not be
+		// retagged onto the current references. Reject and let the
+		// registry fallback run.
+		s.purgeRestoredReferences(ctx, appID, refs)
+		return fmt.Errorf("saved archive for %s carries no digest binding; rejecting it in favor of the registry fallback", appID)
+	}
+	for _, ref := range refs {
+		want, recorded := saved[ref]
+		if !recorded {
+			continue
+		}
+		image, err := s.client.GetImage(ctx, ref)
+		if err != nil {
+			continue // unresolvable references are reported via failures below
+		}
+		if image.Target().Digest.String() != want {
+			// The import above already populated the stale references, so
+			// merely failing would leave them resolving as available:
+			// callers that re-check availability would find nothing
+			// missing, skip the registry pull, and run the rejected
+			// binary. Purge what the rejected archive brought in so the
+			// fallback actually engages.
+			s.purgeRestoredReferences(ctx, appID, refs)
+			return fmt.Errorf("saved archive digest for %s does not match the binding recorded at publication", ref)
+		}
+	}
 	if len(failures) > 0 {
 		return fmt.Errorf("saved archive did not restore required images: %s", strings.Join(failures, "; "))
-	}
-	// Defense in depth: an archive whose digests no longer match the binding
-	// recorded at publication must not satisfy the app's references — that is
-	// exactly the stale-binary-under-a-retagged-reference failure mode. Drop
-	// it and fail so callers fall back to the registry.
-	if saved, ok := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID)); ok {
-		for _, ref := range refs {
-			want, recorded := saved[ref]
-			if !recorded {
-				continue
-			}
-			image, err := s.client.GetImage(ctx, ref)
-			if err != nil || image.Target().Digest.String() != want {
-				if rmErr := containerd.RemoveSavedImageTar(appID); rmErr != nil {
-					logger.Warn("[IMAGE-RECOVERY] Failed to drop digest-mismatched archive for %s: %v", appID, rmErr)
-				}
-				// The import above already populated the stale references, so
-				// merely failing would leave them resolving as available:
-				// callers that re-check availability would find nothing
-				// missing, skip the registry pull, and run the rejected
-				// binary. Purge what the rejected archive brought in so the
-				// fallback actually engages.
-				for _, rejected := range refs {
-					if rmErr := s.client.RemoveImage(ctx, rejected, true); rmErr != nil {
-						logger.Warn("[IMAGE-RECOVERY] Failed to purge rejected reference %s: %v", rejected, rmErr)
-					}
-				}
-				return fmt.Errorf("saved archive digest for %s does not match the binding recorded at publication", ref)
-			}
-		}
 	}
 	logger.Info("[IMAGE-RECOVERY] App %s images restored from persistent archive", appID)
 	return nil
@@ -314,6 +371,9 @@ func (s *AppManagerServer) restoreAppImagesFromSavedTar(ctx context.Context, app
 func (s *AppManagerServer) ensureAppImagesAvailable(ctx context.Context, appID string, refs []string) error {
 	missing := s.unavailableImageReferences(ctx, refs)
 	if len(missing) == 0 {
+		// Everything is already available: this is the last moment the
+		// current image metadata can bind a legacy pre-sidecar archive.
+		s.migrateUnboundSavedArchive(ctx, appID, refs)
 		return nil
 	}
 

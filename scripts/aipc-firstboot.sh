@@ -941,16 +941,19 @@ configure_containerd_root() {
     # bounded-systemctl wrapper turns a hung probe into a 124 that reads as
     # "not active", and a stop timeout swallowed by || true does not mean
     # the stop job finished. Only an explicit terminal state counts as
-    # stopped; an empty or hung probe result keeps waiting. Migrating a
-    # store the daemon is still writing corrupts it, so on timeout keep the
-    # source authoritative and retry on the next boot instead.
+    # stopped; an empty or unrecognized probe result means the wrapper
+    # killed the probe, so the loop stops right there instead of paying the
+    # 60-second bound once per iteration. Migrating a store the daemon is
+    # still writing corrupts it, so on timeout keep the source
+    # authoritative and retry on the next boot instead.
     stop_confirmed=0
     for _ in $(seq 1 30); do
         stop_state="$(systemctl is-active containerd 2>/dev/null || true)"
         case "$stop_state" in
             inactive|failed|unknown) stop_confirmed=1; break ;;
+            active|reloading|activating|deactivating) sleep 1 ;;
+            *) break ;;
         esac
-        sleep 1
     done
     if [[ $stop_confirmed -ne 1 ]]; then
         warn "containerd still active after stop (state: ${stop_state:-unresponsive}); refusing to migrate its store"

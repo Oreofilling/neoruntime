@@ -2078,8 +2078,15 @@ if [[ $CONTAINERD_NEEDS_FIX -eq 1 ]]; then
     for _ in $(seq 1 30); do
         case "$(systemctl is-active containerd 2>/dev/null || true)" in
             inactive|failed|unknown) containerd_stopped=1; break ;;
+            active|reloading|activating|deactivating) sleep 1 ;;
+            *)
+                # Empty or unrecognized output means the wrapper killed the
+                # probe (wedged PID1): stop waiting instead of paying the
+                # 60-second bound once per iteration, and let the refusal
+                # below fire.
+                break
+                ;;
         esac
-        sleep 1
     done
     if [[ $containerd_stopped -ne 1 ]]; then
         record_failure "containerd still active after stop; refusing to migrate its store"
