@@ -573,6 +573,57 @@ else
     info "Systemd log level already info"
 fi
 
+# Persist login records (wtmp/lastlog) across reboots and rootfs reflashes —
+# BEFORE the serial getty below is enabled. /var/log is tmpfs on this BSP:
+# every reboot wipes the login audit trail, and every OS reflash loses it
+# entirely — the 2026-10-21 incident forensics hit exactly this (wtmp began
+# at the reflash, all earlier logins unrecoverable). Mirrors the journal bind
+# pattern: keep the files on /data and bind-mount them onto /var/log.
+# Ordering matters: this script may spend minutes migrating the containerd
+# store (step 6b) after the getty is up, and logins landing on the volatile
+# files during that window would be hidden by the bind mount.
+for ut_file in wtmp lastlog; do
+    ut_src="/data/aipc-data/log/${ut_file}"
+    ut_dst="/var/log/${ut_file}"
+    mkdir -p /data/aipc-data/log 2>/dev/null || true
+    # Seed the persistent copy from the current boot's file if it exists.
+    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
+        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
+    elif [[ -f "$ut_src" ]] && [[ -f "$ut_dst" ]] && [[ -s "$ut_dst" ]]; then
+        # Records already written this boot (utmp boot/runlevel entries or a
+        # pre-firstboot console login) would be hidden by the bind mount.
+        # wtmp is an append-only record stream, so splicing this boot's tail
+        # onto the persistent copy preserves them; this service is a oneshot
+        # with RemainAfterExit, so the merge runs at most once per boot.
+        # lastlog is a sparse UID-indexed table that cannot be merged — the
+        # persistent copy wins and this boot's lastlog entries are dropped.
+        if [[ "$ut_file" == "wtmp" ]]; then
+            cat "$ut_dst" >>"$ut_src" 2>/dev/null || true
+        fi
+    fi
+    if [[ ! -f "$ut_src" ]]; then
+        : >"$ut_src" 2>/dev/null || true
+        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
+        chmod 664 "$ut_src" 2>/dev/null || true
+    fi
+    # A file bind mount requires the destination file to exist. /var/log is
+    # volatile on the BSP, so fresh boots may have neither wtmp nor lastlog.
+    if [[ ! -e "$ut_dst" ]]; then
+        : >"$ut_dst" 2>/dev/null || true
+        chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
+        chmod 664 "$ut_dst" 2>/dev/null || true
+    fi
+    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
+        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
+            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
+    fi
+    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
+        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
+            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
+    fi
+done
+log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
+
 # Ensure serial-getty is running on the kernel console device
 # (console=ttySX on kernel cmdline). systemd-getty-generator usually handles
 # this, but some BSPs ship with it masked or targeting the wrong device.
@@ -1027,43 +1078,6 @@ if findmnt --mountpoint "$JOURNAL_DST" >/dev/null 2>&1; then
 else
     warn "Journal bind not active — persistent journal unavailable this boot"
 fi
-
-# 6c.3 Persist login records (wtmp/lastlog) across reboots and rootfs
-#     reflashes. /var/log is tmpfs on this BSP: every reboot wipes the login
-#     audit trail, and every OS reflash loses it entirely — the 2026-10-21
-#     incident forensics hit exactly this (wtmp began at the reflash, all
-#     earlier logins unrecoverable). Mirrors the journal bind pattern: keep
-#     the files on /data and bind-mount them onto /var/log.
-for ut_file in wtmp lastlog; do
-    ut_src="/data/aipc-data/log/${ut_file}"
-    ut_dst="/var/log/${ut_file}"
-    mkdir -p /data/aipc-data/log 2>/dev/null || true
-    # Seed the persistent copy from the current boot's file if it exists.
-    if [[ ! -f "$ut_src" ]] && [[ -f "$ut_dst" ]]; then
-        cp -a "$ut_dst" "$ut_src" 2>/dev/null || true
-    fi
-    if [[ ! -f "$ut_src" ]]; then
-        : >"$ut_src" 2>/dev/null || true
-        chown root:utmp "$ut_src" 2>/dev/null || chown root:root "$ut_src" 2>/dev/null || true
-        chmod 664 "$ut_src" 2>/dev/null || true
-    fi
-    # A file bind mount requires the destination file to exist. /var/log is
-    # volatile on the BSP, so fresh boots may have neither wtmp nor lastlog.
-    if [[ ! -e "$ut_dst" ]]; then
-        : >"$ut_dst" 2>/dev/null || true
-        chown root:utmp "$ut_dst" 2>/dev/null || chown root:root "$ut_dst" 2>/dev/null || true
-        chmod 664 "$ut_dst" 2>/dev/null || true
-    fi
-    if ! grep -qE "^[[:space:]]*${ut_src}[[:space:]]+${ut_dst}[[:space:]]+" /etc/fstab 2>/dev/null; then
-        echo "${ut_src} ${ut_dst} none bind 0 0" >> /etc/fstab 2>/dev/null || \
-            warn "Failed to append ${ut_file} bind mount to /etc/fstab"
-    fi
-    if ! findmnt --mountpoint "$ut_dst" >/dev/null 2>&1; then
-        mount -o bind "$ut_src" "$ut_dst" 2>/dev/null || \
-            warn "bind mount failed for $ut_dst (login history not persistent this boot)"
-    fi
-done
-log "Login records persisted: /data/aipc-data/log/{wtmp,lastlog} -> /var/log"
 
 # Runtime service lifecycle (including aipc-healthmon) belongs exclusively to
 # aipc-autostart and aipc-cli. Enabling a unit here would silently undo

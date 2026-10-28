@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -45,9 +46,106 @@ func sameImageReferences(a, b []string) bool {
 	return true
 }
 
-func shouldDiscardSavedImageArchive(isUpdate, hasNewArchive, oldRefsKnown bool, oldRefs, newRefs []string) bool {
+// shouldDiscardSavedImageArchive reports whether an update that commits
+// without a new local archive must invalidate the previously saved one.
+// Identical reference strings are not proof: a mutable tag (foo:latest) can
+// be re-pushed with different content while keeping its name, so the archive
+// is retained only when its recorded digests still match the images behind
+// every reference (bindingProven).
+func shouldDiscardSavedImageArchive(isUpdate, hasNewArchive, bindingProven bool, oldRefs, newRefs []string) bool {
 	return isUpdate && !hasNewArchive &&
-		(!oldRefsKnown || !sameImageReferences(oldRefs, newRefs))
+		(!bindingProven || !sameImageReferences(oldRefs, newRefs))
+}
+
+// savedImageDigests is the on-disk sidecar schema recorded next to a
+// recovery archive at publication time.
+type savedImageDigests struct {
+	Digests map[string]string `json:"digests"`
+}
+
+func writeSavedImageDigestsAt(path string, digests map[string]string) error {
+	data, err := json.MarshalIndent(savedImageDigests{Digests: digests}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readSavedImageDigestsAt(path string) (map[string]string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var sidecar savedImageDigests
+	if err := json.Unmarshal(data, &sidecar); err != nil || len(sidecar.Digests) == 0 {
+		return nil, false
+	}
+	return sidecar.Digests, true
+}
+
+// recordSavedImageDigests binds a freshly published archive to the digests
+// containerd currently holds behind refs, so a later no-upload update can
+// prove the archive still belongs to the installed images instead of trusting
+// mutable reference strings.
+func (s *AppManagerServer) recordSavedImageDigests(ctx context.Context, appID string, refs []string) {
+	digests := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		image, err := s.client.GetImage(ctx, ref)
+		if err != nil {
+			logger.Warn("[IMAGE-RECOVERY] Cannot bind archive digests for %s: %v", ref, err)
+			// A new archive must never inherit the previous binding.
+			_ = os.Remove(containerd.SavedImageDigestsPath(appID))
+			return
+		}
+		digests[ref] = image.Target().Digest.String()
+	}
+	if err := writeSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID), digests); err != nil {
+		logger.Warn("[IMAGE-RECOVERY] Failed to record archive digest binding for %s: %v", appID, err)
+	}
+}
+
+// savedArchiveDigestsProven reports whether the saved archive's recorded
+// digests still match what containerd holds behind every reference. A mutable
+// tag re-pushed with different content keeps its name but changes its digest,
+// which reference-string comparison alone cannot see.
+func (s *AppManagerServer) savedArchiveDigestsProven(ctx context.Context, appID string, refs []string) bool {
+	saved, ok := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID))
+	if !ok {
+		return false
+	}
+	for _, ref := range refs {
+		want, recorded := saved[ref]
+		if !recorded {
+			return false
+		}
+		image, err := s.client.GetImage(ctx, ref)
+		if err != nil {
+			return false
+		}
+		if image.Target().Digest.String() != want {
+			return false
+		}
+	}
+	return true
 }
 
 // recoverySourceCandidates returns only archive images that can legitimately
@@ -160,6 +258,25 @@ func (s *AppManagerServer) restoreAppImagesFromSavedTar(ctx context.Context, app
 
 	if len(failures) > 0 {
 		return fmt.Errorf("saved archive did not restore required images: %s", strings.Join(failures, "; "))
+	}
+	// Defense in depth: an archive whose digests no longer match the binding
+	// recorded at publication must not satisfy the app's references — that is
+	// exactly the stale-binary-under-a-retagged-reference failure mode. Drop
+	// it and fail so callers fall back to the registry.
+	if saved, ok := readSavedImageDigestsAt(containerd.SavedImageDigestsPath(appID)); ok {
+		for _, ref := range refs {
+			want, recorded := saved[ref]
+			if !recorded {
+				continue
+			}
+			image, err := s.client.GetImage(ctx, ref)
+			if err != nil || image.Target().Digest.String() != want {
+				if rmErr := containerd.RemoveSavedImageTar(appID); rmErr != nil {
+					logger.Warn("[IMAGE-RECOVERY] Failed to drop digest-mismatched archive for %s: %v", appID, rmErr)
+				}
+				return fmt.Errorf("saved archive digest for %s does not match the binding recorded at publication", ref)
+			}
+		}
 	}
 	logger.Info("[IMAGE-RECOVERY] App %s images restored from persistent archive", appID)
 	return nil

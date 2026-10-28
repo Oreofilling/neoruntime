@@ -621,7 +621,10 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 			savedImageSource = req.ImagePath
 		}
 	}
-	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", oldImageRefsKnown, oldImageRefs, appManifest.ImageReferences()) {
+	archiveBindingProven := oldImageRefsKnown &&
+		sameImageReferences(oldImageRefs, appManifest.ImageReferences()) &&
+		s.savedArchiveDigestsProven(ctx, appID, oldImageRefs)
+	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", archiveBindingProven, oldImageRefs, appManifest.ImageReferences()) {
 		discardSavedImageArchive = true
 	}
 
@@ -804,6 +807,7 @@ func (s *AppManagerServer) InstallApp(ctx context.Context, req *proto.InstallReq
 		if archiveErr := containerd.PublishStagedImageTar(appInfo.ID, stagedImageArchive); archiveErr != nil {
 			return &proto.InstallResponse{Status: &proto.Status{Success: false, Message: fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr), Code: 500}}, nil
 		}
+		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
 		stagedImageArchive = ""
 		s.cleanupUploadedTar(savedImageSource)
 	} else if discardSavedImageArchive {
@@ -1147,7 +1151,10 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 	} else {
 		task.Update("pulling", 80, "No image to pull")
 	}
-	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", oldImageRefsKnown, oldImageRefs, appManifest.ImageReferences()) {
+	archiveBindingProven := oldImageRefsKnown &&
+		sameImageReferences(oldImageRefs, appManifest.ImageReferences()) &&
+		s.savedArchiveDigestsProven(ctx, asyncAppID, oldImageRefs)
+	if shouldDiscardSavedImageArchive(isUpdate, savedImageSource != "", archiveBindingProven, oldImageRefs, appManifest.ImageReferences()) {
 		discardSavedImageArchive = true
 	}
 
@@ -1301,6 +1308,7 @@ func (s *AppManagerServer) runAsyncInstallSnapshot(taskID string, manifestData [
 			task.Fail(fmt.Sprintf("Failed to save image recovery archive: %v", archiveErr))
 			return
 		}
+		s.recordSavedImageDigests(ctx, appInfo.ID, appManifest.ImageReferences())
 		stagedImageArchive = ""
 		s.cleanupUploadedTar(savedImageSource)
 	} else if discardSavedImageArchive {

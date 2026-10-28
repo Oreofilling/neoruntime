@@ -51,6 +51,14 @@ func SavedImageTarPath(appID string) string {
 	return filepath.Join(SavedImagesDir, appID+".tar")
 }
 
+// SavedImageDigestsPath returns the sidecar recorded next to a recovery
+// archive at publication time. It maps each image reference to the digest
+// containerd held when the archive was saved, proving whether the archive
+// still matches the images behind an app's current references.
+func SavedImageDigestsPath(appID string) string {
+	return SavedImageTarPath(appID) + ".digests.json"
+}
+
 // ContainerInfo holds information about a running container
 type ContainerInfo struct {
 	ID        string
@@ -394,7 +402,12 @@ func removeSavedImageTarAt(path string) error {
 }
 
 func RemoveSavedImageTar(appID string) error {
-	return removeSavedImageTarAt(SavedImageTarPath(appID))
+	if err := removeSavedImageTarAt(SavedImageTarPath(appID)); err != nil {
+		return err
+	}
+	// Drop the digest sidecar with the archive so a later archive never
+	// inherits a binding recorded for different content.
+	return removeSavedImageTarAt(SavedImageDigestsPath(appID))
 }
 
 // RepairResult describes the outcome of snapshot repair for one image.

@@ -231,6 +231,45 @@ func TestFirstbootCreatesLoginRecordTargetsBeforeBind(t *testing.T) {
 	}
 }
 
+func TestFirstbootBindsLoginRecordsBeforeExposingGetty(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	bind := strings.Index(script, `mount -o bind "$ut_src" "$ut_dst"`)
+	getty := strings.Index(script, `getty_unit="serial-getty@`)
+	if bind < 0 || getty < 0 || bind > getty {
+		t.Fatal("firstboot must bind persistent login records before enabling the serial getty; logins during the containerd migration window would otherwise be hidden by the bind mount")
+	}
+	if !strings.Contains(script, `cat "$ut_dst" >>"$ut_src"`) {
+		t.Fatal("firstboot must merge this boot's volatile wtmp records into the persistent copy before bind mounting")
+	}
+}
+
+func TestRestoreValidationToleratesPreviousRuntimeRelease(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-restore.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "validate_restored_release() {")
+	if start < 0 {
+		t.Fatal("validate_restored_release not found")
+	}
+	body := script[start:]
+	hard := body
+	if idx := strings.Index(body, "while IFS"); idx >= 0 {
+		hard = body[:idx]
+	}
+	if strings.Contains(hard, "aipc-time-save.sh") {
+		t.Fatal("the hard executable whitelist must not require the v1.2.0-only time saver; an OS A/B upgrade booting an older runtime would roll back a healthy upgrade")
+	}
+	if !strings.Contains(body, "RESTORE_LEGACY_LAYOUT") {
+		t.Fatal("restore must warn when the restored runtime predates the shutdown time saver")
+	}
+}
+
 func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
 	if err != nil {

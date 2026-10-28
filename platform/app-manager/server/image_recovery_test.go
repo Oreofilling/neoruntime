@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -88,22 +90,53 @@ func TestShouldDiscardSavedImageArchive(t *testing.T) {
 		name          string
 		isUpdate      bool
 		hasNewArchive bool
-		oldRefsKnown  bool
+		bindingProven bool
 		newRefs       []string
 		want          bool
 	}{
-		{name: "no-upload changed image", isUpdate: true, oldRefsKnown: true, newRefs: []string{"docker.io/acme/main:3"}, want: true},
-		{name: "no-upload unchanged image", isUpdate: true, oldRefsKnown: true, newRefs: oldRefs, want: false},
-		{name: "unverifiable old binding", isUpdate: true, oldRefsKnown: false, newRefs: oldRefs, want: true},
-		{name: "new local archive replaces old binding", isUpdate: true, hasNewArchive: true, oldRefsKnown: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
-		{name: "fresh install has no stale binding", isUpdate: false, oldRefsKnown: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
+		{name: "no-upload changed image", isUpdate: true, bindingProven: true, newRefs: []string{"docker.io/acme/main:3"}, want: true},
+		{name: "no-upload unchanged image with proven digests", isUpdate: true, bindingProven: true, newRefs: oldRefs, want: false},
+		{name: "no-upload unchanged name with re-pushed digest", isUpdate: true, bindingProven: false, newRefs: oldRefs, want: true},
+		{name: "unverifiable old binding", isUpdate: true, bindingProven: false, newRefs: oldRefs, want: true},
+		{name: "new local archive replaces old binding", isUpdate: true, hasNewArchive: true, bindingProven: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
+		{name: "fresh install has no stale binding", isUpdate: false, bindingProven: false, newRefs: []string{"docker.io/acme/main:3"}, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldDiscardSavedImageArchive(tt.isUpdate, tt.hasNewArchive, tt.oldRefsKnown, oldRefs, tt.newRefs)
+			got := shouldDiscardSavedImageArchive(tt.isUpdate, tt.hasNewArchive, tt.bindingProven, oldRefs, tt.newRefs)
 			if got != tt.want {
 				t.Fatalf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSavedImageDigestsSidecar(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.tar.digests.json")
+	if _, ok := readSavedImageDigestsAt(path); ok {
+		t.Fatal("missing sidecar must read as unproven")
+	}
+	digests := map[string]string{
+		"docker.io/acme/main:2":   "sha256:aaaaaaaa",
+		"docker.io/acme/worker:2": "sha256:bbbbbbbb",
+	}
+	if err := writeSavedImageDigestsAt(path, digests); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("write must leave no temporary file behind, dir has %d entries", len(entries))
+	}
+	got, ok := readSavedImageDigestsAt(path)
+	if !ok || !reflect.DeepEqual(got, digests) {
+		t.Fatalf("readSavedImageDigestsAt() = %v, %v; want %v", got, ok, digests)
+	}
+	// Hand-corrupted content must read as unproven, never as a match.
+	if err := os.WriteFile(path, []byte(`{"digests":`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readSavedImageDigestsAt(path); ok {
+		t.Fatal("corrupt sidecar must read as unproven")
 	}
 }

@@ -46,8 +46,7 @@ validate_restored_release() {
         /data/aipc/libexec/aipc-compat-check \
         /data/aipc/libexec/aipc-os-updater \
         /data/aipc/scripts/aipc-install-current-root.sh \
-        /data/aipc/scripts/aipc-firstboot.sh \
-        /data/aipc/scripts/aipc-time-save.sh; do
+        /data/aipc/scripts/aipc-firstboot.sh; do
         require_executable "$file"
     done
     # Runtime state under etc/ is rewritten in place by the platform and a
@@ -67,6 +66,17 @@ validate_restored_release() {
         /data/aipc/scripts /data/aipc/share /data/aipc/swagger-ui \
         /data/aipc/systemd /data/aipc/web \
         -type f -size 0 -print 2>/dev/null)
+    # The shutdown time saver arrived with the v1.2.0 runtime. An OS A/B
+    # upgrade can boot against an older independently deployed runtime whose
+    # /data tree never shipped this script; failing validation here would
+    # roll back an otherwise healthy OS upgrade. aipc-time-save.service
+    # already carries ConditionPathExists for the same reason, and the
+    # deployment-time validators (deploy.sh, install.sh,
+    # aipc-install-current-root.sh) still hard-require it whenever a full
+    # runtime tree is installed.
+    if [[ ! -x /data/aipc/scripts/aipc-time-save.sh ]]; then
+        log "WARN: RESTORE_LEGACY_LAYOUT: /data/aipc/scripts/aipc-time-save.sh missing (runtime predates the shutdown time saver)"
+    fi
 }
 
 json_string() {
