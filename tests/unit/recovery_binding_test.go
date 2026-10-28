@@ -97,16 +97,41 @@ func TestDeployVerifiesContainerdStoppedBeforeMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(raw)
-	guardAt := strings.Index(script, `if ! systemctl is-active --quiet containerd 2>/dev/null; then`)
+	guardAt := strings.Index(script, `inactive|failed|unknown) containerd_stopped=1; break ;;`)
 	migrateAt := strings.Index(script, `migrate_persistent_dir "$CONTAINERD_OLD_ROOT"`)
 	if guardAt < 0 || migrateAt < 0 {
 		t.Fatal("deploy.sh must verify containerd is inactive before migrating its store")
 	}
 	if guardAt > migrateAt {
-		t.Fatal("the is-active containerd guard must run before migrate_persistent_dir")
+		t.Fatal("the terminal-state containerd guard must run before migrate_persistent_dir")
 	}
 	if !strings.Contains(script, "refusing to migrate its store") {
 		t.Fatal("deploy.sh must fail loudly when containerd stays active after stop")
+	}
+}
+
+// firstboot must confirm containerd reached an explicit terminal state before
+// migrating its store, and must do so even when the activity probe above
+// reported inactive: under the 60s systemctl wrapper a hung probe exits 124,
+// which `is-active --quiet` callers read as "not active", and the swallowed
+// stop timeout does not mean the stop job finished. Migration under a live
+// daemon corrupts the store it is copying.
+func TestFirstbootVerifiesContainerdStoppedBeforeMigration(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/aipc-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	guardAt := strings.Index(script, `inactive|failed|unknown) stop_confirmed=1; break ;;`)
+	migrateAt := strings.Index(script, `migrate_containerd_root "$current_root"`)
+	if guardAt < 0 || migrateAt < 0 {
+		t.Fatal("firstboot must confirm containerd stopped before migrating its store")
+	}
+	if guardAt > migrateAt {
+		t.Fatal("the terminal-state guard must run before the containerd migration passes")
+	}
+	if !strings.Contains(script, "refusing to migrate its store") {
+		t.Fatal("firstboot must refuse migration when containerd stays active")
 	}
 }
 

@@ -397,6 +397,50 @@ func TestFirstbootContainerdMigrationPreservesPersistentMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("duplicate second pass preserves the just-published store", func(t *testing.T) {
+		tmp := t.TempDir()
+		source := filepath.Join(tmp, "rootfs-containerd")
+		destination := filepath.Join(tmp, "persistent-containerd")
+		// A complete source store with real image content, like the stock
+		// /var/lib/containerd after images were pulled under it.
+		blobs := filepath.Join(source, "io.containerd.content.v1.content", "blobs", "sha256")
+		if err := os.MkdirAll(blobs, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(blobs, "layer"), []byte("complete-store"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(source, "io.containerd.metadata.v1.bolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source, "io.containerd.metadata.v1.bolt", "meta.db"), []byte("complete-index"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// configure_containerd_root runs recovery once, then the migration
+		// helper twice with the same default source (current_root resolves
+		// to /var/lib/containerd). The second pass must honor the pending
+		// marker left by the first and keep the store it just published
+		// instead of triaging it aside and re-copying the multi-GB source.
+		command := "set -euo pipefail\nwarn() { :; }\nlog() { :; }\n" + functions +
+			"\nrecover_pending_containerd_migration \"$2\" \"$3\"\n" +
+			"migrate_containerd_root \"$1\" \"$2\" \"$3\"\n" +
+			"migrate_containerd_root \"$1\" \"$2\" \"$3\""
+		cmd := exec.Command("bash", "-c", command, "migration-duplicate-pass", source, destination, source)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("duplicate migration pass failed: %v\n%s", err, output)
+		}
+		got, err := os.ReadFile(filepath.Join(destination, "io.containerd.metadata.v1.bolt", "meta.db"))
+		if err != nil || string(got) != "complete-index" {
+			t.Fatalf("just-published destination was disturbed: %q, %v", got, err)
+		}
+		if legacy, _ := filepath.Glob(destination + ".legacy-partial.*"); len(legacy) != 0 {
+			t.Fatalf("duplicate pass triaged the just-published store aside: %v", legacy)
+		}
+		if _, err := os.Stat(destination + ".migration-pending"); err != nil {
+			t.Fatalf("pending marker missing after publication: %v", err)
+		}
+	})
+
 	t.Run("interrupted seed is refreshed from authoritative source", func(t *testing.T) {
 		tmp := t.TempDir()
 		source := filepath.Join(tmp, "old-containerd")

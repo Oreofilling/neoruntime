@@ -2070,15 +2070,15 @@ if [[ $CONTAINERD_NEEDS_FIX -eq 1 ]]; then
     systemctl stop app-manager containerd 2>/dev/null || true
     # The bounded-systemctl wrapper kills only the waiting systemctl client,
     # never the stop job itself, so a 124 here does not mean containerd is
-    # down. Migrating a store the daemon is still writing corrupts it: require
-    # inactivity, with a bounded retry because is-active can also stall under
-    # a wedged PID1.
+    # down — and the same wrapper can stall the probe, whose 124 would
+    # otherwise read as "not active". Migrating a store the daemon is still
+    # writing corrupts it: require an explicit terminal state, with a
+    # bounded retry because the probe can hang under a wedged PID1.
     containerd_stopped=0
     for _ in $(seq 1 30); do
-        if ! systemctl is-active --quiet containerd 2>/dev/null; then
-            containerd_stopped=1
-            break
-        fi
+        case "$(systemctl is-active containerd 2>/dev/null || true)" in
+            inactive|failed|unknown) containerd_stopped=1; break ;;
+        esac
         sleep 1
     done
     if [[ $containerd_stopped -ne 1 ]]; then

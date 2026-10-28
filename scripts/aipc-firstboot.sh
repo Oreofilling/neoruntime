@@ -816,7 +816,16 @@ migrate_containerd_root() {
     # it aside — never delete — and reseed from the complete source; if the
     # heuristic ever misfires (fresh store that pulled before firstboot),
     # the moved copy survives and images re-import from saved archives.
-    if [[ $destination_has_data -eq 1 && "$configured_root" != "$destination" && -n "$copy_src" ]] && \
+    #
+    # A destination carrying the pending marker is exempt from this triage:
+    # recovery runs before the migration passes and consumes any stale
+    # marker, so one present here was written moments ago by an earlier
+    # pass in this same configure run. configure_containerd_root invokes
+    # this helper twice with the same default source, and triaging the
+    # just-published store aside would re-copy multi-GB of content and
+    # could exhaust /data.
+    marker="${destination}.migration-pending"
+    if [[ $destination_has_data -eq 1 && "$configured_root" != "$destination" && -n "$copy_src" && ! -e "$marker" ]] && \
        find "$copy_src/io.containerd.content.v1.content" -type f -print -quit 2>/dev/null | grep -q .; then
         legacy_keep="${destination}.legacy-partial.$(date +%s)"
         if mv "$destination" "$legacy_keep" 2>/dev/null && mkdir -p "$destination" 2>/dev/null; then
@@ -837,7 +846,6 @@ migrate_containerd_root() {
         # publish with a single rename instead. Staging left behind by an
         # interrupted attempt is partial by definition — always discard it.
         stage_parent="$(dirname "$destination")"
-        marker="${destination}.migration-pending"
         rm -rf "${stage_parent}"/.containerd-migrate.* 2>/dev/null || true
         stage_dir="${stage_parent}/.containerd-migrate.$$"
         if mkdir -p "$stage_dir" 2>/dev/null && \
@@ -895,6 +903,7 @@ configure_containerd_root() {
     local restart_containerd=0
     local restart_app_manager=0
     local restart_ai_runtime=0
+    local stop_state stop_confirmed
 
     mkdir -p "$target" 2>/dev/null || {
         warn "Failed to prepare containerd root $target"
@@ -925,6 +934,32 @@ configure_containerd_root() {
         systemctl is-active --quiet app-manager 2>/dev/null && restart_app_manager=1
         systemctl is-active --quiet ai-runtime 2>/dev/null && restart_ai_runtime=1
         systemctl stop app-manager ai-runtime containerd 2>/dev/null || true
+    fi
+
+    # Confirm the daemon is actually down before touching the store — and
+    # confirm even when the probe above reported inactive, because the
+    # bounded-systemctl wrapper turns a hung probe into a 124 that reads as
+    # "not active", and a stop timeout swallowed by || true does not mean
+    # the stop job finished. Only an explicit terminal state counts as
+    # stopped; an empty or hung probe result keeps waiting. Migrating a
+    # store the daemon is still writing corrupts it, so on timeout keep the
+    # source authoritative and retry on the next boot instead.
+    stop_confirmed=0
+    for _ in $(seq 1 30); do
+        stop_state="$(systemctl is-active containerd 2>/dev/null || true)"
+        case "$stop_state" in
+            inactive|failed|unknown) stop_confirmed=1; break ;;
+        esac
+        sleep 1
+    done
+    if [[ $stop_confirmed -ne 1 ]]; then
+        warn "containerd still active after stop (state: ${stop_state:-unresponsive}); refusing to migrate its store"
+        if [[ $restart_containerd -eq 1 ]]; then
+            systemctl start --no-block containerd 2>/dev/null || true
+            [[ $restart_ai_runtime -eq 1 ]] && systemctl start --no-block ai-runtime 2>/dev/null || true
+            [[ $restart_app_manager -eq 1 ]] && systemctl start --no-block app-manager 2>/dev/null || true
+        fi
+        return 0
     fi
 
     if ! migrate_containerd_root "$current_root" "$target" "$current_root" ||
