@@ -15,6 +15,7 @@ export default function Monitoring() {
     'main'
   );
   const [isEncoderConfiguring, setIsEncoderConfiguring] = useState(false);
+  const [isEncoderRestarting, setIsEncoderRestarting] = useState(false);
 
   const { data: mediaStatus } = useMediaStatus();
 
@@ -52,17 +53,19 @@ export default function Monitoring() {
   // Incrementing the generation guarantees a different URL and a full Player
   // remount after every successful enable/disable operation.
   const [playerKey, setPlayerKey] = useState(0);
-  const currentStreamUrl = effectiveEnabled
+  // Full codec/resolution changes rebuild the backend pipeline. Disconnect the
+  // old player immediately and reconnect only after the mutation's status poll
+  // completes, using the final effective stream (including H.265 fallback).
+  const currentStreamUrl = effectiveEnabled && !isEncoderRestarting
     ? `${buildStreamUrl(effectiveStreamId)}&reconnect=${playerKey}`
     : '';
 
-  const handleStreamToggleSuccess = useCallback(
-    (streamId: string) => {
-      if (streamId !== effectiveStreamId) return;
-      setPlayerKey(key => key + 1);
-    },
-    [effectiveStreamId]
-  );
+  const handleStreamToggleSuccess = useCallback((_streamId: string) => {
+    // A stream layout change recreates every encoder, even when the toggled
+    // stream is not the one currently displayed. Always give the active
+    // decoder a fresh URL/generation after the rebuild.
+    setPlayerKey(key => key + 1);
+  }, []);
 
   const noticeText = codecNotice
     ? t(
@@ -84,7 +87,6 @@ export default function Monitoring() {
         )}
         <div className="relative aspect-video w-full max-w-full overflow-hidden rounded-xl bg-black my-2 md:max-w-none md:rounded-2xl">
           <Player
-            key={`${effectiveStreamId}:${playerKey}`}
             videoUrl={currentStreamUrl}
             videoRendererInstance={playerRef}
             streamWidth={activeStreamInfo?.width}
@@ -92,6 +94,7 @@ export default function Monitoring() {
             objectFit="adaptive"
             audioOverlay
             configuring={isEncoderConfiguring}
+            streamRestarting={isEncoderRestarting}
           />
         </div>
       </div>
@@ -112,6 +115,7 @@ export default function Monitoring() {
             onStreamChange={handleStreamChange}
             onStreamToggleSuccess={handleStreamToggleSuccess}
             onEncoderConfiguringChange={setIsEncoderConfiguring}
+            onEncoderRestartingChange={setIsEncoderRestarting}
           />
         </div>
       </div>
